@@ -1,0 +1,17 @@
+Description: fix build error
+Author: Angie.J <doucaixia@uniontech.com>
+Last-Update: 2022-06-07
+
+---
+
+--- intel-gpu-tools-1.26.orig/lib/meson.build
++++ intel-gpu-tools-1.26/lib/meson.build
+@@ -152,7 +152,7 @@ lib_version = vcs_tag(input : 'version.h
+ 
+ lib_intermediates = []
+ foreach f: lib_sources
+-    name = f.underscorify(f)
++    name = f.underscorify()
+     lib = static_library('igt-' + name,
+ 	[ f, lib_version ],
+ 	include_directories: inc,
