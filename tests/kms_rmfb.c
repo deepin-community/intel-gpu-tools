@@ -36,6 +36,9 @@
 #define DRM_CAP_CURSOR_HEIGHT 0x9
 #endif
 
+IGT_TEST_DESCRIPTION("This tests rmfb and close-fd behavior. In these cases"
+		     "the framebuffers should be removed from the crtc.");
+
 struct rmfb_data {
 	int drm_fd;
 	igt_display_t display;
@@ -54,24 +57,26 @@ static void
 test_rmfb(struct rmfb_data *data, igt_output_t *output, enum pipe pipe, bool reopen)
 {
 	struct igt_fb fb, argb_fb;
+	igt_display_t *display = &data->display;
 	drmModeModeInfo *mode;
 	igt_plane_t *plane;
 	drmModeCrtc *crtc;
 	uint64_t cursor_width, cursor_height;
 	int num_active_planes = 0;
 
+	igt_display_reset(display);
 	igt_output_set_pipe(output, pipe);
 
 	mode = igt_output_get_mode(output);
 
 	igt_create_fb(data->drm_fd, mode->hdisplay, mode->vdisplay,
-		      DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE, &fb);
+		      DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR, &fb);
 
 	do_or_die(drmGetCap(data->drm_fd, DRM_CAP_CURSOR_WIDTH, &cursor_width));
 	do_or_die(drmGetCap(data->drm_fd, DRM_CAP_CURSOR_HEIGHT, &cursor_height));
 
 	igt_create_fb(data->drm_fd, cursor_width, cursor_height,
-		      DRM_FORMAT_ARGB8888, LOCAL_DRM_FORMAT_MOD_NONE, &argb_fb);
+		      DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR, &argb_fb);
 
 	/*
 	 * Make sure these buffers are suited for display use
@@ -142,7 +147,7 @@ test_rmfb(struct rmfb_data *data, igt_output_t *output, enum pipe pipe, bool reo
 		drmModeFreePlane(planeres);
 	}
 
-	igt_output_set_pipe(output, PIPE_ANY);
+	igt_output_set_pipe(output, PIPE_NONE);
 }
 
 static void
@@ -151,13 +156,28 @@ run_rmfb_test(struct rmfb_data *data, bool reopen)
 	igt_output_t *output;
 	enum pipe pipe;
 
-	for_each_pipe_with_single_output(&data->display, pipe, output)
-		test_rmfb(data, output, pipe, reopen);
+	for_each_pipe_with_single_output(&data->display, pipe, output) {
+		igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe),
+			      igt_output_name(output))
+			test_rmfb(data, output, pipe, reopen);
+	}
 }
 
 igt_main
 {
+	const struct {
+		bool reopen;
+		const char *name;
+		const char *description;
+	} tests[] = {
+		{ false, "rmfb-ioctl", "RMFB is supposed to free the framebuffers from any and all "
+				       "planes so test this and make sure it works."},
+		{ true, "close-fd", "RMFB is supposed to free the framebuffers from any and all "
+				    "planes so test this and make sure it works with fd close "
+				    "and reopen."},
+	};
 	struct rmfb_data data = {};
+	int i;
 
 	igt_fixture {
 		data.drm_fd = drm_open_driver_master(DRIVER_ANY);
@@ -168,17 +188,16 @@ igt_main
 		igt_display_require_output(&data.display);
 	}
 
-	igt_describe("RMFB is supposed to free the framebuffers from any and all "
-		     "planes so test this and make sure it works.");
-	igt_subtest_f("rmfb-ioctl")
-		run_rmfb_test(&data, false);
+	for (i = 0; i < ARRAY_SIZE(tests); i++) {
+		igt_describe(tests[i].description);
+		igt_subtest_with_dynamic(tests[i].name) {
+			run_rmfb_test(&data, tests[i].reopen);
 
-	igt_describe("RMFB is supposed to free the framebuffers from any and all planes "
-		     "so test this and make sure it works with fd close and reopen.");
-	igt_subtest_f("close-fd")
-		run_rmfb_test(&data, true);
+		}
+	}
 
 	igt_fixture {
 		igt_display_fini(&data.display);
+		close(data.drm_fd);
 	}
 }

@@ -41,6 +41,7 @@
 #include "igt_debugfs.h"
 
 struct buf_ops;
+typedef struct _igt_crc igt_crc_t;
 
 /*
  * Internal format to denote a buffer compatible with pixman's
@@ -51,6 +52,9 @@ struct buf_ops;
 #define IGT_FORMAT_FMT "%c%c%c%c(0x%08x)"
 #define IGT_FORMAT_ARGS(f) ((f) >> 0) & 0xff, ((f) >> 8) & 0xff, \
 		((f) >> 16) & 0xff, ((f) >> 24) & 0xff, (f)
+
+#define IGT_MODIFIER_FMT "%s(0x%" PRIx64 ")"
+#define IGT_MODIFIER_ARGS(m) igt_fb_modifier_name(m), (m)
 
 /**
  * igt_fb_t:
@@ -188,6 +192,7 @@ cairo_t *igt_get_cairo_ctx(int fd, struct igt_fb *fb);
 void igt_put_cairo_ctx(cairo_t *cr);
 void igt_paint_color(cairo_t *cr, int x, int y, int w, int h,
 			 double r, double g, double b);
+void igt_paint_color_rand(cairo_t *cr, int x, int y, int w, int h);
 void igt_paint_color_alpha(cairo_t *cr, int x, int y, int w, int h,
 			       double r, double g, double b, double a);
 void igt_paint_color_gradient(cairo_t *cr, int x, int y, int w, int h,
@@ -213,10 +218,14 @@ bool igt_format_is_fp16(uint32_t drm_format);
 int igt_format_plane_bpp(uint32_t drm_format, int plane);
 void igt_format_array_fill(uint32_t **formats_array, unsigned int *count,
 			   bool allow_yuv);
-int igt_fill_cts_framebuffer(uint32_t *pixmap, uint32_t video_width,
+int igt_fill_cts_color_ramp_framebuffer(uint32_t *pixmap, uint32_t video_width,
 		uint32_t video_height, uint32_t bitdepth, int alpha);
+int igt_fill_cts_color_square_framebuffer(uint32_t *pixmap,
+		uint32_t video_width, uint32_t video_height,
+		uint32_t bitdepth, int alpha);
 
 int igt_fb_get_fnv1a_crc(struct igt_fb *fb, igt_crc_t *crc);
+const char *igt_fb_modifier_name(uint64_t modifier);
 
 #endif /* __IGT_FB_H__ */
 

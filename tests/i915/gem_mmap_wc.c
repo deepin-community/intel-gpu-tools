@@ -38,18 +38,7 @@
 #include <sys/ioctl.h>
 
 #include "drm.h"
-#include "i915/gem.h"
-
-struct local_i915_gem_mmap_v2 {
-	uint32_t handle;
-	uint32_t pad;
-	uint64_t offset;
-	uint64_t size;
-	uint64_t addr_ptr;
-	uint64_t flags;
-#define I915_MMAP_WC 0x1
-};
-#define LOCAL_IOCTL_I915_GEM_MMAP_v2 DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_GEM_MMAP, struct local_i915_gem_mmap_v2)
+#include "i915/gem_create.h"
 
 static int OBJECT_SIZE = 16*1024*1024;
 
@@ -103,7 +92,7 @@ static void
 test_invalid_flags(int fd)
 {
 	struct drm_i915_getparam gp;
-	struct local_i915_gem_mmap_v2 arg;
+	struct drm_i915_gem_mmap arg;
 	uint64_t flag = I915_MMAP_WC;
 	int val = -1;
 
@@ -128,7 +117,7 @@ test_invalid_flags(int fd)
 		while (flag) {
 			arg.flags = flag;
 			igt_assert(drmIoctl(fd,
-				   LOCAL_IOCTL_I915_GEM_MMAP_v2,
+				   DRM_IOCTL_I915_GEM_MMAP,
 				   &arg) == -1);
 			igt_assert_eq(errno, EINVAL);
 			flag <<= 1;
@@ -470,8 +459,9 @@ test_pf_nonblock(int i915)
 {
 	igt_spin_t *spin;
 	uint32_t *ptr;
+	uint64_t ahnd = get_reloc_ahnd(i915, 0);
 
-	spin = igt_spin_new(i915);
+	spin = igt_spin_new(i915, .ahnd = ahnd);
 
 	igt_set_timeout(1, "initial pagefaulting did not complete within 1s");
 
@@ -482,6 +472,7 @@ test_pf_nonblock(int i915)
 	igt_reset_timeout();
 
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
 static int mmap_ioctl(int i915, struct drm_i915_gem_mmap *arg)
@@ -504,6 +495,7 @@ igt_main
 
 	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
+		igt_require(gem_has_legacy_mmap(fd));
 		gem_require_mmap_wc(fd);
 	}
 

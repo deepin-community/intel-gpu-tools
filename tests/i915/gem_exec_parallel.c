@@ -30,8 +30,11 @@
 #include <pthread.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_gt.h"
+
+IGT_TEST_DESCRIPTION("Exercise filling buffers by many clients working in parallel.");
 
 #define ENGINE_MASK  (I915_EXEC_RING_MASK | I915_EXEC_BSD_MASK)
 
@@ -48,6 +51,7 @@ static inline uint32_t hash32(uint32_t val)
 #define USERPTR 0x4
 
 #define NUMOBJ 16
+#define NUMTHREADS 1024
 
 struct thread {
 	pthread_t thread;
@@ -55,10 +59,13 @@ struct thread {
 	pthread_cond_t *cond;
 	unsigned flags;
 	uint32_t *scratch;
+	uint64_t *offsets;
 	unsigned id;
+	const intel_ctx_t *ctx;
 	unsigned engine;
 	uint32_t used;
 	int fd, gen, *go;
+	uint64_t ahnd;
 };
 
 static void *thread(void *data)
@@ -67,6 +74,8 @@ static void *thread(void *data)
 	struct drm_i915_gem_exec_object2 obj[2];
 	struct drm_i915_gem_relocation_entry reloc;
 	struct drm_i915_gem_execbuffer2 execbuf;
+	const intel_ctx_t *tmp_ctx = NULL;
+	uint64_t offset, bb_offset;
 	uint32_t batch[16];
 	uint16_t used;
 	int fd, i;
@@ -78,7 +87,6 @@ static void *thread(void *data)
 
 	if (t->flags & FDS) {
 		fd = gem_reopen_driver(t->fd);
-		gem_context_copy_engines(t->fd, 0, fd, 0);
 	} else {
 		fd = t->fd;
 	}
@@ -110,7 +118,7 @@ static void *thread(void *data)
 	reloc.delta = 4*t->id;
 	obj[1].handle = gem_create(fd, 4096);
 	obj[1].relocs_ptr = to_user_pointer(&reloc);
-	obj[1].relocation_count = 1;
+	obj[1].relocation_count = !t->ahnd ? 1 : 0;
 	gem_write(fd, obj[1].handle, 0, batch, sizeof(batch));
 
 	memset(&execbuf, 0, sizeof(execbuf));
@@ -121,9 +129,24 @@ static void *thread(void *data)
 	execbuf.flags |= I915_EXEC_NO_RELOC;
 	if (t->gen < 6)
 		execbuf.flags |= I915_EXEC_SECURE;
-	if (t->flags & CONTEXTS) {
-		execbuf.rsvd1 = gem_context_clone_with_engines(fd, 0);
+	if (t->flags & (CONTEXTS | FDS)) {
+		tmp_ctx = intel_ctx_create(fd, &t->ctx->cfg);
+		execbuf.rsvd1 = tmp_ctx->id;
+	} else {
+		execbuf.rsvd1 = t->ctx->id;
 	}
+
+	/*
+	 * For FDS we have new drm fd, what means gem_create() for bb returns
+	 * handle == 1. As we're using objects from other fd it would overlap,
+	 * thus we need to acquire offset for bb from last handle + 1.
+	 * Other cases are within same fd, so obj[1].handle will be distinguish
+	 * anyway.
+	 */
+	if (t->flags & FDS)
+		bb_offset = get_offset(t->ahnd, t->scratch[NUMOBJ - 1] + 1, 4096, 0);
+	else
+		bb_offset = get_offset(t->ahnd, obj[1].handle, 4096, 0);
 
 	used = 0;
 	igt_until_timeout(1) {
@@ -135,14 +158,27 @@ static void *thread(void *data)
 		if (t->flags & FDS)
 			obj[0].handle = gem_open(fd, obj[0].handle);
 
+		if (t->ahnd) {
+			offset = t->offsets[x];
+			i = 0;
+			batch[++i] = offset + 4*t->id;
+			batch[++i] = offset >> 32;
+			obj[0].offset = offset;
+			obj[0].flags |= EXEC_OBJECT_PINNED | EXEC_OBJECT_WRITE |
+					EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+			obj[1].offset = bb_offset;
+			obj[1].flags |= EXEC_OBJECT_PINNED | EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+			gem_write(fd, obj[1].handle, 0, batch, sizeof(batch));
+		}
+
 		gem_execbuf(fd, &execbuf);
 
 		if (t->flags & FDS)
 			gem_close(fd, obj[0].handle);
 	}
 
-	if (t->flags & CONTEXTS)
-		gem_context_destroy(fd, execbuf.rsvd1);
+	if (t->flags & (CONTEXTS | FDS))
+		intel_ctx_destroy(fd, tmp_ctx);
 	gem_close(fd, obj[1].handle);
 	if (t->flags & FDS)
 		close(fd);
@@ -153,7 +189,7 @@ static void *thread(void *data)
 
 static void check_bo(int fd, uint32_t *data, uint32_t handle, int pass, struct thread *threads)
 {
-	uint32_t x = hash32(handle * pass) % 1024;
+	uint32_t x = hash32(handle * pass) % NUMTHREADS;
 	uint32_t result;
 
 	if (!(threads[x].used & (1 << pass)))
@@ -196,7 +232,8 @@ static void handle_close(int fd, unsigned int flags, uint32_t handle, void *data
 	gem_close(fd, handle);
 }
 
-static void all(int fd, struct intel_execution_engine2 *engine, unsigned flags)
+static void all(int fd, const intel_ctx_t *ctx,
+		struct intel_execution_engine2 *engine, unsigned flags)
 {
 	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
 	unsigned engines[I915_EXEC_RING_MASK + 1], nengine;
@@ -207,6 +244,7 @@ static void all(int fd, struct intel_execution_engine2 *engine, unsigned flags)
 	void *arg[NUMOBJ];
 	int go;
 	int i;
+	uint64_t ahnd = get_reloc_ahnd(fd, 0), offsets[NUMOBJ];
 
 	if (flags & CONTEXTS)
 		gem_require_contexts(fd);
@@ -219,7 +257,7 @@ static void all(int fd, struct intel_execution_engine2 *engine, unsigned flags)
 	nengine = 0;
 	if (!engine) {
 		struct intel_execution_engine2 *e;
-		__for_each_physical_engine(fd, e) {
+		for_each_ctx_engine(fd, ctx, e) {
 			if (gem_class_can_store_dword(fd, e->class))
 				engines[nengine++] = e->flags;
 		}
@@ -232,9 +270,11 @@ static void all(int fd, struct intel_execution_engine2 *engine, unsigned flags)
 		scratch[i] = handle[i] = handle_create(fd, flags, &arg[i]);
 		if (flags & FDS)
 			scratch[i] = gem_flink(fd, handle[i]);
+		offsets[i] = get_offset(ahnd, scratch[i], 4096, 0);
+
 	}
 
-	threads = calloc(1024, sizeof(struct thread));
+	threads = calloc(NUMTHREADS, sizeof(struct thread));
 	igt_assert(threads);
 
 	intel_detect_and_clear_missed_interrupts(fd);
@@ -242,26 +282,29 @@ static void all(int fd, struct intel_execution_engine2 *engine, unsigned flags)
 	pthread_cond_init(&cond, 0);
 	go = 0;
 
-	for (i = 0; i < 1024; i++) {
+	for (i = 0; i < NUMTHREADS; i++) {
 		threads[i].id = i;
 		threads[i].fd = fd;
 		threads[i].gen = gen;
+		threads[i].ctx = ctx;
 		threads[i].engine = engines[i % nengine];
 		threads[i].flags = flags;
 		threads[i].scratch = scratch;
+		threads[i].offsets = ahnd ? offsets : NULL;
 		threads[i].mutex = &mutex;
 		threads[i].cond = &cond;
 		threads[i].go = &go;
+		threads[i].ahnd = ahnd;
 
 		pthread_create(&threads[i].thread, 0, thread, &threads[i]);
 	}
 
 	pthread_mutex_lock(&mutex);
-	go = 1024;
+	go = NUMTHREADS;
 	pthread_cond_broadcast(&cond);
 	pthread_mutex_unlock(&mutex);
 
-	for (i = 0; i < 1024; i++)
+	for (i = 0; i < NUMTHREADS; i++)
 		pthread_join(threads[i].thread, NULL);
 
 	for (i = 0; i < NUMOBJ; i++) {
@@ -280,41 +323,47 @@ igt_main
 	const struct mode {
 		const char *name;
 		unsigned flags;
+		const char *describe;
 	} modes[] = {
-		{ "basic", 0 },
-		{ "contexts", CONTEXTS },
-		{ "fds", FDS },
-		{ "userptr", USERPTR },
+		{ "basic", 0, "Check basic functionality per engine." },
+		{ "contexts", CONTEXTS, "Check with many contexts." },
+		{ "fds", FDS, "Check with many fds." },
+		{ "userptr", USERPTR, "Check basic userptr thrashing." },
 		{ NULL }
 	};
+	const intel_ctx_t *ctx;
 	int fd;
 
 	igt_fixture {
 		fd = drm_open_driver_master(DRIVER_INTEL);
 		igt_require_gem(fd);
+		ctx = intel_ctx_create_all_physical(fd);
 
 		igt_fork_hang_detector(fd);
 	}
 
+	igt_describe("Check with engines working in parallel.");
 	igt_subtest_with_dynamic("engines") {
 		for (const struct mode *m = modes; m->name; m++)
 			igt_dynamic(m->name)
 				/* NULL value means all engines */
-				all(fd, NULL, m->flags);
+				all(fd, ctx, NULL, m->flags);
 	}
 
 	for (const struct mode *m = modes; m->name; m++) {
+		igt_describe(m->describe);
 		igt_subtest_with_dynamic(m->name) {
-			__for_each_physical_engine(fd, e) {
+			for_each_ctx_engine(fd, ctx, e) {
 				if (gem_class_can_store_dword(fd, e->class))
 					igt_dynamic(e->name)
-						all(fd, e, m->flags);
+						all(fd, ctx, e, m->flags);
 			}
 		}
 	}
 
 	igt_fixture {
 		igt_stop_hang_detector();
+		intel_ctx_destroy(fd, ctx);
 		close(fd);
 	}
 }

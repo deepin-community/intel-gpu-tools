@@ -33,7 +33,7 @@
 #include <pixman.h>
 
 #include "drmtest.h"
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_mman.h"
 #include "igt_aux.h"
 #include "igt_color_encoding.h"
@@ -220,6 +220,22 @@ static const struct format_desc_struct {
 	  .cairo_id = CAIRO_FORMAT_RGBA128F, .convert = true,
 	  .num_planes = 1, .plane_bpp = { 64, },
 	},
+	{ .name = "XRGB16161616", .depth = -1, .drm_id = DRM_FORMAT_XRGB16161616,
+	  .cairo_id = CAIRO_FORMAT_RGBA128F, .convert = true,
+	  .num_planes = 1, .plane_bpp = { 64, },
+	},
+	{ .name = "ARGB16161616", .depth = -1, .drm_id = DRM_FORMAT_ARGB16161616,
+	  .cairo_id = CAIRO_FORMAT_RGBA128F, .convert = true,
+	  .num_planes = 1, .plane_bpp = { 64, },
+	},
+	{ .name = "XBGR16161616", .depth = -1, .drm_id = DRM_FORMAT_XBGR16161616,
+	  .cairo_id = CAIRO_FORMAT_RGBA128F, .convert = true,
+	  .num_planes = 1, .plane_bpp = { 64, },
+	},
+	{ .name = "ABGR16161616", .depth = -1, .drm_id = DRM_FORMAT_ABGR16161616,
+	  .cairo_id = CAIRO_FORMAT_RGBA128F, .convert = true,
+	  .num_planes = 1, .plane_bpp = { 64, },
+	},
 	{ .name = "NV12", .depth = -1, .drm_id = DRM_FORMAT_NV12,
 	  .cairo_id = CAIRO_FORMAT_RGB24, .convert = true,
 	  .num_planes = 2, .plane_bpp = { 8, 16, },
@@ -376,6 +392,12 @@ bool igt_format_is_yuv_semiplanar(uint32_t format)
 	return igt_format_is_yuv(format) && f->num_planes == 2;
 }
 
+static bool is_yuv_semiplanar_plane(const struct igt_fb *fb, int color_plane)
+{
+	return igt_format_is_yuv_semiplanar(fb->drm_format) &&
+	       color_plane == 1;
+}
+
 /**
  * igt_get_fb_tile_size:
  * @fd: the DRM file descriptor
@@ -396,9 +418,22 @@ void igt_get_fb_tile_size(int fd, uint64_t modifier, int fb_bpp,
 		vc4_modifier_param = fourcc_mod_broadcom_param(modifier);
 		modifier = fourcc_mod_broadcom_mod(modifier);
 	}
+	// For all non-linear modifiers, AMD uses 64 KiB tiles
+	else if (IS_AMD_FMT_MOD(modifier)) {
+		const int bytes_per_pixel = fb_bpp / 8;
+		const int format_log2 = log2(bytes_per_pixel);
+		const int pixel_log2 = log2(64 * 1024) - format_log2;
+		const int width_log2 = (pixel_log2 + 1) / 2;
+		const int height_log2 = pixel_log2 - width_log2;
+		igt_require_amdgpu(fd);
+
+		*width_ret = bytes_per_pixel << width_log2;
+		*height_ret = 1 << height_log2;
+		return;
+	}
 
 	switch (modifier) {
-	case LOCAL_DRM_FORMAT_MOD_NONE:
+	case DRM_FORMAT_MOD_LINEAR :
 		if (is_i915_device(fd))
 			*width_ret = 64;
 		else
@@ -406,9 +441,9 @@ void igt_get_fb_tile_size(int fd, uint64_t modifier, int fb_bpp,
 
 		*height_ret = 1;
 		break;
-	case LOCAL_I915_FORMAT_MOD_X_TILED:
+	case I915_FORMAT_MOD_X_TILED:
 		igt_require_intel(fd);
-		if (intel_gen(intel_get_drm_devid(fd)) == 2) {
+		if (intel_display_ver(intel_get_drm_devid(fd)) == 2) {
 			*width_ret = 128;
 			*height_ret = 16;
 		} else {
@@ -416,13 +451,17 @@ void igt_get_fb_tile_size(int fd, uint64_t modifier, int fb_bpp,
 			*height_ret = 8;
 		}
 		break;
-	case LOCAL_I915_FORMAT_MOD_Y_TILED:
-	case LOCAL_I915_FORMAT_MOD_Y_TILED_CCS:
-	case LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS:
-	case LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC:
-	case LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS:
+	case I915_FORMAT_MOD_Y_TILED:
+	case I915_FORMAT_MOD_Y_TILED_CCS:
+	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS:
+	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC:
+	case I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS:
+	case I915_FORMAT_MOD_4_TILED:
+	case I915_FORMAT_MOD_4_TILED_DG2_RC_CCS:
+	case I915_FORMAT_MOD_4_TILED_DG2_MC_CCS:
+	case I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC:
 		igt_require_intel(fd);
-		if (intel_gen(intel_get_drm_devid(fd)) == 2) {
+		if (intel_display_ver(intel_get_drm_devid(fd)) == 2) {
 			*width_ret = 128;
 			*height_ret = 16;
 		} else if (IS_915(intel_get_drm_devid(fd))) {
@@ -433,8 +472,8 @@ void igt_get_fb_tile_size(int fd, uint64_t modifier, int fb_bpp,
 			*height_ret = 32;
 		}
 		break;
-	case LOCAL_I915_FORMAT_MOD_Yf_TILED:
-	case LOCAL_I915_FORMAT_MOD_Yf_TILED_CCS:
+	case I915_FORMAT_MOD_Yf_TILED:
+	case I915_FORMAT_MOD_Yf_TILED_CCS:
 		igt_require_intel(fd);
 		switch (fb_bpp) {
 		case 8:
@@ -529,14 +568,17 @@ void igt_get_fb_tile_size(int fd, uint64_t modifier, int fb_bpp,
 
 static bool is_gen12_mc_ccs_modifier(uint64_t modifier)
 {
-	return modifier == LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS;
+	return modifier == I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS ||
+		modifier == I915_FORMAT_MOD_4_TILED_DG2_MC_CCS;
 }
 
 static bool is_gen12_ccs_modifier(uint64_t modifier)
 {
 	return is_gen12_mc_ccs_modifier(modifier) ||
 		modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS ||
-		modifier == LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC;
+		modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC ||
+		modifier == I915_FORMAT_MOD_4_TILED_DG2_RC_CCS ||
+		modifier == I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC;
 }
 
 static bool is_ccs_modifier(uint64_t modifier)
@@ -548,7 +590,7 @@ static bool is_ccs_modifier(uint64_t modifier)
 
 static bool is_ccs_plane(const struct igt_fb *fb, int plane)
 {
-	if (!is_ccs_modifier(fb->modifier))
+	if (!is_ccs_modifier(fb->modifier) || HAS_FLATCCS(intel_get_drm_devid(fb->fd)))
 		return false;
 
 	return plane >= fb->num_planes / 2;
@@ -566,8 +608,15 @@ static bool is_gen12_ccs_plane(const struct igt_fb *fb, int plane)
 
 static bool is_gen12_ccs_cc_plane(const struct igt_fb *fb, int plane)
 {
-	return fb->modifier == LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC &&
-	       plane == 2;
+	if (fb->modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC &&
+	    plane == 2)
+		return true;
+
+	if (fb->modifier == I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC &&
+	    plane == 1)
+		return true;
+
+	return false;
 }
 
 bool igt_fb_is_gen12_ccs_cc_plane(const struct igt_fb *fb, int plane)
@@ -635,7 +684,7 @@ static unsigned fb_plane_height(const struct igt_fb *fb, int plane)
 		if (ccs_to_main_plane(fb, plane))
 			height = DIV_ROUND_UP(height, format->vsub);
 
-		return DIV_ROUND_UP(height, 128) * 4;
+		return DIV_ROUND_UP(height, 32);
 	} else if (is_ccs_plane(fb, plane)) {
 		return DIV_ROUND_UP(fb->height, 512) * 32;
 	}
@@ -650,10 +699,11 @@ static int fb_num_planes(const struct igt_fb *fb)
 {
 	int num_planes = lookup_drm_format(fb->drm_format)->num_planes;
 
-	if (is_ccs_modifier(fb->modifier))
+	if (is_ccs_modifier(fb->modifier) && !HAS_FLATCCS(intel_get_drm_devid(fb->fd)))
 		num_planes *= 2;
 
-	if (fb->modifier == LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC)
+	if (fb->modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC ||
+	    fb->modifier == I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC)
 		num_planes++;
 
 	return num_planes;
@@ -691,9 +741,9 @@ static uint32_t calc_plane_stride(struct igt_fb *fb, int plane)
 	uint32_t min_stride = fb->plane_width[plane] *
 		(fb->plane_bpp[plane] / 8);
 
-	if (fb->modifier != LOCAL_DRM_FORMAT_MOD_NONE &&
+	if (fb->modifier != DRM_FORMAT_MOD_LINEAR &&
 	    is_i915_device(fb->fd) &&
-	    intel_gen(intel_get_drm_devid(fb->fd)) <= 3) {
+	    intel_display_ver(intel_get_drm_devid(fb->fd)) <= 3) {
 		uint32_t stride;
 
 		/* Round the tiling up to the next power-of-two and the region
@@ -704,7 +754,7 @@ static uint32_t calc_plane_stride(struct igt_fb *fb, int plane)
 		 * tiled. But then that failure is expected.
 		 */
 
-		stride = max(min_stride, 512);
+		stride = max(min_stride, 512u);
 		stride = roundup_power_of_two(stride);
 
 		return stride;
@@ -714,11 +764,11 @@ static uint32_t calc_plane_stride(struct igt_fb *fb, int plane)
 		 * so the easiest way is to align the luma stride to 256.
 		 */
 		return ALIGN(min_stride, 256);
-	} else if (fb->modifier != LOCAL_DRM_FORMAT_MOD_NONE && is_amdgpu_device(fb->fd)) {
+	} else if (fb->modifier != DRM_FORMAT_MOD_LINEAR && is_amdgpu_device(fb->fd)) {
 		/*
 		 * For amdgpu device with tiling mode
 		 */
-		unsigned int tile_width, tile_height;
+		uint32_t tile_width, tile_height;
 
 		igt_amd_fb_calculate_tile_dimension(fb->plane_bpp[plane],
 				     &tile_width, &tile_height);
@@ -727,9 +777,12 @@ static uint32_t calc_plane_stride(struct igt_fb *fb, int plane)
 		return ALIGN(min_stride, tile_width);
 	} else if (is_gen12_ccs_cc_plane(fb, plane)) {
 		/* clear color always fixed to 64 bytes */
-		return 64;
+		return HAS_FLATCCS(intel_get_drm_devid(fb->fd)) ? 512 : 64;
 	} else if (is_gen12_ccs_plane(fb, plane)) {
-		/* A main surface using a CCS AUX surface must be 4x4 tiles aligned. */
+		/*
+		 * The CCS surface stride is
+		 *    ccs_stride = main_surface_stride_in_bytes / 512 * 64.
+		 */
 		return ALIGN(min_stride, 64);
 	} else if (!fb->modifier && is_nouveau_device(fb->fd)) {
 		int align;
@@ -743,25 +796,26 @@ static uint32_t calc_plane_stride(struct igt_fb *fb, int plane)
 		return ALIGN(min_stride, align);
 	} else {
 		unsigned int tile_width, tile_height;
+		int tile_align = 1;
 
 		igt_get_fb_tile_size(fb->fd, fb->modifier, fb->plane_bpp[plane],
 				     &tile_width, &tile_height);
 
 		if (is_gen12_ccs_modifier(fb->modifier))
-			tile_width *= 4;
+			tile_align = 4;
 
-		return ALIGN(min_stride, tile_width);
+		return ALIGN(min_stride, tile_width * tile_align);
 	}
 }
 
 static uint64_t calc_plane_size(struct igt_fb *fb, int plane)
 {
-	if (fb->modifier != LOCAL_DRM_FORMAT_MOD_NONE &&
+	if (fb->modifier != DRM_FORMAT_MOD_LINEAR &&
 	    is_i915_device(fb->fd) &&
-	    intel_gen(intel_get_drm_devid(fb->fd)) <= 3) {
-		uint64_t min_size = (uint64_t) fb->strides[plane] *
+	    intel_display_ver(intel_get_drm_devid(fb->fd)) <= 3) {
+		uint64_t size = (uint64_t) fb->strides[plane] *
 			fb->plane_height[plane];
-		uint64_t size;
+		uint64_t min_size = 1024 * 1024;
 
 		/* Round the tiling up to the next power-of-two and the region
 		 * up to the next pot fence size so that this works on all
@@ -771,11 +825,8 @@ static uint64_t calc_plane_size(struct igt_fb *fb, int plane)
 		 * tiled. But then that failure is expected.
 		 */
 
-		size = max(min_size, 1024*1024);
-		size = roundup_power_of_two(size);
-
-		return size;
-	} else if (fb->modifier != LOCAL_DRM_FORMAT_MOD_NONE && is_amdgpu_device(fb->fd)) {
+		return roundup_power_of_two(max(size, min_size));
+	} else if (fb->modifier != DRM_FORMAT_MOD_LINEAR && is_amdgpu_device(fb->fd)) {
 		/*
 		 * For amdgpu device with tiling mode
 		 */
@@ -788,29 +839,68 @@ static uint64_t calc_plane_size(struct igt_fb *fb, int plane)
 		return (uint64_t) fb->strides[plane] *
 			ALIGN(fb->plane_height[plane], tile_height);
 	} else if (is_gen12_ccs_plane(fb, plane)) {
+		uint64_t size;
+
 		/* The AUX CCS surface must be page aligned */
-		return (uint64_t)fb->strides[plane] *
-			ALIGN(fb->plane_height[plane], 64);
+		size = ALIGN((uint64_t)fb->strides[plane] *
+			     fb->plane_height[plane], 4096);
+
+		return size;
 	} else {
 		unsigned int tile_width, tile_height;
+		uint64_t size;
 
 		igt_get_fb_tile_size(fb->fd, fb->modifier, fb->plane_bpp[plane],
 				     &tile_width, &tile_height);
 
-		/* A main surface using a CCS AUX surface must be 4x4 tiles aligned. */
-		if (is_gen12_ccs_modifier(fb->modifier))
-			tile_height *= 4;
-
-		/* Special case where the "tile height" represents a
-		 * height-based stride, such as with VC4 SAND tiling modes.
-		 */
-
-		if (tile_height > fb->plane_height[plane])
-			return fb->strides[plane] * tile_height;
-
-		return (uint64_t) fb->strides[plane] *
+		size = (uint64_t)fb->strides[plane] *
 			ALIGN(fb->plane_height[plane], tile_height);
+
+		return size;
 	}
+}
+
+static unsigned int gcd(unsigned int a, unsigned int b)
+{
+	while (b) {
+		unsigned int m = a % b;
+
+		a = b;
+		b = m;
+	}
+
+	return a;
+}
+
+static unsigned int lcm(unsigned int a, unsigned int b)
+{
+	unsigned int g = gcd(a, b);
+
+	if (g == 0 || b == 0)
+		return 0;
+
+	return a / g * b;
+}
+
+static unsigned int get_plane_alignment(struct igt_fb *fb, int color_plane)
+{
+	unsigned int tile_width, tile_height;
+	unsigned int tile_row_size;
+	unsigned int alignment;
+
+	if (!(is_i915_device(fb->fd) &&
+	      is_gen12_ccs_modifier(fb->modifier) &&
+	      is_yuv_semiplanar_plane(fb, color_plane)))
+		return 0;
+
+	igt_get_fb_tile_size(fb->fd, fb->modifier, fb->plane_bpp[color_plane],
+			     &tile_width, &tile_height);
+
+	tile_row_size = fb->strides[color_plane] * tile_height;
+
+	alignment = lcm(tile_row_size, 64 * 1024);
+
+	return alignment;
 }
 
 static uint64_t calc_fb_size(struct igt_fb *fb)
@@ -819,9 +909,15 @@ static uint64_t calc_fb_size(struct igt_fb *fb)
 	int plane;
 
 	for (plane = 0; plane < fb->num_planes; plane++) {
+		unsigned int align;
+
 		/* respect the stride requested by the caller */
 		if (!fb->strides[plane])
 			fb->strides[plane] = calc_plane_stride(fb, plane);
+
+		align = get_plane_alignment(fb, plane);
+		if (align)
+			size += align - (size % align);
 
 		fb->offsets[plane] = size;
 
@@ -873,18 +969,23 @@ void igt_calc_fb_size(int fd, int width, int height, uint32_t drm_format, uint64
 uint64_t igt_fb_mod_to_tiling(uint64_t modifier)
 {
 	switch (modifier) {
-	case LOCAL_DRM_FORMAT_MOD_NONE:
+	case DRM_FORMAT_MOD_LINEAR :
 		return I915_TILING_NONE;
-	case LOCAL_I915_FORMAT_MOD_X_TILED:
+	case I915_FORMAT_MOD_X_TILED:
 		return I915_TILING_X;
-	case LOCAL_I915_FORMAT_MOD_Y_TILED:
-	case LOCAL_I915_FORMAT_MOD_Y_TILED_CCS:
-	case LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS:
-	case LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC:
-	case LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS:
+	case I915_FORMAT_MOD_Y_TILED:
+	case I915_FORMAT_MOD_Y_TILED_CCS:
+	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS:
+	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC:
+	case I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS:
 		return I915_TILING_Y;
-	case LOCAL_I915_FORMAT_MOD_Yf_TILED:
-	case LOCAL_I915_FORMAT_MOD_Yf_TILED_CCS:
+	case I915_FORMAT_MOD_4_TILED:
+	case I915_FORMAT_MOD_4_TILED_DG2_RC_CCS:
+	case I915_FORMAT_MOD_4_TILED_DG2_MC_CCS:
+	case I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC:
+		return I915_TILING_4;
+	case I915_FORMAT_MOD_Yf_TILED:
+	case I915_FORMAT_MOD_Yf_TILED_CCS:
 		return I915_TILING_Yf;
 	default:
 		igt_assert(0);
@@ -905,13 +1006,15 @@ uint64_t igt_fb_tiling_to_mod(uint64_t tiling)
 {
 	switch (tiling) {
 	case I915_TILING_NONE:
-		return LOCAL_DRM_FORMAT_MOD_NONE;
+		return DRM_FORMAT_MOD_LINEAR;
 	case I915_TILING_X:
-		return LOCAL_I915_FORMAT_MOD_X_TILED;
+		return I915_FORMAT_MOD_X_TILED;
 	case I915_TILING_Y:
-		return LOCAL_I915_FORMAT_MOD_Y_TILED;
+		return I915_FORMAT_MOD_Y_TILED;
+	case I915_TILING_4:
+		return I915_FORMAT_MOD_4_TILED;
 	case I915_TILING_Yf:
-		return LOCAL_I915_FORMAT_MOD_Yf_TILED;
+		return I915_FORMAT_MOD_Yf_TILED;
 	default:
 		igt_assert(0);
 	}
@@ -926,7 +1029,8 @@ static void memset64(uint64_t *s, uint64_t c, size_t n)
 static void clear_yuv_buffer(struct igt_fb *fb)
 {
 	bool full_range = fb->color_range == IGT_COLOR_YCBCR_FULL_RANGE;
-	size_t plane_size[2];
+	int num_planes = lookup_drm_format(fb->drm_format)->num_planes;
+	size_t plane_size[num_planes];
 	void *ptr;
 
 	igt_assert(igt_format_is_yuv(fb->drm_format));
@@ -934,7 +1038,8 @@ static void clear_yuv_buffer(struct igt_fb *fb)
 	for (int i = 0; i < lookup_drm_format(fb->drm_format)->num_planes; i++) {
 		unsigned int tile_width, tile_height;
 
-		igt_assert_lt(i, ARRAY_SIZE(plane_size));
+		igt_assert_lt(i, num_planes);
+
 		igt_get_fb_tile_size(fb->fd, fb->modifier, fb->plane_bpp[i],
 				     &tile_width, &tile_height);
 		plane_size[i] = fb->strides[i] *
@@ -1001,6 +1106,21 @@ static void clear_yuv_buffer(struct igt_fb *fb)
 			 full_range ? 0x800000008000ULL : 0x800010008000ULL,
 			 plane_size[0] / sizeof(uint64_t));
 		break;
+	case DRM_FORMAT_YUV420:
+	case DRM_FORMAT_YUV422:
+	case DRM_FORMAT_YVU420:
+	case DRM_FORMAT_YVU422:
+		igt_assert(ARRAY_SIZE(plane_size) == 3);
+		memset(ptr + fb->offsets[0],
+		       full_range ? 0x00 : 0x10,
+		       plane_size[0]);
+		memset(ptr + fb->offsets[1],
+		       0x80,
+		       plane_size[1]);
+		memset(ptr + fb->offsets[2],
+		       0x80,
+		       plane_size[2]);
+		break;
 	}
 
 	igt_fb_unmap_buffer(fb, ptr);
@@ -1042,7 +1162,7 @@ static int create_bo_for_fb(struct igt_fb *fb, bool prefer_sysmem)
 		if (is_i915_device(fd)) {
 			int err;
 
-			fb->gem_handle = gem_create(fd, fb->size);
+			fb->gem_handle = gem_buffer_create_fb_obj(fd, fb->size);
 			err = __gem_set_tiling(fd, fb->gem_handle,
 					       igt_fb_mod_to_tiling(fb->modifier),
 					       fb->strides[0]);
@@ -1363,7 +1483,192 @@ void igt_paint_color(cairo_t *cr, int x, int y, int w, int h,
 }
 
 /**
- * igt_fill_cts_framebuffer:
+ * igt_paint_color_rand:
+ * @cr: cairo drawing context
+ * @x: pixel x-coordination of the fill rectangle
+ * @y: pixel y-coordination of the fill rectangle
+ * @w: width of the fill rectangle
+ * @h: height of the fill rectangle
+ *
+ * This functions draws a solid rectangle with random colors using the drawing
+ * context @cr.
+ */
+void igt_paint_color_rand(cairo_t *cr, int x, int y, int w, int h)
+{
+	double r = rand() / (double)RAND_MAX;
+	double g = rand() / (double)RAND_MAX;
+	double b = rand() / (double)RAND_MAX;
+
+	igt_paint_color(cr, x, y, w, h, r, g, b);
+}
+
+/**
+ *
+ * igt_fill_cts_color_square_framebuffer:
+ * @pixmap: handle to mapped buffer
+ * @video_width: required width for pattern
+ * @video_height: required height for pattern
+ * @bitdepth: required bitdepth fot pattern
+ * @alpha: required alpha for the pattern
+ *
+ * This function draws a color square pattern for given width and height
+ * as per the specifications mentioned in section 3.2.5.3 of DP CTS spec.
+ */
+int igt_fill_cts_color_square_framebuffer(uint32_t *pixmap,
+		uint32_t video_width, uint32_t video_height,
+		uint32_t bitdepth, int alpha)
+{
+	uint32_t pmax = 0;
+	uint32_t pmin = 0;
+	int tile_width = 64;
+	int tile_height = 64;
+	int reverse = 0;
+	int i;
+	uint32_t colors[8][3];
+	uint32_t reverse_colors[8][3];
+
+	switch (bitdepth) {
+	case 8:
+		pmax  = 235;
+		pmin  = 16;
+		break;
+	case 10:
+		pmax  = 940;
+		pmin  = 64;
+		break;
+	}
+
+	/*
+	 * According to the requirement stated in the 3.2.5.3  DP CTS spec
+	 * the required pattern for color square should look like below
+	 *
+	 *   white | yellow | cyan    | green | magenta | red    | blue  | black | white | ... | ..
+	 *   -------------------------------------------------------------------------------
+	 *   blue  | red    | magenta | green | cyan    | yellow | white | black | blue  | ... | ..
+	 *   -------------------------------------------------------------------------------
+	 *   white | yellow | cyan    | green | magenta | red    | blue  | black | white | ... | ..
+	 *   -------------------------------------------------------------------------------
+	 *   blue  | red    | magenta | green | cyan    | yellow | white | black | blue  | ... | ..
+	 *   --------------------------------------------------------------------------------
+	 *	  .    |   .      |	  .	|  .	|   .     |	.  |   .   |   .   |   .   |  .
+	 *
+	 *	  .    |   .      |	  .	|  .	|   .	  |	.  |   .   |   .   |   .   |  .
+	 *
+	 *
+	 */
+
+	for (i = 0; i < 8; i++) {
+		if ((i % 8) == 0) {
+			/* White Color */
+			colors[i][0] = pmax;
+			colors[i][1] = pmax;
+			colors[i][2] = pmax;
+			/* Blue Color */
+			reverse_colors[i][0] = pmin;
+			reverse_colors[i][1] = pmin;
+			reverse_colors[i][2] = pmax;
+		} else if ((i % 8) == 1) {
+			/* Yellow Color */
+			colors[i][0] = pmax;
+			colors[i][1] = pmax;
+			colors[i][2] = pmin;
+			/* Red Color */
+			reverse_colors[i][0] = pmax;
+			reverse_colors[i][1] = pmin;
+			reverse_colors[i][2] = pmin;
+		} else if ((i % 8) == 2) {
+			/* Cyan Color */
+			colors[i][0] = pmin;
+			colors[i][1] = pmax;
+			colors[i][2] = pmax;
+			/* Magenta Color */
+			reverse_colors[i][0] = pmax;
+			reverse_colors[i][1] = pmin;
+			reverse_colors[i][2] = pmax;
+		} else if ((i % 8) == 3) {
+			/* Green Color */
+			colors[i][0] = pmin;
+			colors[i][1] = pmax;
+			colors[i][2] = pmin;
+			/* Green Color */
+			reverse_colors[i][0] = pmin;
+			reverse_colors[i][1] = pmax;
+			reverse_colors[i][2] = pmin;
+		} else if ((i % 8) == 4) {
+			/* Magenta Color */
+			colors[i][0] = pmax;
+			colors[i][1] = pmin;
+			colors[i][2] = pmax;
+			/* Cyan Color */
+			reverse_colors[i][0] = pmin;
+			reverse_colors[i][1] = pmax;
+			reverse_colors[i][2] = pmax;
+		} else if ((i % 8) == 5) {
+			/* Red Color */
+			colors[i][0] = pmax;
+			colors[i][1] = pmin;
+			colors[i][2] = pmin;
+			/* Yellow Color */
+			reverse_colors[i][0] = pmax;
+			reverse_colors[i][1] = pmax;
+			reverse_colors[i][2] = pmin;
+		} else if ((i % 8) == 6) {
+			/* Blue Color */
+			colors[i][0] = pmin;
+			colors[i][1] = pmin;
+			colors[i][2] = pmax;
+			/* White Color */
+			reverse_colors[i][0] = pmax;
+			reverse_colors[i][1] = pmax;
+			reverse_colors[i][2] = pmax;
+		} else if ((i % 8) == 7) {
+			/* Black Color */
+			colors[i][0] = pmin;
+			colors[i][1] = pmin;
+			colors[i][2] = pmin;
+			/* Black Color */
+			reverse_colors[i][0] = pmin;
+			reverse_colors[i][1] = pmin;
+			reverse_colors[i][2] = pmin;
+		}
+	}
+
+	for (uint32_t height = 0; height < video_height; height++) {
+		uint32_t color = 0;
+		uint8_t *temp = (uint8_t *)pixmap;
+		uint8_t **buf = &temp;
+		uint32_t (*clr_arr)[3];
+
+		temp += (4 * video_width * height);
+
+		for (uint32_t width = 0; width < video_width; width++) {
+
+			if (reverse == 0)
+				clr_arr = colors;
+			else
+				clr_arr = reverse_colors;
+
+			/* using BGRA8888 format */
+			*(*buf)++ = (((uint8_t)clr_arr[color][2]) & 0xFF);
+			*(*buf)++ = (((uint8_t)clr_arr[color][1]) & 0xFF);
+			*(*buf)++ = (((uint8_t)clr_arr[color][0]) & 0xFF);
+			*(*buf)++ = ((uint8_t)alpha & 0xFF);
+
+			if (((width + 1) % tile_width) == 0)
+				color = (color + 1) % 8;
+
+		}
+		if (((height + 1) % tile_height) == 0) {
+			if (reverse == 0)
+				reverse = 1;
+			else
+				reverse = 0;
+		}
+	}
+	return 0;
+}
+/**
+ * igt_fill_cts_color_ramp_framebuffer:
  * @pixmap: handle to the mapped buffer
  * @video_width: required width for the CTS pattern
  * @video_height: required height for the CTS pattern
@@ -1371,7 +1676,7 @@ void igt_paint_color(cairo_t *cr, int x, int y, int w, int h,
  * @alpha: required alpha for the CTS pattern
  * This functions draws the CTS test pattern for a given width, height.
  */
-int igt_fill_cts_framebuffer(uint32_t *pixmap, uint32_t video_width,
+int igt_fill_cts_color_ramp_framebuffer(uint32_t *pixmap, uint32_t video_width,
 		uint32_t video_height, uint32_t bitdepth, int alpha)
 {
 	uint32_t tile_height, tile_width;
@@ -1768,7 +2073,7 @@ igt_create_fb_with_bo_size(int fd, int width, int height,
 		  __func__, fb->gem_handle, fb->strides[0]);
 
 	if (fb->modifier || igt_has_fb_modifiers(fd))
-		flags = LOCAL_DRM_MODE_FB_MODIFIERS;
+		flags = DRM_MODE_FB_MODIFIERS;
 
 	do_or_die(__kms_addfb(fb->fd, fb->gem_handle,
 			      fb->width, fb->height,
@@ -2125,12 +2430,16 @@ struct fb_blit_upload {
 
 static bool fast_blit_ok(const struct igt_fb *fb)
 {
-	int gen = intel_gen(intel_get_drm_devid(fb->fd));
+	int dev_id = intel_get_drm_devid(fb->fd);
+	int ver = intel_display_ver(dev_id);
 
-	if (gen < 9)
+	if (ver < 9)
 		return false;
 
-	if (gen < 12)
+	if (ver < 12)
+		return true;
+
+	if (ver >= 13 && !IS_ALDERLAKE_P(dev_id))
 		return true;
 
 	return fb->modifier != I915_FORMAT_MOD_X_TILED;
@@ -2236,9 +2545,10 @@ igt_fb_create_intel_buf(int fd, struct buf_ops *bops,
 	if (is_ccs_modifier(fb->modifier)) {
 		igt_assert_eq(fb->strides[0] & 127, 0);
 
-		if (is_gen12_ccs_modifier(fb->modifier))
-			igt_assert_eq(fb->strides[1] & 63, 0);
-		else
+		if (is_gen12_ccs_modifier(fb->modifier)) {
+			if (!HAS_FLATCCS(intel_get_drm_devid(fb->fd)))
+				igt_assert_eq(fb->strides[1] & 63, 0);
+		} else
 			igt_assert_eq(fb->strides[1] & 127, 0);
 
 		if (is_gen12_mc_ccs_modifier(fb->modifier))
@@ -2257,7 +2567,8 @@ igt_fb_create_intel_buf(int fd, struct buf_ops *bops,
 						     fb->width, fb->height,
 						     fb->plane_bpp[0], 0,
 						     igt_fb_mod_to_tiling(fb->modifier),
-						     compression, fb->size);
+						     compression, fb->size,
+						     fb->strides[0]);
 	intel_buf_set_name(buf, name);
 
 	/* Make sure we close handle on destroy path */
@@ -2270,7 +2581,7 @@ igt_fb_create_intel_buf(int fd, struct buf_ops *bops,
 		buf->yuv_semiplanar_bpp = yuv_semiplanar_bpp(fb->drm_format);
 
 	if (is_ccs_modifier(fb->modifier)) {
-		num_surfaces = fb->num_planes / 2;
+		num_surfaces = fb->num_planes / (HAS_FLATCCS(intel_get_drm_devid(fb->fd)) ? 1 : 2);
 		for (i = 0; i < num_surfaces; i++)
 			init_buf_ccs(buf, i,
 				     fb->offsets[num_surfaces + i],
@@ -2288,8 +2599,11 @@ igt_fb_create_intel_buf(int fd, struct buf_ops *bops,
 				 end - fb->offsets[i]);
 	}
 
-	if (fb->modifier == LOCAL_I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC)
+	if (fb->modifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC)
 		buf->cc.offset = fb->offsets[2];
+
+	if (fb->modifier == I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC)
+		buf->cc.offset = fb->offsets[1];
 
 	return buf;
 }
@@ -2370,12 +2684,20 @@ static void blitcopy(const struct igt_fb *dst_fb,
 		     const struct igt_fb *src_fb)
 {
 	uint32_t src_tiling, dst_tiling;
+	uint32_t ctx = 0;
+	uint64_t ahnd = 0;
 
 	igt_assert_eq(dst_fb->fd, src_fb->fd);
 	igt_assert_eq(dst_fb->num_planes, src_fb->num_planes);
 
 	src_tiling = igt_fb_mod_to_tiling(src_fb->modifier);
 	dst_tiling = igt_fb_mod_to_tiling(dst_fb->modifier);
+
+	if (!gem_has_relocations(dst_fb->fd)) {
+		igt_require(gem_has_contexts(dst_fb->fd));
+		ctx = gem_context_create(dst_fb->fd);
+		ahnd = get_reloc_ahnd(dst_fb->fd, ctx);
+	}
 
 	for (int i = 0; i < dst_fb->num_planes; i++) {
 		igt_assert_eq(dst_fb->plane_bpp[i], src_fb->plane_bpp[i]);
@@ -2388,11 +2710,13 @@ static void blitcopy(const struct igt_fb *dst_fb,
 		 */
 		if (fast_blit_ok(src_fb) && fast_blit_ok(dst_fb)) {
 			igt_blitter_fast_copy__raw(dst_fb->fd,
+						   ahnd, ctx, NULL,
 						   src_fb->gem_handle,
 						   src_fb->offsets[i],
 						   src_fb->strides[i],
 						   src_tiling,
 						   0, 0, /* src_x, src_y */
+						   src_fb->size,
 						   dst_fb->plane_width[i],
 						   dst_fb->plane_height[i],
 						   dst_fb->plane_bpp[i],
@@ -2400,14 +2724,17 @@ static void blitcopy(const struct igt_fb *dst_fb,
 						   dst_fb->offsets[i],
 						   dst_fb->strides[i],
 						   dst_tiling,
-						   0, 0 /* dst_x, dst_y */);
+						   0, 0 /* dst_x, dst_y */,
+						   dst_fb->size);
 		} else {
 			igt_blitter_src_copy(dst_fb->fd,
+					     ahnd, ctx, NULL,
 					     src_fb->gem_handle,
 					     src_fb->offsets[i],
 					     src_fb->strides[i],
 					     src_tiling,
 					     0, 0, /* src_x, src_y */
+					     src_fb->size,
 					     dst_fb->plane_width[i],
 					     dst_fb->plane_height[i],
 					     dst_fb->plane_bpp[i],
@@ -2415,9 +2742,14 @@ static void blitcopy(const struct igt_fb *dst_fb,
 					     dst_fb->offsets[i],
 					     dst_fb->strides[i],
 					     dst_tiling,
-					     0, 0 /* dst_x, dst_y */);
+					     0, 0 /* dst_x, dst_y */,
+					     dst_fb->size);
 		}
 	}
+
+	if (ctx)
+		gem_context_destroy(dst_fb->fd, ctx);
+	put_ahnd(ahnd);
 }
 
 static void free_linear_mapping(struct fb_blit_upload *blit)
@@ -2490,7 +2822,7 @@ static void setup_linear_mapping(struct fb_blit_upload *blit)
 	 */
 
 	igt_init_fb(&linear->fb, fb->fd, fb->width, fb->height,
-		    fb->drm_format, LOCAL_DRM_FORMAT_MOD_NONE,
+		    fb->drm_format, DRM_FORMAT_MOD_LINEAR,
 		    fb->color_encoding, fb->color_range);
 
 	create_bo_for_fb(&linear->fb, true);
@@ -2667,7 +2999,7 @@ static void *igt_fb_create_cairo_shadow_buffer(int fd,
 	igt_assert(shadow);
 
 	igt_init_fb(shadow, fd, width, height,
-		    drm_format, LOCAL_DRM_FORMAT_MOD_NONE,
+		    drm_format, DRM_FORMAT_MOD_LINEAR,
 		    IGT_COLOR_YCBCR_BT709, IGT_COLOR_YCBCR_LIMITED_RANGE);
 
 	shadow->strides[0] = ALIGN(width * (shadow->plane_bpp[0] / 8), 16);
@@ -3359,9 +3691,13 @@ static const unsigned char *rgbx_swizzle(uint32_t format)
 	default:
 	case DRM_FORMAT_XRGB16161616F:
 	case DRM_FORMAT_ARGB16161616F:
+	case DRM_FORMAT_XRGB16161616:
+	case DRM_FORMAT_ARGB16161616:
 		return swizzle_bgrx;
 	case DRM_FORMAT_XBGR16161616F:
 	case DRM_FORMAT_ABGR16161616F:
+	case DRM_FORMAT_XBGR16161616:
+	case DRM_FORMAT_ABGR16161616:
 		return swizzle_rgbx;
 	}
 }
@@ -3442,6 +3778,97 @@ static void convert_float_to_fp16(struct fb_convert *cvt)
 
 		ptr += float_stride;
 		fp16 += fp16_stride;
+	}
+}
+
+static void float_to_uint16(const float *f, uint16_t *h, unsigned int num)
+{
+	for (int i = 0; i < num; i++)
+		h[i] = f[i] * 65535.0f + 0.5f;
+}
+
+static void uint16_to_float(const uint16_t *h, float *f, unsigned int num)
+{
+	for (int i = 0; i < num; i++)
+		f[i] = ((float) h[i]) / 65535.0f;
+}
+
+static void convert_uint16_to_float(struct fb_convert *cvt)
+{
+	int i, j;
+	uint16_t *up16;
+	float *ptr = cvt->dst.ptr;
+	unsigned int float_stride = cvt->dst.fb->strides[0] / sizeof(*ptr);
+	unsigned int up16_stride = cvt->src.fb->strides[0] / sizeof(*up16);
+	const unsigned char *swz = rgbx_swizzle(cvt->src.fb->drm_format);
+	bool needs_reswizzle = swz != swizzle_rgbx;
+
+	uint16_t *buf = convert_src_get(cvt);
+	up16 = buf + cvt->src.fb->offsets[0] / sizeof(*buf);
+
+	for (i = 0; i < cvt->dst.fb->height; i++) {
+		if (needs_reswizzle) {
+			const uint16_t *u16_tmp = up16;
+			float *rgb_tmp = ptr;
+
+			for (j = 0; j < cvt->dst.fb->width; j++) {
+				struct igt_vec4 rgb;
+
+				uint16_to_float(u16_tmp, rgb.d, 4);
+
+				rgb_tmp[0] = rgb.d[swz[0]];
+				rgb_tmp[1] = rgb.d[swz[1]];
+				rgb_tmp[2] = rgb.d[swz[2]];
+				rgb_tmp[3] = rgb.d[swz[3]];
+
+				rgb_tmp += 4;
+				u16_tmp += 4;
+			}
+		} else {
+			uint16_to_float(up16, ptr, cvt->dst.fb->width * 4);
+		}
+
+		ptr += float_stride;
+		up16 += up16_stride;
+	}
+
+	convert_src_put(cvt, buf);
+}
+
+static void convert_float_to_uint16(struct fb_convert *cvt)
+{
+	int i, j;
+	uint16_t *up16 = cvt->dst.ptr + cvt->dst.fb->offsets[0];
+	const float *ptr = cvt->src.ptr;
+	unsigned float_stride = cvt->src.fb->strides[0] / sizeof(*ptr);
+	unsigned up16_stride = cvt->dst.fb->strides[0] / sizeof(*up16);
+	const unsigned char *swz = rgbx_swizzle(cvt->dst.fb->drm_format);
+	bool needs_reswizzle = swz != swizzle_rgbx;
+
+	for (i = 0; i < cvt->dst.fb->height; i++) {
+		if (needs_reswizzle) {
+			const float *rgb_tmp = ptr;
+			uint16_t *u16_tmp = up16;
+
+			for (j = 0; j < cvt->dst.fb->width; j++) {
+				struct igt_vec4 rgb;
+
+				rgb.d[0] = rgb_tmp[swz[0]];
+				rgb.d[1] = rgb_tmp[swz[1]];
+				rgb.d[2] = rgb_tmp[swz[2]];
+				rgb.d[3] = rgb_tmp[swz[3]];
+
+				float_to_uint16(rgb.d, u16_tmp, 4);
+
+				rgb_tmp += 4;
+				u16_tmp += 4;
+			}
+		} else {
+			float_to_uint16(ptr, up16, cvt->dst.fb->width * 4);
+		}
+
+		ptr += float_stride;
+		up16 += up16_stride;
 	}
 }
 
@@ -3554,6 +3981,12 @@ static void fb_convert(struct fb_convert *cvt)
 		case DRM_FORMAT_ABGR16161616F:
 			convert_fp16_to_float(cvt);
 			return;
+		case DRM_FORMAT_XRGB16161616:
+		case DRM_FORMAT_XBGR16161616:
+		case DRM_FORMAT_ARGB16161616:
+		case DRM_FORMAT_ABGR16161616:
+			convert_uint16_to_float(cvt);
+			return;
 		}
 	} else if (cvt->src.fb->drm_format == IGT_FORMAT_FLOAT) {
 		switch (cvt->dst.fb->drm_format) {
@@ -3582,6 +4015,12 @@ static void fb_convert(struct fb_convert *cvt)
 		case DRM_FORMAT_ARGB16161616F:
 		case DRM_FORMAT_ABGR16161616F:
 			convert_float_to_fp16(cvt);
+			return;
+		case DRM_FORMAT_XRGB16161616:
+		case DRM_FORMAT_XBGR16161616:
+		case DRM_FORMAT_ARGB16161616:
+		case DRM_FORMAT_ABGR16161616:
+			convert_float_to_uint16(cvt);
 			return;
 		}
 	}
@@ -3998,13 +4437,17 @@ int igt_fb_get_fnv1a_crc(struct igt_fb *fb, igt_crc_t *crc)
 {
 	const uint32_t FNV1a_OFFSET_BIAS = 2166136261;
 	const uint32_t FNV1a_PRIME = 16777619;
+	uint32_t *line = NULL;
 	uint32_t hash;
 	void *map;
-	char *ptr, *line = NULL;
+	char *ptr;
 	int x, y, cpp = igt_drm_format_to_bpp(fb->drm_format) / 8;
 	uint32_t stride = calc_plane_stride(fb, 0);
 
 	if (fb->num_planes != 1)
+		return -EINVAL;
+
+	if (fb->drm_format != DRM_FORMAT_XRGB8888)
 		return -EINVAL;
 
 	ptr = igt_fb_map_buffer(fb->fd, fb);
@@ -4028,9 +4471,17 @@ int igt_fb_get_fnv1a_crc(struct igt_fb *fb, igt_crc_t *crc)
 
 		igt_memcpy_from_wc(line, ptr, fb->width * cpp);
 
-		for (x = 0; x < fb->width * cpp; x++) {
-			hash ^= line[x];
-			hash *= FNV1a_PRIME;
+		for (x = 0; x < fb->width; x++) {
+			unsigned int i;
+			uint32_t pixel = le32_to_cpu(line[x]);
+			pixel &= 0x00ffffff;
+
+			for (i = 0; i < sizeof(pixel); i++) {
+				uint8_t component = (pixel >> (i * 8)) & 0xff;
+
+				hash ^= component;
+				hash *= FNV1a_PRIME;
+			}
 		}
 	}
 
@@ -4150,5 +4601,39 @@ void igt_format_array_fill(uint32_t **formats_array, unsigned int *count,
 			continue;
 
 		(*formats_array)[index++] = format->drm_id;
+	}
+}
+
+const char *igt_fb_modifier_name(uint64_t modifier)
+{
+	switch (modifier) {
+	case DRM_FORMAT_MOD_LINEAR:
+		return "linear";
+	case I915_FORMAT_MOD_X_TILED:
+		return "X";
+	case I915_FORMAT_MOD_Y_TILED:
+		return "Y";
+	case I915_FORMAT_MOD_Yf_TILED:
+		return "Yf";
+	case I915_FORMAT_MOD_Y_TILED_CCS:
+		return "Y-CCS";
+	case I915_FORMAT_MOD_Yf_TILED_CCS:
+		return "Yf-CCS";
+	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS:
+		return "Y-RC_CCS";
+	case I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC:
+		return "Y-RC_CCS-CC";
+	case I915_FORMAT_MOD_Y_TILED_GEN12_MC_CCS:
+		return "Y-MC_CCS";
+	case I915_FORMAT_MOD_4_TILED:
+		return "4";
+	case I915_FORMAT_MOD_4_TILED_DG2_RC_CCS:
+		return "4-RC_CCS";
+	case I915_FORMAT_MOD_4_TILED_DG2_MC_CCS:
+		return "4-MC_CCS";
+	case I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC:
+		return "4-RC_CCS-CC";
+	default:
+		return "?";
 	}
 }

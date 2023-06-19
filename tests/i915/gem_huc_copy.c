@@ -34,6 +34,7 @@
 #include <sys/time.h>
 #include "drm.h"
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 
 IGT_TEST_DESCRIPTION("A very simple workload for the HuC.");
 
@@ -88,6 +89,7 @@ igt_main
 	int drm_fd = -1;
 	uint32_t devid;
 	igt_huc_copyfunc_t huc_copy;
+	uint64_t ahnd;
 
 	igt_fixture {
 		drm_fd = drm_open_driver(DRIVER_INTEL);
@@ -96,6 +98,8 @@ igt_main
 		huc_copy = igt_get_huc_copyfunc(devid);
 
 		igt_require_f(huc_copy, "no huc_copy function\n");
+
+		ahnd = get_reloc_ahnd(drm_fd, 0);
 	}
 
 	igt_describe("Make sure that Huc firmware works"
@@ -105,6 +109,9 @@ igt_main
 	igt_subtest("huc-copy") {
 		char inputs[HUC_COPY_DATA_BUF_SIZE];
 		struct drm_i915_gem_exec_object2 obj[3];
+		uint64_t objsize[3] = { HUC_COPY_DATA_BUF_SIZE,
+					HUC_COPY_DATA_BUF_SIZE,
+					4096 };
 
 		test_huc_load(drm_fd);
 		/* Initialize src buffer randomly */
@@ -122,7 +129,7 @@ igt_main
 
 		gem_write(drm_fd, obj[0].handle, 0, inputs, HUC_COPY_DATA_BUF_SIZE);
 
-		huc_copy(drm_fd, obj);
+		huc_copy(drm_fd, ahnd, obj, objsize);
 		compare_huc_copy_result(drm_fd, obj[0].handle, obj[1].handle);
 
 		gem_close(drm_fd, obj[0].handle);
@@ -130,6 +137,8 @@ igt_main
 		gem_close(drm_fd, obj[2].handle);
 	}
 
-	igt_fixture
+	igt_fixture {
+		put_ahnd(ahnd);
 		close(drm_fd);
+	}
 }

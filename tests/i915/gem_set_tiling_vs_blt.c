@@ -126,7 +126,7 @@ static void do_test(struct buf_ops *bops, uint32_t tiling, unsigned stride,
 	intel_buf_init_using_handle(bops, test_buf->handle, test_buf,
 				    TEST_WIDTH(stride), TEST_HEIGHT(stride), 32,
 				    0, tiling, I915_COMPRESSION_NONE);
-	igt_assert_eq_u32(intel_buf_bo_size(test_buf), TEST_SIZE);
+	igt_assert_eq_u32(intel_buf_size(test_buf), TEST_SIZE);
 	intel_buf_set_ownership(test_buf, true);
 	intel_bb_add_intel_buf(ibb, test_buf, false);
 
@@ -232,6 +232,7 @@ igt_main
 		bops = buf_ops_create(fd);
 	}
 
+	igt_describe("Check for proper synchronization of untiled->tiled transition.");
 	igt_subtest("untiled-to-tiled") {
 		tiling = I915_TILING_NONE;
 		tiling_after = I915_TILING_X;
@@ -240,6 +241,7 @@ igt_main
 		igt_assert(tiling_after == I915_TILING_X);
 	}
 
+	igt_describe("Check for proper synchronization of tiled->untiled transition.");
 	igt_subtest("tiled-to-untiled") {
 		tiling = I915_TILING_X;
 		tiling_after = I915_TILING_NONE;
@@ -248,6 +250,7 @@ igt_main
 		igt_assert(tiling_after == I915_TILING_NONE);
 	}
 
+	igt_describe("Check for proper synchronization of tiled->tiled transition.");
 	igt_subtest("tiled-to-tiled") {
 		tiling = I915_TILING_X;
 		tiling_after = I915_TILING_X;

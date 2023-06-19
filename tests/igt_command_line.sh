@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 #
 # Copyright © 2014 Intel Corporation
 #
@@ -91,6 +91,17 @@ check_test ()
 	if [ $RET -eq 0 -a -z "$LIST" ]; then
 		echo "    test does seem to be using igt_main() (should have subtests) and yet --list-subtests is empty!"
 		fail $test
+	fi
+
+	# check for duplicate subtests
+	echo "  Checking subtest uniqueness..."
+	if [ $RET -eq 0 ]; then
+	    DUPLICATES="`./$test --list-subtests | sort | uniq -d`"
+	    if [ -n "$DUPLICATES" ]; then
+		echo "    test has duplicate subtest names!"
+		echo $DUPLICATES
+		fail $test
+	    fi
 	fi
 }
 

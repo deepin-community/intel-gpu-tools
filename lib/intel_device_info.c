@@ -1,157 +1,184 @@
 #include "intel_chipset.h"
 #include "i915_pciids.h"
+#include "i915_pciids_local.h"
 
 #include <strings.h> /* ffs() */
 
 static const struct intel_device_info intel_generic_info = {
-	.gen = 0,
+	.graphics_ver = 0,
+	.display_ver = 0,
 };
 
 static const struct intel_device_info intel_i810_info = {
-	.gen = BIT(0),
+	.graphics_ver = 1,
+	.display_ver = 1,
 	.is_whitney = true,
 	.codename = "solano" /* 815 == "whitney" ? or vice versa? */
 };
 
 static const struct intel_device_info intel_i815_info = {
-	.gen = BIT(0),
+	.graphics_ver = 1,
+	.display_ver = 1,
 	.is_whitney = true,
 	.codename = "whitney"
 };
 
 static const struct intel_device_info intel_i830_info = {
-	.gen = BIT(1),
+	.graphics_ver = 2,
+	.display_ver = 2,
 	.is_almador = true,
 	.codename = "almador"
 };
 static const struct intel_device_info intel_i845_info = {
-	.gen = BIT(1),
+	.graphics_ver = 2,
+	.display_ver = 2,
 	.is_brookdale = true,
 	.codename = "brookdale"
 };
 static const struct intel_device_info intel_i855_info = {
-	.gen = BIT(1),
+	.graphics_ver = 2,
+	.display_ver = 2,
 	.is_mobile = true,
 	.is_montara = true,
 	.codename = "montara"
 };
 static const struct intel_device_info intel_i865_info = {
-	.gen = BIT(1),
+	.graphics_ver = 2,
+	.display_ver = 2,
 	.is_springdale = true,
 	.codename = "spingdale"
 };
 
 static const struct intel_device_info intel_i915_info = {
-	.gen = BIT(2),
+	.graphics_ver = 3,
+	.display_ver = 3,
 	.is_grantsdale = true,
 	.codename = "grantsdale"
 };
 static const struct intel_device_info intel_i915m_info = {
-	.gen = BIT(2),
+	.graphics_ver = 3,
+	.display_ver = 3,
 	.is_mobile = true,
 	.is_alviso = true,
 	.codename = "alviso"
 };
 static const struct intel_device_info intel_i945_info = {
-	.gen = BIT(2),
+	.graphics_ver = 3,
+	.display_ver = 3,
 	.is_lakeport = true,
 	.codename = "lakeport"
 };
 static const struct intel_device_info intel_i945m_info = {
-	.gen = BIT(2),
+	.graphics_ver = 3,
+	.display_ver = 3,
 	.is_mobile = true,
 	.is_calistoga = true,
 	.codename = "calistoga"
 };
 
 static const struct intel_device_info intel_g33_info = {
-	.gen = BIT(2),
+	.graphics_ver = 3,
+	.display_ver = 3,
 	.is_bearlake = true,
 	.codename = "bearlake"
 };
 
 static const struct intel_device_info intel_pineview_g_info = {
-	.gen = BIT(2),
+	.graphics_ver = 3,
+	.display_ver = 3,
 	.is_pineview = true,
 	.codename = "pineview"
 };
 
 static const struct intel_device_info intel_pineview_m_info = {
-	.gen = BIT(2),
+	.graphics_ver = 3,
+	.display_ver = 3,
 	.is_mobile = true,
 	.is_pineview = true,
 	.codename = "pineview"
 };
 
 static const struct intel_device_info intel_i965_info = {
-	.gen = BIT(3),
+	.graphics_ver = 4,
+	.display_ver = 4,
 	.is_broadwater = true,
 	.codename = "broadwater"
 };
 
 static const struct intel_device_info intel_i965m_info = {
-	.gen = BIT(3),
+	.graphics_ver = 4,
+	.display_ver = 4,
 	.is_mobile = true,
 	.is_crestline = true,
 	.codename = "crestline"
 };
 
 static const struct intel_device_info intel_g45_info = {
-	.gen = BIT(3),
+	.graphics_ver = 4,
+	.display_ver = 4,
 	.is_eaglelake = true,
 	.codename = "eaglelake"
 };
 static const struct intel_device_info intel_gm45_info = {
-	.gen = BIT(3),
+	.graphics_ver = 4,
+	.display_ver = 4,
 	.is_mobile = true,
 	.is_cantiga = true,
 	.codename = "cantiga"
 };
 
 static const struct intel_device_info intel_ironlake_info = {
-	.gen = BIT(4),
+	.graphics_ver = 5,
+	.display_ver = 5,
 	.is_ironlake = true,
 	.codename = "ironlake" /* clarkdale? */
 };
 static const struct intel_device_info intel_ironlake_m_info = {
-	.gen = BIT(4),
+	.graphics_ver = 5,
+	.display_ver = 5,
 	.is_mobile = true,
 	.is_arrandale = true,
 	.codename = "arrandale"
 };
 
 static const struct intel_device_info intel_sandybridge_info = {
-	.gen = BIT(5),
+	.graphics_ver = 6,
+	.display_ver = 6,
 	.is_sandybridge = true,
 	.codename = "sandybridge"
 };
 static const struct intel_device_info intel_sandybridge_m_info = {
-	.gen = BIT(5),
+	.graphics_ver = 6,
+	.display_ver = 6,
 	.is_mobile = true,
 	.is_sandybridge = true,
 	.codename = "sandybridge"
 };
 
 static const struct intel_device_info intel_ivybridge_info = {
-	.gen = BIT(6),
+	.graphics_ver = 7,
+	.display_ver = 7,
 	.is_ivybridge = true,
 	.codename = "ivybridge"
 };
 static const struct intel_device_info intel_ivybridge_m_info = {
-	.gen = BIT(6),
+	.graphics_ver = 7,
+	.display_ver = 7,
 	.is_mobile = true,
 	.is_ivybridge = true,
 	.codename = "ivybridge"
 };
 
 static const struct intel_device_info intel_valleyview_info = {
-	.gen = BIT(6),
+	.graphics_ver = 7,
+	.display_ver = 7,
 	.is_valleyview = true,
 	.codename = "valleyview"
 };
 
 #define HASWELL_FIELDS \
-	.gen = BIT(6), \
+	.graphics_ver = 7, \
+	.display_ver = 7, \
 	.is_haswell = true, \
 	.codename = "haswell"
 
@@ -171,7 +198,8 @@ static const struct intel_device_info intel_haswell_gt3_info = {
 };
 
 #define BROADWELL_FIELDS \
-	.gen = BIT(7), \
+	.graphics_ver = 8, \
+	.display_ver = 8, \
 	.is_broadwell = true, \
 	.codename = "broadwell"
 
@@ -195,13 +223,15 @@ static const struct intel_device_info intel_broadwell_unknown_info = {
 };
 
 static const struct intel_device_info intel_cherryview_info = {
-	.gen = BIT(7),
+	.graphics_ver = 8,
+	.display_ver = 8,
 	.is_cherryview = true,
 	.codename = "cherryview"
 };
 
 #define SKYLAKE_FIELDS \
-	.gen = BIT(8), \
+	.graphics_ver = 9, \
+	.display_ver = 9, \
 	.codename = "skylake", \
 	.is_skylake = true
 
@@ -226,13 +256,15 @@ static const struct intel_device_info intel_skylake_gt4_info = {
 };
 
 static const struct intel_device_info intel_broxton_info = {
-	.gen = BIT(8),
+	.graphics_ver = 9,
+	.display_ver = 9,
 	.is_broxton = true,
 	.codename = "broxton"
 };
 
 #define KABYLAKE_FIELDS \
-	.gen = BIT(8), \
+	.graphics_ver = 9, \
+	.display_ver = 9, \
 	.is_kabylake = true, \
 	.codename = "kabylake"
 
@@ -257,13 +289,15 @@ static const struct intel_device_info intel_kabylake_gt4_info = {
 };
 
 static const struct intel_device_info intel_geminilake_info = {
-	.gen = BIT(8),
+	.graphics_ver = 9,
+	.display_ver = 9,
 	.is_geminilake = true,
 	.codename = "geminilake"
 };
 
 #define COFFEELAKE_FIELDS \
-	.gen = BIT(8), \
+	.graphics_ver = 9, \
+	.display_ver = 9, \
 	.is_coffeelake = true, \
 	.codename = "coffeelake"
 
@@ -283,7 +317,8 @@ static const struct intel_device_info intel_coffeelake_gt3_info = {
 };
 
 #define COMETLAKE_FIELDS \
-	.gen = BIT(8), \
+	.graphics_ver = 9, \
+	.display_ver = 9, \
 	.is_cometlake = true, \
 	.codename = "cometlake"
 
@@ -298,59 +333,119 @@ static const struct intel_device_info intel_cometlake_gt2_info = {
 };
 
 static const struct intel_device_info intel_cannonlake_info = {
-	.gen = BIT(9),
+	.graphics_ver = 10,
+	.display_ver = 10,
 	.is_cannonlake = true,
 	.codename = "cannonlake"
 };
 
 static const struct intel_device_info intel_icelake_info = {
-	.gen = BIT(10),
+	.graphics_ver = 11,
+	.display_ver = 11,
 	.is_icelake = true,
 	.codename = "icelake"
 };
 
 static const struct intel_device_info intel_elkhartlake_info = {
-	.gen = BIT(10),
+	.graphics_ver = 11,
+	.display_ver = 11,
 	.is_elkhartlake = true,
 	.codename = "elkhartlake"
 };
 
 static const struct intel_device_info intel_jasperlake_info = {
-	.gen = BIT(10),
+	.graphics_ver = 11,
+	.display_ver = 11,
 	.is_jasperlake = true,
 	.codename = "jasperlake"
 };
 
 static const struct intel_device_info intel_tigerlake_gt1_info = {
-	.gen = BIT(11),
+	.graphics_ver = 12,
+	.display_ver = 12,
 	.is_tigerlake = true,
 	.codename = "tigerlake",
 	.gt = 1,
 };
 
 static const struct intel_device_info intel_tigerlake_gt2_info = {
-	.gen = BIT(11),
+	.graphics_ver = 12,
+	.display_ver = 12,
 	.is_tigerlake = true,
 	.codename = "tigerlake",
 	.gt = 2,
 };
 
 static const struct intel_device_info intel_rocketlake_info = {
-	.gen = BIT(11),
+	.graphics_ver = 12,
+	.display_ver = 12,
 	.is_rocketlake = true,
 	.codename = "rocketlake"
 };
 
 static const struct intel_device_info intel_dg1_info = {
-	.gen = BIT(11),
+	.graphics_ver = 12,
+	.graphics_rel = 10,
+	.display_ver = 12,
 	.is_dg1 = true,
 	.codename = "dg1"
 };
 
+static const struct intel_device_info intel_dg2_info = {
+	.graphics_ver = 12,
+	.graphics_rel = 55,
+	.display_ver = 13,
+	.has_4tile = true,
+	.is_dg2 = true,
+	.codename = "dg2",
+	.has_flatccs = true,
+};
+
 static const struct intel_device_info intel_alderlake_s_info = {
-	.gen = BIT(11),
+	.graphics_ver = 12,
+	.display_ver = 12,
 	.is_alderlake_s = true,
 	.codename = "alderlake_s"
+};
+
+static const struct intel_device_info intel_raptorlake_s_info = {
+	.graphics_ver = 12,
+	.display_ver = 12,
+	.is_raptorlake_s = true,
+	.codename = "raptorlake_s"
+};
+
+static const struct intel_device_info intel_alderlake_p_info = {
+	.graphics_ver = 12,
+	.display_ver = 13,
+	.is_alderlake_p = true,
+	.codename = "alderlake_p"
+};
+
+static const struct intel_device_info intel_alderlake_n_info = {
+	.graphics_ver = 12,
+	.display_ver = 13,
+	.is_alderlake_n = true,
+	.codename = "alderlake_n"
+};
+
+static const struct intel_device_info intel_ats_m_info = {
+	.graphics_ver = 12,
+	.graphics_rel = 55,
+	.display_ver = 0, /* no display support */
+	.is_dg2 = true,
+	.has_4tile = true,
+	.codename = "ats_m",
+	.has_flatccs = true,
+};
+
+static const struct intel_device_info intel_meteorlake_info = {
+	.graphics_ver = 12,
+	.graphics_rel = 70,
+	.display_ver = 14,
+	.has_4tile = true,
+	.is_meteorlake = true,
+	.codename = "meteorlake"
 };
 
 static const struct pci_id_match intel_device_match[] = {
@@ -442,8 +537,17 @@ static const struct pci_id_match intel_device_match[] = {
 	INTEL_RKL_IDS(&intel_rocketlake_info),
 
 	INTEL_DG1_IDS(&intel_dg1_info),
+	INTEL_DG2_IDS(&intel_dg2_info),
 
 	INTEL_ADLS_IDS(&intel_alderlake_s_info),
+	INTEL_RPLS_IDS(&intel_raptorlake_s_info),
+	INTEL_ADLP_IDS(&intel_alderlake_p_info),
+	INTEL_RPLP_IDS(&intel_alderlake_p_info),
+	INTEL_ADLN_IDS(&intel_alderlake_n_info),
+
+	INTEL_ATS_M_IDS(&intel_ats_m_info),
+
+	INTEL_MTL_IDS(&intel_meteorlake_info),
 
 	INTEL_VGA_DEVICE(PCI_MATCH_ANY, &intel_generic_info),
 };
@@ -490,5 +594,26 @@ out:
  */
 unsigned intel_gen(uint16_t devid)
 {
-	return ffs(intel_get_device_info(devid)->gen) ?: -1u;
+	return intel_get_device_info(devid)->graphics_ver ?: -1u;
+}
+
+unsigned intel_graphics_ver(uint16_t devid)
+{
+	const struct intel_device_info *info = intel_get_device_info(devid);
+
+	return IP_VER(info->graphics_ver, info->graphics_rel);
+}
+
+/**
+ * intel_display_ver:
+ * @devid: pci device id
+ *
+ * Computes the Intel GFX display version for the given device id.
+ *
+ * Returns:
+ * The display version on successful lookup, -1u on failure.
+ */
+unsigned intel_display_ver(uint16_t devid)
+{
+	return intel_get_device_info(devid)->display_ver ?: -1u;
 }

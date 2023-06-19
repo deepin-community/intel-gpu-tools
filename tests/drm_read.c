@@ -46,6 +46,8 @@
 #include <pthread.h>
 #include "drm.h"
 
+#include "igt_types.h"
+
 IGT_TEST_DESCRIPTION("Call read(drm) and see if it behaves.");
 
 static void sighandler(int sig, siginfo_t * info, void *context)
@@ -103,10 +105,11 @@ static void teardown(int fd)
 static void test_invalid_buffer(int in)
 {
 	int fd = setup(in, 0);
+	void *add = (void *)-1;
 
 	alarm(1);
 
-	igt_assert_eq(read(fd, (void *)-1, 4096), -1);
+	igt_assert_eq(read(fd, add, 4096), -1);
 	igt_assert_eq(errno, EFAULT);
 
 	teardown(fd);
@@ -220,7 +223,7 @@ static void test_short_buffer_wakeup(int in, enum pipe pipe)
 		pthread_mutex_unlock(&w.mutex);
 
 		/* Give each thread a chance to sleep in drm_read() */
-		pthread_yield();
+		sched_yield();
 
 		/* One event should wake all threads as none consume */
 		generate_event(w.fd, pipe);
@@ -252,10 +255,10 @@ static void test_short_buffer_wakeup(int in, enum pipe pipe)
 
 igt_main
 {
-	int fd;
 	igt_display_t display;
 	struct igt_fb fb;
 	enum pipe pipe;
+	igt_fd_t(fd);
 
 	igt_fixture {
 		struct sigaction alarm_action = {};
@@ -277,7 +280,7 @@ igt_main
 
 			igt_create_pattern_fb(fd, mode->hdisplay, mode->vdisplay,
 					      DRM_FORMAT_XRGB8888,
-					      LOCAL_DRM_FORMAT_MOD_NONE, &fb);
+					      DRM_FORMAT_MOD_LINEAR, &fb);
 
 			igt_output_set_pipe(output, pipe);
 			igt_plane_set_fb(igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY), &fb);

@@ -1,7 +1,10 @@
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <glib.h>
+#ifdef __linux__
 #include <linux/watchdog.h>
+#endif
 #if HAVE_OPING
 #include <oping.h>
 #endif
@@ -11,14 +14,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/poll.h>
 #include <sys/signalfd.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -27,9 +33,11 @@
 #include "igt_taints.h"
 #include "executor.h"
 #include "output_strings.h"
+#include "runnercomms.h"
 
 #define KMSG_HEADER "[IGT] "
 #define KMSG_WARN 4
+#define GRACEFUL_EXITCODE -SIGHUP
 
 static struct {
 	int *fds;
@@ -363,7 +371,7 @@ static char *need_to_abort(const struct settings* settings)
 	return NULL;
 }
 
-static void prune_subtest(struct job_list_entry *entry, char *subtest)
+static void prune_subtest(struct job_list_entry *entry, const char *subtest)
 {
 	char *excl;
 
@@ -440,11 +448,77 @@ static bool prune_from_journal(struct job_list_entry *entry, int fd)
 	return pruned > 0;
 }
 
+struct prune_comms_data
+{
+	struct job_list_entry *entry;
+	int pruned;
+	bool got_exit;
+};
+
+static bool prune_handle_subtest_start(const struct runnerpacket *packet,
+				       runnerpacket_read_helper helper,
+				       void *userdata)
+{
+	struct prune_comms_data *data = userdata;
+
+	prune_subtest(data->entry, helper.subteststart.name);
+	data->pruned++;
+
+	return true;
+}
+
+static bool prune_handle_exit(const struct runnerpacket *packet,
+			      runnerpacket_read_helper helper,
+			      void *userdata)
+{
+	struct prune_comms_data *data = userdata;
+
+	data->got_exit = true;
+
+	return true;
+}
+
+static bool prune_from_comms(struct job_list_entry *entry, int fd)
+{
+	struct prune_comms_data data = {
+		.entry = entry,
+		.pruned = 0,
+		.got_exit = false,
+	};
+	struct comms_visitor visitor = {
+		.subtest_start = prune_handle_subtest_start,
+		.exit = prune_handle_exit,
+
+		.userdata = &data,
+	};
+	size_t old_count = entry->subtest_count;
+
+	if (comms_read_dump(fd, &visitor) == COMMSPARSE_ERROR)
+		return false;
+
+	/*
+	 * If we know the subtests we originally wanted to run, check
+	 * if we got an equal amount already.
+	 */
+	if (old_count > 0 && data.pruned >= old_count)
+		entry->binary[0] = '\0';
+
+	/*
+	 * If we don't know how many subtests there should be but we
+	 * got an exit, also consider the test fully finished.
+	 */
+	if (data.got_exit)
+		entry->binary[0] = '\0';
+
+	return data.pruned > 0;
+}
+
 static const char *filenames[_F_LAST] = {
 	[_F_JOURNAL] = "journal.txt",
 	[_F_OUT] = "out.txt",
 	[_F_ERR] = "err.txt",
 	[_F_DMESG] = "dmesg.txt",
+	[_F_SOCKET] = "comms",
 };
 
 static int open_at_end(int dirfd, const char *name)
@@ -476,6 +550,9 @@ bool open_output_files(int dirfd, int *fds, bool write)
 
 	for (i = 0; i < _F_LAST; i++) {
 		if ((fds[i] = openfunc(dirfd, filenames[i])) < 0) {
+			/* Ignore failure to open socket comms for reading */
+			if (i == _F_SOCKET && !write) continue;
+
 			while (--i >= 0)
 				close(fds[i]);
 			return false;
@@ -756,6 +833,19 @@ static int next_kill_signal(int killed)
 	}
 }
 
+static void write_packet_with_canary(int fd, struct runnerpacket *packet, bool sync)
+{
+	uint32_t canary = socket_dump_canary();
+
+	write(fd, &canary, sizeof(canary));
+	write(fd, packet, packet->size);
+	if (sync)
+		fdatasync(fd);
+}
+
+/* TODO: Refactor this macro from here and from various tests to lib */
+#define KB(x) ((x) * 1024)
+
 /*
  * Returns:
  *  =0 - Success
@@ -763,14 +853,16 @@ static int next_kill_signal(int killed)
  *  >0 - Timeout happened, need to recreate from journal
  */
 static int monitor_output(pid_t child,
-			  int outfd, int errfd, int kmsgfd, int sigfd,
+			  int outfd, int errfd, int socketfd,
+			  int kmsgfd, int sigfd,
 			  int *outputs,
 			  double *time_spent,
 			  struct settings *settings,
 			  char **abortreason)
 {
 	fd_set set;
-	char buf[2048];
+	char *buf;
+	size_t bufsize;
 	char *outbuf = NULL;
 	size_t outbufsize = 0;
 	char current_subtest[256] = {};
@@ -785,12 +877,15 @@ static int monitor_output(pid_t child,
 	unsigned long taints = 0;
 	bool aborting = false;
 	size_t disk_usage = 0;
+	bool socket_comms_used = false; /* whether the test actually uses comms */
 
 	igt_gettime(&time_beg);
 	time_last_activity = time_last_subtest = time_killed = time_beg;
 
 	if (errfd > nfds)
 		nfds = errfd;
+	if (socketfd > nfds)
+		nfds = socketfd;
 	if (kmsgfd > nfds)
 		nfds = kmsgfd;
 	if (sigfd > nfds)
@@ -820,6 +915,9 @@ static int monitor_output(pid_t child,
 		}
 	}
 
+	bufsize = KB(256);
+	buf = malloc(bufsize);
+
 	while (outfd >= 0 || errfd >= 0 || sigfd >= 0) {
 		const char *timeout_reason;
 		struct timeval tv = { .tv_sec = interval_length };
@@ -829,6 +927,8 @@ static int monitor_output(pid_t child,
 			FD_SET(outfd, &set);
 		if (errfd >= 0)
 			FD_SET(errfd, &set);
+		if (socketfd >= 0)
+			FD_SET(socketfd, &set);
 		if (kmsgfd >= 0)
 			FD_SET(kmsgfd, &set);
 		if (sigfd >= 0)
@@ -850,7 +950,7 @@ static int monitor_output(pid_t child,
 
 			time_last_activity = time_now;
 
-			s = read(outfd, buf, sizeof(buf));
+			s = read(outfd, buf, bufsize);
 			if (s <= 0) {
 				if (s < 0) {
 					errf("Error reading test's stdout: %m\n");
@@ -945,7 +1045,7 @@ static int monitor_output(pid_t child,
 		if (errfd >= 0 && FD_ISSET(errfd, &set)) {
 			time_last_activity = time_now;
 
-			s = read(errfd, buf, sizeof(buf));
+			s = read(errfd, buf, bufsize);
 			if (s <= 0) {
 				if (s < 0) {
 					errf("Error reading test's stderr: %m\n");
@@ -960,6 +1060,113 @@ static int monitor_output(pid_t child,
 				}
 			}
 		}
+
+		if (socketfd >= 0 && FD_ISSET(socketfd, &set)) {
+			struct runnerpacket *packet;
+
+			time_last_activity = time_now;
+
+			/* Fully drain everything */
+			while (true) {
+				s = recv(socketfd, buf, bufsize, MSG_DONTWAIT);
+
+				if (s < 0) {
+					if (errno == EAGAIN)
+						break;
+
+					errf("Error reading from communication socket: %m\n");
+
+					close(socketfd);
+					socketfd = -1;
+					goto socket_end;
+				}
+
+				packet = (struct runnerpacket *)buf;
+				if (s < sizeof(*packet) || s != packet->size) {
+					struct runnerpacket *message, *override;
+
+					errf("Socket communication error: Received %zd bytes, expected %zd\n",
+					     s, s >= sizeof(packet->size) ? packet->size : sizeof(*packet));
+					message = runnerpacket_log(STDOUT_FILENO,
+								   "\nrunner: Socket communication error, invalid packet size. "
+								   "Packet is discarded, test result and logs might be incorrect.\n");
+					write_packet_with_canary(outputs[_F_SOCKET], message, false);
+					free(message);
+
+					override = runnerpacket_resultoverride("warn");
+					write_packet_with_canary(outputs[_F_SOCKET], override, settings->sync);
+					free(override);
+
+					/* Continue using socket comms, hope for the best. */
+					goto socket_end;
+				}
+
+				write_packet_with_canary(outputs[_F_SOCKET], packet, settings->sync);
+
+				/*
+				 * runner sends EXEC itself before executing
+				 * the test, other types indicate the test
+				 * really uses socket comms
+				 */
+				if (packet->type != PACKETTYPE_EXEC)
+					socket_comms_used = true;
+
+				if (packet->type == PACKETTYPE_SUBTEST_START ||
+				    packet->type == PACKETTYPE_DYNAMIC_SUBTEST_START) {
+					time_last_subtest = time_now;
+					disk_usage = 0;
+				}
+
+				disk_usage += packet->size;
+
+				if (settings->log_level >= LOG_LEVEL_VERBOSE) {
+					runnerpacket_read_helper helper = {};
+					const char *time;
+
+					if (packet->type == PACKETTYPE_SUBTEST_START ||
+					    packet->type == PACKETTYPE_SUBTEST_RESULT ||
+					    packet->type == PACKETTYPE_DYNAMIC_SUBTEST_START ||
+					    packet->type == PACKETTYPE_DYNAMIC_SUBTEST_RESULT)
+						helper = read_runnerpacket(packet);
+
+					switch (helper.type) {
+					case PACKETTYPE_SUBTEST_START:
+						if (helper.subteststart.name)
+							outf("Starting subtest: %s\n", helper.subteststart.name);
+						break;
+					case PACKETTYPE_SUBTEST_RESULT:
+						if (helper.subtestresult.name && helper.subtestresult.result) {
+							time = "<unknown>";
+							if (helper.subtestresult.timeused)
+								time = helper.subtestresult.timeused;
+							outf("Subtest %s: %s (%ss)\n",
+							     helper.subtestresult.name,
+							     helper.subtestresult.result,
+							     time);
+						}
+						break;
+					case PACKETTYPE_DYNAMIC_SUBTEST_START:
+						if (helper.dynamicsubteststart.name)
+							outf("Starting dynamic subtest: %s\n", helper.dynamicsubteststart.name);
+						break;
+					case PACKETTYPE_DYNAMIC_SUBTEST_RESULT:
+						if (helper.dynamicsubtestresult.name && helper.dynamicsubtestresult.result) {
+							time = "<unknown>";
+							if (helper.dynamicsubtestresult.timeused)
+								time = helper.dynamicsubtestresult.timeused;
+							outf("Dynamic subtest %s: %s (%ss)\n",
+							     helper.dynamicsubtestresult.name,
+							     helper.dynamicsubtestresult.result,
+							     time);
+						}
+						break;
+					default:
+						break;
+					}
+				}
+			}
+		}
+	socket_end:
 
 		if (kmsgfd >= 0 && FD_ISSET(kmsgfd, &set)) {
 			long dmesgwritten;
@@ -1030,11 +1237,23 @@ static int monitor_output(pid_t child,
 					if (settings->log_level >= LOG_LEVEL_NORMAL)
 						outf("Exiting gracefully, currently running test will have a 'notrun' result\n");
 
-					dprintf(outputs[_F_JOURNAL], "%s%d (%.3fs)\n",
-						EXECUTOR_EXIT,
-						-SIGHUP, 0.0);
-					if (settings->sync)
-						fdatasync(outputs[_F_JOURNAL]);
+					if (socket_comms_used) {
+						struct runnerpacket *message, *override;
+
+						message = runnerpacket_log(STDOUT_FILENO, "runner: Exiting gracefully, overriding this test's result to be notrun\n");
+						write_packet_with_canary(outputs[_F_SOCKET], message, false); /* possible sync after the override packet */
+						free(message);
+
+						override = runnerpacket_resultoverride("notrun");
+						write_packet_with_canary(outputs[_F_SOCKET], override, settings->sync);
+						free(override);
+					} else {
+						dprintf(outputs[_F_JOURNAL], "%s%d (0.000s)\n",
+							EXECUTOR_EXIT,
+							GRACEFUL_EXITCODE);
+						if (settings->sync)
+							fdatasync(outputs[_F_JOURNAL]);
+					}
 				}
 
 				aborting = true;
@@ -1051,9 +1270,10 @@ static int monitor_output(pid_t child,
 				time = 0.0;
 
 			if (!aborting) {
-				const char *exitline;
+				bool timeoutresult = false;
 
-				exitline = killed ? EXECUTOR_TIMEOUT : EXECUTOR_EXIT;
+				if (killed)
+					timeoutresult = true;
 
 				/* If we're stopping because we killed
 				 * the test for tainting, let's not
@@ -1067,7 +1287,7 @@ static int monitor_output(pid_t child,
 				 * journaling a timeout here.
 				 */
 				if (killed && is_tainted(taints)) {
-					exitline = EXECUTOR_EXIT;
+					timeoutresult = false;
 
 					/*
 					 * Also inject a message to
@@ -1080,11 +1300,22 @@ static int monitor_output(pid_t child,
 					 * have newlines on both ends
 					 * of this injection though.
 					 */
-					dprintf(outputs[_F_OUT],
-						"\nrunner: This test was killed due to a kernel taint (0x%lx).\n",
-						taints);
-					if (settings->sync)
-						fdatasync(outputs[_F_OUT]);
+					if (socket_comms_used) {
+						struct runnerpacket *message;
+						char killmsg[256];
+
+						snprintf(killmsg, sizeof(killmsg),
+							 "runner: This test was killed due to a kernel taint (0x%lx).\n", taints);
+						message = runnerpacket_log(STDOUT_FILENO, killmsg);
+						write_packet_with_canary(outputs[_F_SOCKET], message, settings->sync);
+						free(message);
+					} else {
+						dprintf(outputs[_F_OUT],
+							"\nrunner: This test was killed due to a kernel taint (0x%lx).\n",
+							taints);
+						if (settings->sync)
+							fdatasync(outputs[_F_OUT]);
+					}
 				}
 
 				/*
@@ -1092,21 +1323,58 @@ static int monitor_output(pid_t child,
 				 * exceeded the disk usage limit.
 				 */
 				if (killed && disk_usage_limit_exceeded(settings, disk_usage)) {
-					exitline = EXECUTOR_EXIT;
-					dprintf(outputs[_F_OUT],
-						"\nrunner: This test was killed due to exceeding disk usage limit. "
-						"(Used %zd bytes, limit %zd)\n",
-						disk_usage,
-						settings->disk_usage_limit);
-					if (settings->sync)
-						fdatasync(outputs[_F_OUT]);
+					timeoutresult = false;
+
+					if (socket_comms_used) {
+						struct runnerpacket *message;
+						char killmsg[256];
+
+						snprintf(killmsg, sizeof(killmsg),
+							 "runner: This test was killed due to exceeding disk usage limit. "
+							 "(Used %zd bytes, limit %zd)\n",
+							 disk_usage,
+							 settings->disk_usage_limit);
+						message = runnerpacket_log(STDOUT_FILENO, killmsg);
+						write_packet_with_canary(outputs[_F_SOCKET], message, settings->sync);
+						free(message);
+					} else {
+						dprintf(outputs[_F_OUT],
+							"\nrunner: This test was killed due to exceeding disk usage limit. "
+							"(Used %zd bytes, limit %zd)\n",
+							disk_usage,
+							settings->disk_usage_limit);
+						if (settings->sync)
+							fdatasync(outputs[_F_OUT]);
+					}
 				}
 
-				dprintf(outputs[_F_JOURNAL], "%s%d (%.3fs)\n",
-					exitline,
-					status, time);
-				if (settings->sync) {
-					fdatasync(outputs[_F_JOURNAL]);
+				if (socket_comms_used) {
+					struct runnerpacket *exitpacket;
+					char timestr[32];
+
+					snprintf(timestr, sizeof(timestr), "%.3f", time);
+
+					if (timeoutresult) {
+						struct runnerpacket *override;
+
+						override = runnerpacket_resultoverride("timeout");
+						write_packet_with_canary(outputs[_F_SOCKET], override, false); /* sync after exitpacket */
+						free(override);
+					}
+
+					exitpacket = runnerpacket_exit(status, timestr);
+					write_packet_with_canary(outputs[_F_SOCKET], exitpacket, settings->sync);
+					free(exitpacket);
+				} else {
+					const char *exitline;
+
+					exitline = timeoutresult ? EXECUTOR_TIMEOUT : EXECUTOR_EXIT;
+					dprintf(outputs[_F_JOURNAL], "%s%d (%.3fs)\n",
+						exitline,
+						status, time);
+					if (settings->sync) {
+						fdatasync(outputs[_F_JOURNAL]);
+					}
 				}
 
 				if (status == IGT_EXIT_ABORT) {
@@ -1148,9 +1416,11 @@ static int monitor_output(pid_t child,
 					fdatasync(outputs[_F_DMESG]);
 
 				close_watchdogs(settings);
+				free(buf);
 				free(outbuf);
 				close(outfd);
 				close(errfd);
+				close(socketfd);
 				close(kmsgfd);
 				return -1;
 			}
@@ -1171,9 +1441,11 @@ static int monitor_output(pid_t child,
 	if (settings->sync)
 		fdatasync(outputs[_F_DMESG]);
 
+	free(buf);
 	free(outbuf);
 	close(outfd);
 	close(errfd);
+	close(socketfd);
 	close(kmsgfd);
 
 	if (aborting)
@@ -1183,7 +1455,7 @@ static int monitor_output(pid_t child,
 }
 
 static void __attribute__((noreturn))
-execute_test_process(int outfd, int errfd,
+execute_test_process(int outfd, int errfd, int socketfd,
 		     struct settings *settings,
 		     struct job_list_entry *entry)
 {
@@ -1233,6 +1505,13 @@ execute_test_process(int outfd, int errfd,
 			strcpy(argv[2] + argsize + 1, sub);
 			argsize += sublen + 1;
 		}
+	}
+
+	if (socketfd >= 0) {
+		struct runnerpacket *packet;
+
+		packet = runnerpacket_exec(argv);
+		write(socketfd, packet, packet->size);
 	}
 
 	execv(argv[0], argv);
@@ -1316,7 +1595,8 @@ static int execute_next_entry(struct execute_state *state,
 	int kmsgfd;
 	int outpipe[2] = { -1, -1 };
 	int errpipe[2] = { -1, -1 };
-	int outfd, errfd;
+	int socket[2] = { -1, -1 };
+	int outfd, errfd, socketfd;
 	char name[32];
 	pid_t child;
 	int result;
@@ -1342,6 +1622,12 @@ static int execute_next_entry(struct execute_state *state,
 
 	if (pipe(outpipe) || pipe(errpipe)) {
 		errf("Error creating pipes: %m\n");
+		result = -1;
+		goto out_pipe;
+	}
+
+	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, socket)) {
+		errf("Error creating sockets: %m\n");
 		result = -1;
 		goto out_pipe;
 	}
@@ -1386,27 +1672,39 @@ static int execute_next_entry(struct execute_state *state,
 		result = -1;
 		goto out_kmsgfd;
 	} else if (child == 0) {
+		char envstring[16];
+
 		outfd = outpipe[1];
 		errfd = errpipe[1];
+		socketfd = socket[1];
 		close(outpipe[0]);
 		close(errpipe[0]);
+		close(socket[0]);
 
 		sigprocmask(SIG_UNBLOCK, sigmask, NULL);
 
+		if (socketfd >= 0 && !getenv("IGT_RUNNER_DISABLE_SOCKET_COMMUNICATION")) {
+			snprintf(envstring, sizeof(envstring), "%d", socketfd);
+			setenv("IGT_RUNNER_SOCKET_FD", envstring, 1);
+		}
 		setenv("IGT_SENTINEL_ON_STDERR", "1", 1);
 
-		execute_test_process(outfd, errfd, settings, entry);
+		execute_test_process(outfd, errfd, socketfd, settings, entry);
 		/* unreachable */
 	}
 
 	outfd = outpipe[0];
 	errfd = errpipe[0];
+	socketfd = socket[0];
 	close(outpipe[1]);
 	close(errpipe[1]);
-	outpipe[1] = errpipe[1] = -1;
+	close(socket[1]);
+	outpipe[1] = errpipe[1] = socket[1] = -1;
 
-	result = monitor_output(child, outfd, errfd, kmsgfd, sigfd,
-				outputs, time_spent, settings, abortreason);
+	result = monitor_output(child, outfd, errfd, socketfd,
+				kmsgfd, sigfd,
+				outputs, time_spent, settings,
+				abortreason);
 
 out_kmsgfd:
 	close(kmsgfd);
@@ -1421,6 +1719,41 @@ out_dirfd:
 	close(dirfd);
 
 	return result;
+}
+
+static void fill_results_directory_with_notruns(struct job_list *list,
+						int resdirfd)
+{
+	int outputs[_F_LAST];
+	char name[32];
+	int dirfd;
+	size_t i;
+
+	for (i = 0; i < list->size; i++) {
+		snprintf(name, sizeof(name), "%zd", i);
+
+		if (faccessat(resdirfd, name, F_OK, 0) == 0)
+			continue;
+
+		mkdirat(resdirfd, name, 0777);
+		dirfd = openat(resdirfd, name, O_DIRECTORY | O_RDONLY);
+		if (dirfd < 0) {
+			errf("Error accessing individual test result directory\n");
+			return;
+		}
+
+		if (!open_output_files(dirfd, outputs, true)) {
+			errf("Error opening output files\n");
+			close(dirfd);
+			return;
+		}
+
+		dprintf(outputs[_F_OUT], "Forced notrun result because of abort condition on bootup\n");
+		dprintf(outputs[_F_JOURNAL], "%s%d (0.000s)\n", EXECUTOR_EXIT, GRACEFUL_EXITCODE);
+
+		close_outputs(outputs);
+		close(dirfd);
+	}
 }
 
 static int remove_file(int dirfd, const char *name)
@@ -1445,8 +1778,11 @@ static bool clear_test_result_directory(int dirfd)
 
 static bool clear_old_results(char *path)
 {
+	struct dirent *entry;
+	char name[PATH_MAX];
 	int dirfd;
 	size_t i;
+	DIR *dir;
 
 	if ((dirfd = open(path, O_DIRECTORY | O_RDONLY)) < 0) {
 		if (errno == ENOENT) {
@@ -1468,7 +1804,6 @@ static bool clear_old_results(char *path)
 	}
 
 	for (i = 0; true; i++) {
-		char name[32];
 		int resdirfd;
 
 		snprintf(name, sizeof(name), "%zd", i);
@@ -1484,6 +1819,31 @@ static bool clear_old_results(char *path)
 		if (unlinkat(dirfd, name, AT_REMOVEDIR)) {
 			errf("Warning: Result directory %s contains extra files\n",
 			     name);
+		}
+	}
+
+	strcpy(name, path);
+	strcat(name, "/" CODE_COV_RESULTS_PATH);
+	if ((dir = opendir(name)) != NULL) {
+		char *p;
+
+		strcat(name, "/");
+		p = name + strlen(name);
+
+		while ((entry = readdir(dir)) != NULL) {
+			if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+				continue;
+
+			strcpy(p, entry->d_name);
+			if (unlink(name))  {
+				errf("Error removing %s\n", name);
+			}
+		}
+
+		closedir(dir);
+		if (unlinkat(dirfd, CODE_COV_RESULTS_PATH, AT_REMOVEDIR)) {
+			errf("Warning: Result directory %s/%s contains extra files\n",
+			     path, CODE_COV_RESULTS_PATH);
 		}
 	}
 
@@ -1518,14 +1878,19 @@ bool initialize_execute_state_from_resume(int dirfd,
 	struct job_list_entry *entry;
 	int resdirfd, fd, i;
 
-	free_settings(settings);
+	clear_settings(settings);
 	free_job_list(list);
 	memset(state, 0, sizeof(*state));
-	state->resuming = true;
 
 	if (!read_settings_from_dir(settings, dirfd) ||
 	    !read_job_list(list, dirfd)) {
 		close(dirfd);
+		fprintf(stderr, "Failure reading metadata\n");
+		return false;
+	}
+
+	if (!settings->allow_non_root && (getuid() != 0)) {
+		fprintf(stderr, "Runner needs to run with UID 0 (root).\n");
 		return false;
 	}
 
@@ -1545,6 +1910,22 @@ bool initialize_execute_state_from_resume(int dirfd,
 
 	entry = &list->entries[i];
 	state->next = i;
+
+	if ((fd = openat(resdirfd, filenames[_F_SOCKET], O_RDONLY)) >= 0) {
+		if (!prune_from_comms(entry, fd)) {
+			/*
+			 * No subtests, or incomplete before the first
+			 * subtest. Not suitable to re-run.
+			 */
+			state->next = i + 1;
+		} else if (entry->binary[0] == '\0') {
+			/* Full completed */
+			state->next = i + 1;
+		}
+
+		close (fd);
+	}
+
 	if ((fd = openat(resdirfd, filenames[_F_JOURNAL], O_RDONLY)) >= 0) {
 		if (!prune_from_journal(entry, fd)) {
 			/*
@@ -1573,6 +1954,11 @@ bool initialize_execute_state(struct execute_state *state,
 			      struct settings *settings,
 			      struct job_list *job_list)
 {
+	if (!settings->allow_non_root && (getuid() != 0)) {
+		fprintf(stderr, "Runner needs to run with UID 0 (root).\n");
+		return false;
+	}
+
 	memset(state, 0, sizeof(*state));
 
 	if (!validate_settings(settings))
@@ -1682,14 +2068,148 @@ static bool should_die_because_signal(int sigfd)
 	return false;
 }
 
+static char *code_coverage_name(struct settings *settings)
+{
+	const char *start, *end, *fname;
+	char *name;
+	int size;
+
+	if (settings->name && *settings->name)
+		return settings->name;
+	else if (!settings->test_list)
+		return NULL;
+
+	/* Use only the base of the test_list, without path and extension */
+	fname = settings->test_list;
+
+	start = strrchr(fname,'/');
+	if (!start)
+		start = fname;
+
+	end = strrchr(start, '.');
+	if (end)
+		size = end - start;
+	else
+		size = strlen(start);
+
+	name = malloc(size + 1);
+	strncpy(name, fname, size);
+	name[size]  = '\0';
+
+	return name;
+}
+
+static void run_as_root(char * const argv[], int sigfd, char **abortreason)
+{
+	struct signalfd_siginfo siginfo;
+	int status = 0, ret;
+	pid_t child;
+
+	child = fork();
+	if (child < 0) {
+		*abortreason = strdup("Failed to fork");
+		return;
+	}
+
+	if (child == 0) {
+		execv(argv[0], argv);
+		perror (argv[0]);
+		exit(IGT_EXIT_INVALID);
+	}
+
+	if (sigfd >= 0) {
+		while (1) {
+			ret = read(sigfd, &siginfo, sizeof(siginfo));
+			if (ret < 0) {
+				errf("Error reading from signalfd: %m\n");
+				continue;
+			} else if (siginfo.ssi_signo == SIGCHLD) {
+				if (child != waitpid(child, &status, WNOHANG)) {
+					errf("Failed to reap child\n");
+					status = 9999;
+					continue;
+				}
+				break;
+			}
+		}
+	} else {
+		waitpid(child, &status, 0);
+	}
+
+	if (WIFSIGNALED(status))
+		asprintf(abortreason, "%s received signal %d while running\n",argv[0], WTERMSIG(status));
+	else if (!WIFEXITED(status))
+		asprintf(abortreason, "%s aborted with unknown status\n", argv[0]);
+	else if (WEXITSTATUS(status))
+		asprintf(abortreason, "%s returned error %d\n", argv[0], WEXITSTATUS(status));
+}
+
+static void code_coverage_start(struct settings *settings, int sigfd, char **abortreason)
+{
+	int fd;
+
+	fd = open(GCOV_RESET, O_WRONLY);
+	if (fd < 0) {
+		asprintf(abortreason, "Failed to open %s", GCOV_RESET);
+		return;
+	}
+	if (write(fd, "0\n", 2) < 0)
+		*abortreason = strdup("Failed to reset gcov counters");
+
+	close(fd);
+}
+
+static void code_coverage_stop(struct settings *settings, const char *job_name,
+			       int sigfd, char **abortreason)
+{
+	int i, j = 0, last_was_escaped = 1;
+	char fname[PATH_MAX];
+	char name[PATH_MAX];
+	char *argv[3] = {};
+
+	/* If name is empty, use a default */
+	if (!job_name || !*job_name)
+		job_name = "code_coverage";
+
+	/*
+	 * Use only letters, numbers and '_'
+	 *
+	 * This way, the tarball name can be used as testname when lcov runs
+	 */
+	for (i = 0; i < strlen(job_name); i++) {
+		if (!isalpha(job_name[i]) && !isalnum(job_name[i])) {
+			if (last_was_escaped)
+				continue;
+			name[j++] = '_';
+			last_was_escaped = 1;
+		} else {
+			name[j++] = job_name[i];
+			last_was_escaped = 0;
+		}
+	}
+	if (j && last_was_escaped)
+		j--;
+	name[j] = '\0';
+
+	strcpy(fname, settings->results_path);
+	strcat(fname, "/" CODE_COV_RESULTS_PATH "/");
+	strcat(fname, name);
+
+	argv[0] = settings->code_coverage_script;
+	argv[1] = fname;
+
+	outf("Storing code coverage results...\n");
+	run_as_root(argv, sigfd, abortreason);
+}
+
 bool execute(struct execute_state *state,
 	     struct settings *settings,
 	     struct job_list *job_list)
 {
+	int resdirfd, testdirfd, unamefd, timefd, sigfd;
+	struct environment_variable *env_var;
 	struct utsname unamebuf;
-	int resdirfd, testdirfd, unamefd, timefd;
 	sigset_t sigmask;
-	int sigfd;
 	double time_spent = 0.0;
 	bool status = true;
 
@@ -1698,11 +2218,36 @@ bool execute(struct execute_state *state,
 		return true;
 	}
 
+	if (state->next >= job_list->size) {
+		outf("All tests already executed.\n");
+		return true;
+	}
+
+	igt_list_for_each_entry(env_var, &settings->env_vars, link) {
+		setenv(env_var->key, env_var->value, 1);
+	}
+
 	if ((resdirfd = open(settings->results_path, O_DIRECTORY | O_RDONLY)) < 0) {
 		/* Initialize state should have done this */
 		errf("Error: Failure opening results path %s\n",
 		     settings->results_path);
 		return false;
+	}
+
+	if (settings->enable_code_coverage) {
+		if (!settings->cov_results_per_test) {
+			char *reason = NULL;
+
+			code_coverage_start(settings, -1, &reason);
+			if (reason != NULL) {
+				errf("%s\n", reason);
+				free(reason);
+				close(resdirfd);
+				return false;
+			}
+		}
+
+		mkdirat(resdirfd, CODE_COV_RESULTS_PATH, 0755);
 	}
 
 	if ((testdirfd = open(settings->test_root, O_DIRECTORY | O_RDONLY)) < 0) {
@@ -1766,7 +2311,7 @@ bool execute(struct execute_state *state,
 	close(unamefd);
 
 	/* Check if we're already in abort-state at bootup */
-	if (!state->resuming) {
+	{
 		char *reason;
 
 		if ((reason = need_to_abort(settings)) != NULL) {
@@ -1774,6 +2319,17 @@ bool execute(struct execute_state *state,
 			write_abort_file(resdirfd, reason, "nothing", nexttest);
 			free(reason);
 			free(nexttest);
+
+			/*
+			 * If an abort condition happened at bootup,
+			 * assume that it happens on every boot,
+			 * making this test execution impossible.
+			 * Write stuff to the results directory
+			 * indicating this so resuming immediately
+			 * finishes instead of getting stuck in an
+			 * infinite reboot loop.
+			 */
+			fill_results_directory_with_notruns(job_list, resdirfd);
 
 			status = false;
 
@@ -1784,6 +2340,7 @@ bool execute(struct execute_state *state,
 	for (; state->next < job_list->size;
 	     state->next++) {
 		char *reason = NULL;
+		char *job_name;
 		int result;
 
 		if (should_die_because_signal(sigfd)) {
@@ -1791,14 +2348,26 @@ bool execute(struct execute_state *state,
 			goto end;
 		}
 
-		result = execute_next_entry(state,
-					    job_list->size,
-					    &time_spent,
-					    settings,
-					    &job_list->entries[state->next],
-					    testdirfd, resdirfd,
-					    sigfd, &sigmask,
-					    &reason);
+		if (settings->cov_results_per_test) {
+			code_coverage_start(settings, sigfd, &reason);
+			job_name = entry_display_name(&job_list->entries[state->next]);
+		}
+
+		if (reason == NULL) {
+			result = execute_next_entry(state,
+						job_list->size,
+						&time_spent,
+						settings,
+						&job_list->entries[state->next],
+						testdirfd, resdirfd,
+						sigfd, &sigmask,
+						&reason);
+
+			if (settings->cov_results_per_test) {
+				code_coverage_stop(settings, job_name, sigfd, &reason);
+				free(job_name);
+			}
+		}
 
 		if (reason != NULL || (reason = need_to_abort(settings)) != NULL) {
 			char *prev = entry_display_name(&job_list->entries[state->next]);
@@ -1840,7 +2409,8 @@ bool execute(struct execute_state *state,
 			}
 			close(sigfd);
 			close(testdirfd);
-			initialize_execute_state_from_resume(resdirfd, state, settings, job_list);
+			if (!initialize_execute_state_from_resume(resdirfd, state, settings, job_list))
+				return false;
 			state->time_left = time_left;
 			return execute(state, settings, job_list);
 		}
@@ -1852,6 +2422,17 @@ bool execute(struct execute_state *state,
 	}
 
  end:
+	if (settings->enable_code_coverage && !settings->cov_results_per_test) {
+		char *reason = NULL;
+
+		code_coverage_stop(settings, code_coverage_name(settings), -1, &reason);
+		if (reason != NULL) {
+			errf("%s\n", reason);
+			free(reason);
+			status = false;
+		}
+	}
+
 	close_watchdogs(settings);
 	sigprocmask(SIG_UNBLOCK, &sigmask, NULL);
 	/* make sure that we do not leave any signals unhandled */

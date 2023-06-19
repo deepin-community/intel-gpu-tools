@@ -1,8 +1,24 @@
-intel-gpu-tools (1.26-2) UNRELEASED; urgency=medium
+intel-gpu-tools (1.27.1-1) unstable; urgency=medium
 
-  * update
+  * New upstream release.
+  * rules: Set srcdir. (Closes: #945105)
+  * patches/libproc2_library: Refreshed.
 
- -- Debian X Strike Force <debian-x@lists.debian.org>  Tue, 07 Jun 2022 11:01:34 +0800
+ -- Timo Aaltonen <tjaalton@debian.org>  Wed, 08 Feb 2023 09:40:10 +0200
+
+intel-gpu-tools (1.26+git20220524-1.1) unstable; urgency=medium
+
+  * Non-maintainer upload.
+  * Adjust API to be to link to libproc2 Closes: #1024221
+
+ -- Craig Small <csmall@debian.org>  Thu, 22 Dec 2022 21:12:41 +1100
+
+intel-gpu-tools (1.26+git20220524-1) unstable; urgency=medium
+
+  * New git snapshot.
+  * install: Updated.
+
+ -- Timo Aaltonen <tjaalton@debian.org>  Fri, 10 Jun 2022 10:26:54 +0300
 
 intel-gpu-tools (1.26-2) unstable; urgency=medium
 

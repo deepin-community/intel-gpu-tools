@@ -50,6 +50,7 @@
 #define DRIVER_AMDGPU	(1 << 3)
 #define DRIVER_V3D	(1 << 4)
 #define DRIVER_PANFROST	(1 << 5)
+#define DRIVER_MSM	(1 << 6)
 
 /*
  * Exclude DRVER_VGEM from DRIVER_ANY since if you run on a system
@@ -102,6 +103,8 @@ void igt_require_vc4(int fd);
 
 bool is_amdgpu_device(int fd);
 bool is_i915_device(int fd);
+bool is_mtk_device(int fd);
+bool is_msm_device(int fd);
 bool is_nouveau_device(int fd);
 bool is_vc4_device(int fd);
 

@@ -17,6 +17,7 @@ override_dh_clean:
 # FIXME: building debugger causes FTBFS
 override_dh_auto_configure:
 	dh_auto_configure -- \
+		-Dsrcdir='.' \
 		-Dtests=disabled
 
 # Disable test suite:

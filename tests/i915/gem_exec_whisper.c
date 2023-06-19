@@ -28,12 +28,15 @@
  */
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
+#include "i915/gem_vm.h"
 #include "igt.h"
 #include "igt_debugfs.h"
-#include "igt_rapl.h"
 #include "igt_gt.h"
+#include "igt_power.h"
 #include "igt_rand.h"
 #include "igt_sysfs.h"
+#include "intel_ctx.h"
 
 #define ENGINE_MASK  (I915_EXEC_RING_MASK | I915_EXEC_BSD_MASK)
 
@@ -81,13 +84,16 @@ static void verify_reloc(int fd, uint32_t handle,
 #define BASIC 0x400
 
 struct hang {
+	const intel_ctx_t *ctx;
 	struct drm_i915_gem_exec_object2 obj;
 	struct drm_i915_gem_relocation_entry reloc;
 	struct drm_i915_gem_execbuffer2 execbuf;
 	int fd;
+	uint64_t ahnd;
+	uint64_t bb_offset;
 };
 
-static void init_hang(struct hang *h, int fd)
+static void init_hang(struct hang *h, int fd, const intel_ctx_cfg_t *cfg)
 {
 	uint32_t *batch;
 	int i, gen;
@@ -97,15 +103,27 @@ static void init_hang(struct hang *h, int fd)
 
 	gen = intel_gen(intel_get_drm_devid(h->fd));
 
+	if (gem_has_contexts(fd)) {
+		h->ctx = intel_ctx_create(h->fd, cfg);
+		h->execbuf.rsvd1 = h->ctx->id;
+		h->ahnd = get_reloc_ahnd(h->fd, h->ctx->id);
+	} else {
+		h->ctx = NULL;
+		h->ahnd = get_reloc_ahnd(h->fd, 0);
+	}
+
 	memset(&h->execbuf, 0, sizeof(h->execbuf));
 	h->execbuf.buffers_ptr = to_user_pointer(&h->obj);
 	h->execbuf.buffer_count = 1;
 
 	memset(&h->obj, 0, sizeof(h->obj));
 	h->obj.handle = gem_create(h->fd, 4096);
+	h->bb_offset = get_offset(h->ahnd, h->obj.handle, 4096, 0);
+	if (h->ahnd)
+		h->obj.flags |= EXEC_OBJECT_PINNED;
 
 	h->obj.relocs_ptr = to_user_pointer(&h->reloc);
-	h->obj.relocation_count = 1;
+	h->obj.relocation_count = !h->ahnd ? 1 : 0;
 	memset(&h->reloc, 0, sizeof(h->reloc));
 
 	batch = gem_mmap__cpu(h->fd, h->obj.handle, 0, 4096, PROT_WRITE);
@@ -127,8 +145,8 @@ static void init_hang(struct hang *h, int fd)
 	batch[i] = MI_BATCH_BUFFER_START;
 	if (gen >= 8) {
 		batch[i] |= 1 << 8 | 1;
-		batch[++i] = 0;
-		batch[++i] = 0;
+		batch[++i] = h->bb_offset;
+		batch[++i] = h->bb_offset >> 32;
 	} else if (gen >= 6) {
 		batch[i] |= 1 << 8;
 		batch[++i] = 0;
@@ -156,6 +174,10 @@ static void submit_hang(struct hang *h, unsigned *engines, int nengine, unsigned
 
 static void fini_hang(struct hang *h)
 {
+	gem_close(h->fd, h->obj.handle);
+	put_offset(h->ahnd, h->obj.handle);
+	put_ahnd(h->ahnd);
+	intel_ctx_destroy(h->fd, h->ctx);
 	close(h->fd);
 }
 
@@ -165,7 +187,8 @@ static void ctx_set_random_priority(int fd, uint32_t ctx)
 	gem_context_set_priority(fd, ctx, prio);
 }
 
-static void whisper(int fd, unsigned engine, unsigned flags)
+static void whisper(int fd, const intel_ctx_t *ctx,
+		    unsigned engine, unsigned flags)
 {
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
 	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
@@ -179,7 +202,8 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 	const struct intel_execution_engine2 *e;
 	struct hang hang;
 	int fds[64];
-	uint32_t contexts[64];
+	intel_ctx_cfg_t local_cfg;
+	const intel_ctx_t *contexts[64];
 	unsigned nengine;
 	uint32_t batch[16];
 	unsigned int relocations = 0;
@@ -187,11 +211,12 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 	unsigned int reloc_interruptions = 0;
 	unsigned int eb_migrations = 0;
 	struct power_sample sample[2];
-	struct rapl rapl;
+	struct igt_power gpu;
 	uint64_t old_offset;
 	int i, n, loc;
 	int debugfs;
 	int nchild;
+	bool has_relocs = gem_has_relocations(fd);
 
 	if (flags & PRIORITY) {
 		igt_require(gem_scheduler_enabled(fd));
@@ -199,11 +224,11 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 	}
 
 	debugfs = igt_debugfs_dir(fd);
-	gpu_power_open(&rapl);
+	igt_power_open(fd, &gpu, "gpu");
 
 	nengine = 0;
 	if (engine == ALL_ENGINES) {
-		__for_each_physical_engine(fd, e) {
+		for_each_ctx_engine(fd, ctx, e) {
 			if (gem_class_can_store_dword(fd, e->class))
 				engines[nengine++] = e->flags;
 		}
@@ -219,11 +244,13 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 	if (flags & CONTEXTS)
 		gem_require_contexts(fd);
 
-	if (flags & QUEUES)
-		igt_require(gem_has_queues(fd));
+	if (flags & QUEUES) {
+		igt_require(gem_has_vm(fd));
+		igt_require(gem_context_has_single_timeline(fd));
+	}
 
 	if (flags & HANG)
-		init_hang(&hang, fd);
+		init_hang(&hang, fd, &ctx->cfg);
 
 	nchild = 1;
 	if (flags & FORKED)
@@ -232,7 +259,7 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 		nchild *= nengine;
 
 	intel_detect_and_clear_missed_interrupts(fd);
-	rapl_read(&rapl, &sample[0]);
+	igt_power_get_energy(&gpu, &sample[0]);
 	igt_fork(child, nchild) {
 		unsigned int pass;
 
@@ -248,7 +275,7 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 		memset(&store, 0, sizeof(store));
 		store.handle = gem_create(fd, 4096);
 		store.relocs_ptr = to_user_pointer(&reloc);
-		store.relocation_count = 1;
+		store.relocation_count = has_relocs ? 1 : 0;
 
 		memset(&reloc, 0, sizeof(reloc));
 		reloc.offset = sizeof(uint32_t);
@@ -272,9 +299,16 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 			execbuf.flags |= I915_EXEC_NO_RELOC;
 			if (gen < 6)
 				execbuf.flags |= I915_EXEC_SECURE;
+
+			execbuf.rsvd1 = ctx->id;
 			igt_require(__gem_execbuf(fd, &execbuf) == 0);
 			scratch = tmp[0];
 			store = tmp[1];
+		}
+
+		if (!has_relocs) {
+			scratch.flags |= EXEC_OBJECT_PINNED;
+			store.flags |= EXEC_OBJECT_PINNED;
 		}
 
 		i = 0;
@@ -293,18 +327,21 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 		igt_assert(loc == sizeof(uint32_t) * i);
 		batch[++i] = MI_BATCH_BUFFER_END;
 
-		if (flags & CONTEXTS) {
-			for (n = 0; n < 64; n++)
-				contexts[n] = gem_context_clone_with_engines(fd, 0);
-		}
-		if (flags & QUEUES) {
-			for (n = 0; n < 64; n++)
-				contexts[n] = gem_queue_create(fd);
-		}
 		if (flags & FDS) {
 			for (n = 0; n < 64; n++) {
 				fds[n] = gem_reopen_driver(fd);
-				gem_context_copy_engines(fd, 0, fds[n], 0);
+			}
+		}
+		if (flags & (CONTEXTS | QUEUES | FDS)) {
+			local_cfg = ctx->cfg;
+			if (flags & QUEUES) {
+				igt_assert(!(flags & FDS));
+				local_cfg.vm = gem_vm_create(fd);
+				local_cfg.flags |= I915_CONTEXT_CREATE_FLAGS_SINGLE_TIMELINE;
+			}
+			for (n = 0; n < 64; n++) {
+				int this_fd = (flags & FDS) ? fds[n] : fd;
+				contexts[n] = intel_ctx_create(this_fd, &local_cfg);
 			}
 		}
 
@@ -335,7 +372,9 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 			inter[n].presumed_offset = old_offset;
 			inter[n].delta = loc;
 			batches[n].relocs_ptr = to_user_pointer(&inter[n]);
-			batches[n].relocation_count = 1;
+			batches[n].relocation_count = has_relocs ? 1 : 0;
+			if (!has_relocs)
+				batches[n].flags |= EXEC_OBJECT_PINNED;
 			gem_write(fd, batches[n].handle, 0, batch, sizeof(batch));
 
 			old_offset = batches[n].offset;
@@ -376,7 +415,9 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 				tmp[1] = store;
 				verify_reloc(fd, store.handle, &reloc);
 				execbuf.buffers_ptr = to_user_pointer(tmp);
+
 				gem_execbuf(fd, &execbuf);
+
 				igt_assert_eq_u64(reloc.presumed_offset, tmp[0].offset);
 				if (flags & SYNC)
 					gem_sync(fd, tmp[0].handle);
@@ -413,8 +454,8 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 						execbuf.flags &= ~ENGINE_MASK;
 						execbuf.flags |= engines[rand() % nengine];
 					}
-					if (flags & (CONTEXTS | QUEUES)) {
-						execbuf.rsvd1 = contexts[rand() % 64];
+					if (flags & (CONTEXTS | QUEUES | FDS)) {
+						execbuf.rsvd1 = contexts[rand() % 64]->id;
 						if (flags & PRIORITY)
 							ctx_set_random_priority(this_fd, execbuf.rsvd1);
 					}
@@ -430,7 +471,7 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 						gem_sync(this_fd, batches[n-1].handle);
 					relocations += inter[n].presumed_offset != old_offset;
 
-					batches[n-1].relocation_count = 1;
+					batches[n-1].relocation_count = has_relocs ? 1 : 0;
 					batches[n-1].flags &= ~EXEC_OBJECT_WRITE;
 
 					if (this_fd != fd) {
@@ -442,12 +483,14 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 					}
 				}
 				execbuf.flags &= ~ENGINE_MASK;
-				execbuf.rsvd1 = 0;
+				execbuf.rsvd1 = ctx->id;
 				execbuf.buffers_ptr = to_user_pointer(&tmp);
 
 				tmp[0] = tmp[1];
 				tmp[0].relocation_count = 0;
 				tmp[0].flags = EXEC_OBJECT_WRITE;
+				if (!has_relocs)
+					tmp[0].flags |= EXEC_OBJECT_PINNED;
 				reloc_migrations += tmp[0].offset != inter[0].presumed_offset;
 				tmp[0].offset = inter[0].presumed_offset;
 				old_offset = tmp[0].offset;
@@ -458,6 +501,7 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 					reloc_interruptions++;
 					inter[0].presumed_offset = tmp[0].offset;
 				}
+
 				igt_assert_eq_u64(inter[0].presumed_offset, tmp[0].offset);
 				relocations += inter[0].presumed_offset != old_offset;
 				batches[0] = tmp[1];
@@ -467,7 +511,7 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 				igt_assert(tmp[0].flags & EXEC_OBJECT_WRITE);
 				igt_assert_eq_u64(reloc.presumed_offset, tmp[0].offset);
 				igt_assert(tmp[1].relocs_ptr == to_user_pointer(&reloc));
-				tmp[1].relocation_count = 1;
+				tmp[1].relocation_count = has_relocs ? 1 : 0;
 				tmp[1].flags &= ~EXEC_OBJECT_WRITE;
 				verify_reloc(fd, store.handle, &reloc);
 				gem_execbuf(fd, &execbuf);
@@ -492,16 +536,22 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 		gem_close(fd, scratch.handle);
 		gem_close(fd, store.handle);
 
+		if (flags & (CONTEXTS | QUEUES | FDS)) {
+			for (n = 0; n < 64; n++) {
+				int this_fd = (flags & FDS) ? fds[n] : fd;
+				intel_ctx_destroy(this_fd, contexts[n]);
+			}
+			if (local_cfg.vm) {
+				igt_assert(!(flags & FDS));
+				gem_vm_destroy(fd, local_cfg.vm);
+			}
+		}
+		for (n = 0; n < QLEN; n++)
+			gem_close(fd, batches[n].handle);
 		if (flags & FDS) {
 			for (n = 0; n < 64; n++)
 				close(fds[n]);
 		}
-		if (flags & (CONTEXTS | QUEUES)) {
-			for (n = 0; n < 64; n++)
-				gem_context_destroy(fd, contexts[n]);
-		}
-		for (n = 0; n < QLEN; n++)
-			gem_close(fd, batches[n].handle);
 	}
 
 	igt_waitchildren();
@@ -510,12 +560,14 @@ static void whisper(int fd, unsigned engine, unsigned flags)
 		fini_hang(&hang);
 	else
 		igt_assert_eq(intel_detect_and_clear_missed_interrupts(fd), 0);
-	if (rapl_read(&rapl, &sample[1]))  {
+
+	igt_power_get_energy(&gpu, &sample[1]);
+	if (sample[1].energy) {
 		igt_info("Total energy used: %.1fmJ\n",
-			 power_J(&rapl, &sample[0], &sample[1]) * 1e3);
+			 igt_power_get_mJ(&gpu, &sample[0], &sample[1]));
 	}
 
-	rapl_close(&rapl);
+	igt_power_close(&gpu);
 	close(debugfs);
 }
 
@@ -554,6 +606,7 @@ igt_main
 		{ NULL }
 	};
 	const struct intel_execution_engine2 *e;
+	const intel_ctx_t *ctx;
 	int fd = -1;
 
 	igt_fixture {
@@ -561,30 +614,32 @@ igt_main
 		igt_require_gem(fd);
 		igt_require(gem_can_store_dword(fd, 0));
 		gem_submission_print_method(fd);
+		ctx = intel_ctx_create_all_physical(fd);
 
 		igt_fork_hang_detector(fd);
+		intel_allocator_multiprocess_start();
 	}
 
 	for (const struct mode *m = modes; m->name; m++) {
 		igt_subtest_f("%s%s",
 			      m->flags & BASIC ? "basic-" : "", m->name)
-			whisper(fd, ALL_ENGINES, m->flags);
+			whisper(fd, ctx, ALL_ENGINES, m->flags);
 		igt_subtest_f("%s%s-all",
 			      m->flags & BASIC ? "basic-" : "", m->name)
-			whisper(fd, ALL_ENGINES, m->flags | ALL);
+			whisper(fd, ctx, ALL_ENGINES, m->flags | ALL);
 	}
 
 	for (const struct mode *m = modes; m->name; m++) {
 		if (m->flags & CHAIN)
 			continue;
 
-		igt_subtest_with_dynamic_f("%s", m->name) {
-			__for_each_physical_engine(fd, e) {
+		igt_subtest_with_dynamic_f("%s-engine", m->name) {
+			for_each_ctx_engine(fd, ctx, e) {
 				if (!gem_class_can_store_dword(fd, e->class))
 					continue;
 
 				igt_dynamic_f("%s", e->name)
-					whisper(fd, e->flags, m->flags);
+					whisper(fd, ctx, e->flags, m->flags);
 			}
 		}
 	}
@@ -598,11 +653,13 @@ igt_main
 			if (m->flags & INTERRUPTIBLE)
 				continue;
 			igt_subtest_f("hang-%s", m->name)
-				whisper(fd, ALL_ENGINES, m->flags | HANG);
+				whisper(fd, ctx, ALL_ENGINES, m->flags | HANG);
 		}
 	}
 
 	igt_fixture {
+		intel_allocator_multiprocess_stop();
+		intel_ctx_destroy(fd, ctx);
 		close(fd);
 	}
 }

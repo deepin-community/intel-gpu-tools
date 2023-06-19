@@ -32,8 +32,11 @@
 #include <fcntl.h>
 #include <glib.h>
 #include <libudev.h>
+#ifdef __linux__
 #include <linux/limits.h>
+#endif
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 
 /**
@@ -85,13 +88,13 @@
  *
  * - pci: select device using PCI slot or vendor and device properties
  *   |[<!-- language="plain" -->
- *   pci:[vendor=%04x/name][,device=%04x][,card=%d] | [slot=%04x:%02x:%02x.%x]
+ *   pci:[vendor=%04x/name][,device=%04x/codename][,card=%d] | [slot=%04x:%02x:%02x.%x]
  *   ]|
  *
  *   Filter allows device selection using vendor (hex or name), device id
- *   (hex) and nth-card from all matches. For example if there are 4 PCI cards
- *   installed (let two cards have 1234 and other two 1235 device id, all of
- *   them of vendor Intel) you can select one using:
+ *   (hex or codename) and nth-card from all matches. For example if there
+ *   are 4 PCI cards installed (let two cards have 1234 and other two 1235
+ *   device id, all of them of vendor Intel) you can select one using:
  *
  *   |[<!-- language="plain" -->
  *   pci:vendor=Intel,device=1234,card=0
@@ -117,6 +120,28 @@
  *
  *   It selects the second one.
  *
+ *   |[<!-- language="plain" -->
+ *   pci:vendor=8086,device=1234,card=all
+ *   pci:vendor=8086,device=1234,card=*
+ *   ]|
+ *
+ *   This will add 0..N card selectors, where 0 <= N <= 63. At least one
+ *   filter will be added with card=0 and all incrementally matched ones
+ *   up to max numbered 63 (max total 64).
+ *
+ *   We may use device codename or pseudo-codename (integrated/discrete)
+ *   instead of pci device id:
+ *
+ *   |[<!-- language="plain" -->
+ *   pci:vendor=8086,device=skylake
+ *   ]|
+ *
+ *   or
+ *
+ *   |[<!-- language="plain" -->
+ *   pci:vendor=8086,device=integrated
+ *   ]|
+ *
  *   Another possibility is to select device using a PCI slot:
  *
  *   |[<!-- language="plain" -->
@@ -128,6 +153,35 @@
  *   return you same device regardless the order of enumeration.
  *
  *   Simple syntactic sugar over using the sysfs paths.
+ *
+ * - sriov: select pf or vf
+ *   |[<!-- language="plain" -->
+ *   sriov:[vendor=%04x/name][,device=%04x/codename][,card=%d][,pf=%d][,vf=%d]
+ *   ]|
+ *
+ *   Filter extends pci selector to allow pf/vf selection:
+ *
+ *   |[<!-- language="plain" -->
+ *   sriov:vendor=Intel,device=1234,card=0,vf=2
+ *   ]|
+ *
+ *   When vf is not defined, pf will be selected:
+ *
+ *   |[<!-- language="plain" -->
+ *   sriov:vendor=Intel,device=1234,card=0
+ *   ]|
+ *
+ *   In case a device has more than one pf, you can also select a specific pf
+ *   or a vf associated with a specific pf:
+ *
+ *   |[<!-- language="plain" -->
+ *   sriov:vendor=Intel,device=1234,card=0,pf=1
+ *   ]|
+ *
+ *   |[<!-- language="plain" -->
+ *   sriov:vendor=Intel,device=1234,card=0,pf=1,vf=0
+ *   ]|
+ *
  */
 
 #ifdef DEBUG_DEVICE_SCAN
@@ -135,13 +189,22 @@
 { \
 	struct timeval tm; \
 	gettimeofday(&tm, NULL); \
-	printf("%10ld.%03ld: ", tm.tv_sec, tm.tv_usec); \
+	printf("%10ld.%06ld: ", tm.tv_sec, tm.tv_usec); \
 	printf(__VA_ARGS__); \
 }
 
 #else
 #define DBG(...) {}
 #endif
+
+enum dev_type {
+	DEVTYPE_ALL,
+	DEVTYPE_INTEGRATED,
+	DEVTYPE_DISCRETE,
+};
+
+#define STR_INTEGRATED "integrated"
+#define STR_DISCRETE "discrete"
 
 static inline bool strequal(const char *a, const char *b)
 {
@@ -176,6 +239,9 @@ struct igt_device {
 	char *pci_slot_name;
 	int gpu_index; /* For more than one GPU with same vendor and device. */
 
+	char *codename; /* For grouping by codename */
+	enum dev_type dev_type; /* For grouping by integrated/discrete */
+
 	struct igt_list_head link;
 };
 
@@ -186,7 +252,10 @@ static struct {
 	bool devs_scanned;
 } igt_devs;
 
+static void igt_device_free(struct igt_device *dev);
+
 typedef char *(*devname_fn)(uint16_t, uint16_t);
+typedef enum dev_type (*devtype_fn)(uint16_t, uint16_t, const char *);
 
 static char *devname_hex(uint16_t vendor, uint16_t device)
 {
@@ -208,7 +277,7 @@ static char *devname_intel(uint16_t vendor, uint16_t device)
 		if (devname) {
 			devname[0] = toupper(devname[0]);
 			igt_assert(asprintf(&s, "Intel %s (Gen%u)", devname,
-					    ffs(info->gen)) != -1);
+					    info->graphics_ver) != -1);
 			free(devname);
 		}
 	}
@@ -219,13 +288,51 @@ static char *devname_intel(uint16_t vendor, uint16_t device)
 	return s;
 }
 
+static char *codename_intel(uint16_t vendor, uint16_t device)
+{
+	const struct intel_device_info *info = intel_get_device_info(device);
+	char *codename = NULL;
+
+	if (info->codename) {
+		codename = strdup(info->codename);
+		igt_assert(codename);
+	}
+
+	if (!codename)
+		codename = devname_hex(vendor, device);
+
+	return codename;
+}
+
+static enum dev_type devtype_intel(uint16_t vendor, uint16_t device, const char *pci_slot)
+{
+	(void) vendor;
+	(void) device;
+
+	if (!strncmp(pci_slot, INTEGRATED_I915_GPU_PCI_ID, PCI_SLOT_NAME_SIZE))
+		return DEVTYPE_INTEGRATED;
+
+	return DEVTYPE_DISCRETE;
+}
+
+static enum dev_type devtype_all(uint16_t vendor, uint16_t device, const char *pci_slot)
+{
+	(void) vendor;
+	(void) device;
+	(void) pci_slot;
+
+	return DEVTYPE_ALL;
+}
+
 static struct {
 	const char *name;
 	const char *vendor_id;
 	devname_fn devname;
+	devname_fn codename;
+	devtype_fn devtype;
 } pci_vendor_mapping[] = {
-	{ "intel", "8086", devname_intel },
-	{ "amd", "1002", devname_hex },
+	{ "intel", "8086", devname_intel, codename_intel, devtype_intel },
+	{ "amd", "1002", devname_hex, devname_hex, devtype_all },
 	{ NULL, },
 };
 
@@ -254,6 +361,34 @@ static devname_fn get_pci_vendor_device_fn(uint16_t vendor)
 	return devname_hex;
 }
 
+static devname_fn get_pci_vendor_device_codename_fn(uint16_t vendor)
+{
+	char vendorstr[5];
+
+	snprintf(vendorstr, sizeof(vendorstr), "%04x", vendor);
+
+	for (typeof(*pci_vendor_mapping) *vm = pci_vendor_mapping; vm->name; vm++) {
+		if (!strcasecmp(vendorstr, vm->vendor_id))
+			return vm->codename;
+	}
+
+	return devname_hex;
+}
+
+static devtype_fn get_pci_vendor_device_devtype_fn(uint16_t vendor)
+{
+	char vendorstr[5];
+
+	snprintf(vendorstr, sizeof(vendorstr), "%04x", vendor);
+
+	for (typeof(*pci_vendor_mapping) *vm = pci_vendor_mapping; vm->name; vm++) {
+		if (!strcasecmp(vendorstr, vm->vendor_id))
+			return vm->devtype;
+	}
+
+	return devtype_all;
+}
+
 static void get_pci_vendor_device(const struct igt_device *dev,
 				  uint16_t *vendorp, uint16_t *devicep)
 {
@@ -274,6 +409,24 @@ static char *__pci_pretty_name(uint16_t vendor, uint16_t device, bool numeric)
 		fn = devname_hex;
 
 	return fn(vendor, device);
+}
+
+static char *__pci_codename(uint16_t vendor, uint16_t device)
+{
+	devname_fn fn;
+
+	fn = get_pci_vendor_device_codename_fn(vendor);
+
+	return fn(vendor, device);
+}
+
+static enum dev_type __pci_devtype(uint16_t vendor, uint16_t device, const char *pci_slot)
+{
+	devtype_fn fn;
+
+	fn = get_pci_vendor_device_devtype_fn(vendor);
+
+	return fn(vendor, device, pci_slot);
 }
 
 /* Reading sysattr values can take time (even seconds),
@@ -337,6 +490,7 @@ static void igt_device_add_prop(struct igt_device *dev,
 static void igt_device_add_attr(struct igt_device *dev,
 				const char *key, const char *value)
 {
+	char linkto[PATH_MAX];
 	const char *v = value;
 
 	if (!key)
@@ -348,7 +502,6 @@ static void igt_device_add_attr(struct igt_device *dev,
 	if (!v) {
 		struct stat st;
 		char path[PATH_MAX];
-		char linkto[PATH_MAX];
 		int len;
 
 		snprintf(path, sizeof(path), "%s/%s", dev->syspath, key);
@@ -418,17 +571,29 @@ static void get_attrs(struct udev_device *dev, struct igt_device *idev)
 #define is_drm_subsystem(dev)  (strequal(get_prop_subsystem(dev), "drm"))
 #define is_pci_subsystem(dev)  (strequal(get_prop_subsystem(dev), "pci"))
 
+static void print_ht(GHashTable *ht);
+static void dump_props_and_attrs(const struct igt_device *dev)
+{
+	printf("\n[properties]\n");
+	print_ht(dev->props_ht);
+	printf("\n[attributes]\n");
+	print_ht(dev->attrs_ht);
+	printf("\n");
+}
+
 /*
  * Get PCI_SLOT_NAME property, it should be in format of
  * xxxx:yy:zz.z
  */
-static void set_pci_slot_name(struct igt_device *dev)
+static bool set_pci_slot_name(struct igt_device *dev)
 {
 	const char *pci_slot_name = get_prop(dev, "PCI_SLOT_NAME");
 
-	if (!pci_slot_name || (strlen(pci_slot_name) != PCI_SLOT_NAME_SIZE))
-		return;
+	if (!pci_slot_name || strlen(pci_slot_name) != PCI_SLOT_NAME_SIZE)
+		return false;
+
 	dev->pci_slot_name = strdup(pci_slot_name);
+	return true;
 }
 
 /*
@@ -436,14 +601,17 @@ static void set_pci_slot_name(struct igt_device *dev)
  * xxxx to dev->vendor and yyyy to dev->device for
  * faster access.
  */
-static void set_vendor_device(struct igt_device *dev)
+static bool set_vendor_device(struct igt_device *dev)
 {
 	const char *pci_id = get_prop(dev, "PCI_ID");
 
 	if (!pci_id || strlen(pci_id) != 9)
-		return;
+		return false;
+
 	dev->vendor = strndup(pci_id, 4);
 	dev->device = strndup(pci_id + 5, 4);
+
+	return true;
 }
 
 /* Initialize lists for keeping scanned devices */
@@ -484,6 +652,18 @@ static struct igt_device *igt_device_new_from_udev(struct udev_device *dev)
 	get_props(dev, idev);
 	get_attrs(dev, idev);
 
+	if (is_pci_subsystem(idev)) {
+		uint16_t vendor, device;
+
+		if (!set_vendor_device(idev) || !set_pci_slot_name(idev)) {
+			igt_device_free(idev);
+			return NULL;
+		}
+		get_pci_vendor_device(idev, &vendor, &device);
+		idev->codename = __pci_codename(vendor, device);
+		idev->dev_type = __pci_devtype(vendor, device, idev->pci_slot_name);
+	}
+
 	return idev;
 }
 
@@ -522,6 +702,25 @@ static bool is_vendor_matched(struct igt_device *dev, const char *vendor)
 		return false;
 
 	return !strcasecmp(dev->vendor, vendor_id);
+}
+
+static bool is_device_matched(struct igt_device *dev, const char *device)
+{
+	if (!dev->device || !device)
+		return false;
+
+	/* First we compare device id, like 1926 */
+	if (!strcasecmp(dev->device, device))
+		return true;
+
+	/* Try "integrated" and "discrete" */
+	if (dev->dev_type == DEVTYPE_INTEGRATED && !strcasecmp(device, STR_INTEGRATED))
+		return true;
+	else if (dev->dev_type == DEVTYPE_DISCRETE && !strcasecmp(device, STR_DISCRETE))
+		return true;
+
+	/* Try codename */
+	return !strcasecmp(dev->codename, device);
 }
 
 static char *safe_strncpy(char *dst, const char *src, int n)
@@ -622,17 +821,24 @@ static struct igt_device *igt_device_from_syspath(const char *syspath)
 	return NULL;
 }
 
+#define RETRIES_GET_PARENT 5
 /* For each drm igt_device add or update its parent igt_device to the array.
  * As card/render drm devices mostly have same parent (vkms is an exception)
  * link to it and update corresponding drm_card / drm_render fields.
  */
-static void update_or_add_parent(struct udev_device *dev,
+static void update_or_add_parent(struct udev *udev,
+				 struct udev_device *dev,
 				 struct igt_device *idev)
 {
 	struct udev_device *parent_dev;
 	struct igt_device *parent_idev;
 	const char *subsystem, *syspath, *devname;
+	int retries = RETRIES_GET_PARENT;
 
+	/*
+	 * Get parent for drm node. It caches parent in udev device
+	 * and will be destroyed along with the node.
+	 */
 	parent_dev = udev_device_get_parent(dev);
 	igt_assert(parent_dev);
 
@@ -640,14 +846,29 @@ static void update_or_add_parent(struct udev_device *dev,
 	syspath = udev_device_get_syspath(parent_dev);
 
 	parent_idev = igt_device_find(subsystem, syspath);
-	if (!parent_idev) {
+	while (!parent_idev && retries--) {
+		/*
+		 * Don't care about previous parent_dev, it is tracked
+		 * by the child node. There's very rare race when driver module
+		 * is loaded or binded - in this moment getting parent device
+		 * may finish with incomplete properties. Unfortunately even
+		 * if we notice this (missing PCI_ID or PCI_SLOT_NAME)
+		 * consecutive calling udev_device_get_parent() will return
+		 * stale (cached parent) device. We don't want this so
+		 * only udev_device_new*() will scan sys directory and
+		 * return fresh udev device.
+		 */
+		parent_dev = udev_device_new_from_syspath(udev, syspath);
 		parent_idev = igt_device_new_from_udev(parent_dev);
-		if (is_pci_subsystem(parent_idev)) {
-			set_vendor_device(parent_idev);
-			set_pci_slot_name(parent_idev);
-		}
-		igt_list_add_tail(&parent_idev->link, &igt_devs.all);
+		udev_device_unref(parent_dev);
+
+		if (parent_idev)
+			igt_list_add_tail(&parent_idev->link, &igt_devs.all);
+		else
+			usleep(100000); /* arbitrary, 100ms should be enough */
 	}
+	igt_assert(parent_idev);
+
 	devname = udev_device_get_devnode(dev);
 	if (devname != NULL && strstr(devname, "/dev/dri/card"))
 		parent_idev->drm_card = strdup(devname);
@@ -775,8 +996,8 @@ static void scan_drm_devices(void)
 		path = udev_list_entry_get_name(dev_list_entry);
 		udev_dev = udev_device_new_from_syspath(udev, path);
 		idev = igt_device_new_from_udev(udev_dev);
-		update_or_add_parent(udev_dev, idev);
 		igt_list_add_tail(&idev->link, &igt_devs.all);
+		update_or_add_parent(udev, udev_dev, idev);
 
 		udev_device_unref(udev_dev);
 	}
@@ -794,6 +1015,7 @@ static void scan_drm_devices(void)
 
 static void igt_device_free(struct igt_device *dev)
 {
+	free(dev->codename);
 	free(dev->devnode);
 	free(dev->subsystem);
 	free(dev->syspath);
@@ -810,10 +1032,17 @@ void igt_devices_free(void)
 {
 	struct igt_device *dev, *tmp;
 
+	igt_list_for_each_entry_safe(dev, tmp, &igt_devs.filtered, link) {
+		igt_list_del(&dev->link);
+		free(dev);
+	}
+
 	igt_list_for_each_entry_safe(dev, tmp, &igt_devs.all, link) {
+		igt_list_del(&dev->link);
 		igt_device_free(dev);
 		free(dev);
 	}
+	igt_devs.devs_scanned = false;
 }
 
 /**
@@ -827,22 +1056,8 @@ void igt_devices_free(void)
  */
 void igt_devices_scan(bool force)
 {
-	if (force && igt_devs.devs_scanned) {
-		struct igt_device *dev, *tmp;
-
-		igt_list_for_each_entry_safe(dev, tmp, &igt_devs.filtered,
-					     link) {
-			igt_list_del(&dev->link);
-			free(dev);
-		}
-		igt_list_for_each_entry_safe(dev, tmp, &igt_devs.all, link) {
-			igt_list_del(&dev->link);
-			igt_device_free(dev);
-			free(dev);
-		}
-
-		igt_devs.devs_scanned = false;
-	}
+	if (force && igt_devs.devs_scanned)
+		igt_devices_free();
 
 	if (igt_devs.devs_scanned)
 		return;
@@ -900,6 +1115,7 @@ igt_devs_print_simple(struct igt_list_head *view,
 			if (is_pci_subsystem(dev)) {
 				_pr_simple("vendor", dev->vendor);
 				_pr_simple("device", dev->device);
+				_pr_simple("codename", dev->codename);
 			}
 		}
 		printf("\n");
@@ -987,7 +1203,10 @@ igt_devs_print_user(struct igt_list_head *view,
 			char *devname;
 
 			get_pci_vendor_device(pci_dev, &vendor, &device);
-			devname = __pci_pretty_name(vendor, device, fmt->numeric);
+			if (fmt->codename)
+				devname = __pci_codename(vendor, device);
+			else
+				devname = __pci_pretty_name(vendor, device, fmt->numeric);
 
 			__print_filter(filter, sizeof(filter), fmt, pci_dev,
 				       false);
@@ -1071,13 +1290,10 @@ igt_devs_print_detail(struct igt_list_head *view,
 		if (!is_drm_subsystem(dev)) {
 			_print_key_value("card device", dev->drm_card);
 			_print_key_value("render device", dev->drm_render);
+			_print_key_value("codename", dev->codename);
 		}
 
-		printf("\n[properties]\n");
-		print_ht(dev->props_ht);
-		printf("\n[attributes]\n");
-		print_ht(dev->attrs_ht);
-		printf("\n");
+		dump_props_and_attrs(dev);
 	}
 }
 
@@ -1147,6 +1363,8 @@ struct filter {
 		char *slot;
 		char *drm;
 		char *driver;
+		char *pf;
+		char *vf;
 	} data;
 };
 
@@ -1164,6 +1382,8 @@ static void fill_filter_data(struct filter *filter, const char *key, const char 
 	__fill_key(slot);
 	__fill_key(drm);
 	__fill_key(driver);
+	__fill_key(pf);
+	__fill_key(vf);
 #undef __fill_key
 
 }
@@ -1293,7 +1513,7 @@ static struct igt_list_head *filter_pci(const struct filter_class *fcls,
 			continue;
 
 		/* Skip if 'device' doesn't match */
-		if (filter->data.device && strcasecmp(filter->data.device, dev->device))
+		if (filter->data.device && !is_device_matched(dev, filter->data.device))
 			continue;
 
 		/* We get n-th card */
@@ -1306,6 +1526,116 @@ static struct igt_list_head *filter_pci(const struct filter_class *fcls,
 	}
 
 	DBG("Filter pci filtered size: %d\n", igt_list_length(&igt_devs.filtered));
+
+	return &igt_devs.filtered;
+}
+
+static bool is_pf(struct igt_device *dev)
+{
+	if (get_attr(dev, "sriov_numvfs") == NULL)
+		return false;
+
+	return true;
+}
+
+static bool is_vf(struct igt_device *dev)
+{
+	if (get_attr(dev, "physfn") == NULL)
+		return false;
+
+	return true;
+}
+
+/*
+ * Find appropriate pci device matching vendor/device/card/pf/vf filter arguments.
+ */
+static struct igt_list_head *filter_sriov(const struct filter_class *fcls,
+					const struct filter *filter)
+{
+	struct igt_device *dev, *dup;
+	int card = -1, pf = -1, vf = -1;
+	char *pf_pci_slot_name = NULL;
+	(void) fcls;
+
+	DBG("filter sriov\n");
+
+	if (filter->data.card) {
+		sscanf(filter->data.card, "%d", &card);
+		if (card < 0) {
+			return &igt_devs.filtered;
+		}
+	} else {
+		card = 0;
+	}
+
+	if (filter->data.pf) {
+		sscanf(filter->data.pf, "%d", &pf);
+		if (pf < 0) {
+			return &igt_devs.filtered;
+		}
+	} else {
+		pf = 0;
+	}
+
+	if (filter->data.vf) {
+		sscanf(filter->data.vf, "%d", &vf);
+		if (vf < 0) {
+			return &igt_devs.filtered;
+		}
+	}
+
+	igt_list_for_each_entry(dev, &igt_devs.all, link) {
+		if (!is_pci_subsystem(dev))
+			continue;
+
+		/* Skip if 'vendor' doesn't match (hex or name) */
+		if (filter->data.vendor && !is_vendor_matched(dev, filter->data.vendor))
+			continue;
+
+		/* Skip if 'device' doesn't match */
+		if (filter->data.device && !is_device_matched(dev, filter->data.device))
+			continue;
+
+		/* We get n-th card */
+		if (!card) {
+			if (!pf) {
+				if (is_pf(dev))
+					pf_pci_slot_name = dev->pci_slot_name;
+
+				/* vf parameter was not passed, get pf */
+				if (vf < 0) {
+					if (!is_pf(dev))
+						continue;
+
+					dup = duplicate_device(dev);
+					igt_list_add_tail(&dup->link, &igt_devs.filtered);
+					break;
+				} else {
+					/* Skip if vf is not associated with defined pf */
+					if (!strequal(get_attr(dev, "physfn"), pf_pci_slot_name))
+						continue;
+
+					if (!vf) {
+						if (!is_vf(dev))
+							continue;
+
+						dup = duplicate_device(dev);
+						igt_list_add_tail(&dup->link, &igt_devs.filtered);
+						break;
+					}
+					if (is_vf(dev)) {
+						vf--;
+						continue;
+					}
+				}
+			}
+			if (is_pf(dev)) {
+				pf--;
+				continue;
+			}
+		}
+		card--;
+	}
 
 	return &igt_devs.filtered;
 }
@@ -1344,6 +1674,12 @@ static struct filter_class filter_definition_list[] = {
 		.filter_function = filter_pci,
 		.help = "pci:[vendor=%04x/name][,device=%04x][,card=%d] | [slot=%04x:%02x:%02x.%x]",
 		.detail = "vendor is hex number or vendor name\n",
+	},
+	{
+		.name = "sriov",
+		.filter_function = filter_sriov,
+		.help = "sriov:[vendor=%04x/name][,device=%04x][,card=%d][,pf=%d][,vf=%d]",
+		.detail = "find pf or vf\n",
 	},
 	{
 		.name = NULL,
@@ -1426,6 +1762,8 @@ static bool is_filter_valid(const char *fstr)
 	return true;
 }
 
+#define MAX_PCI_CARDS 64
+
 /**
  * igt_device_filter_add
  * @filters: filter(s) to be stored in filter array
@@ -1448,12 +1786,43 @@ int igt_device_filter_add(const char *filters)
 
 	while ((filter = strsep(&dup, ";"))) {
 		bool is_valid = is_filter_valid(filter);
+		struct device_filter *df;
+		char *multi;
+
 		igt_warn_on(!is_valid);
-		if (is_valid) {
-			struct device_filter *df = malloc(sizeof(*df));
+		if (!is_valid)
+			continue;
+
+		if (!strncmp(filter, "sriov:", 6)) {
+			multi = NULL;
+		} else {
+			multi = strstr(filter, "card=all");
+			if (!multi)
+				multi = strstr(filter, "card=*");
+		}
+
+		if (!multi) {
+			df = malloc(sizeof(*df));
 			strncpy(df->filter, filter, sizeof(df->filter)-1);
 			igt_list_add_tail(&df->link, &device_filters);
 			count++;
+		} else {
+			multi[5] = 0;
+			for (int i = 0; i < MAX_PCI_CARDS; ++i) {
+				df = malloc(sizeof(*df));
+				snprintf(df->filter, sizeof(df->filter)-1, "%s%d", filter, i);
+				if (i) { /* add at least card=0 */
+					struct igt_device_card card;
+
+					if (!igt_device_card_match(df->filter, &card)) {
+						free(df);
+						break;
+					}
+				}
+
+				igt_list_add_tail(&df->link, &device_filters);
+				count++;
+			}
 		}
 	}
 

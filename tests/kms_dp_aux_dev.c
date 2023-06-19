@@ -53,6 +53,12 @@ static bool test(int drm_fd, uint32_t connector_id)
 	drmModeFreeConnector(connector);
 	igt_assert(dir_fd >= 0);
 
+	if (connector->connection != DRM_MODE_CONNECTED &&
+	    is_mst_connector(drm_fd, connector_id)) {
+		close(dir_fd);
+		return false;
+	}
+
 	dir = fdopendir(dir_fd);
 	igt_assert(dir);
 
@@ -80,7 +86,8 @@ static bool test(int drm_fd, uint32_t connector_id)
 
 		igt_assert(ret == sizeof(buf) ||
 			   errno == ETIMEDOUT ||
-			   (errno == EIO && is_mst_connector(drm_fd, connector_id)));
+			   (errno == EIO && (is_mst_connector(drm_fd, connector_id) ||
+			    is_amdgpu_device(drm_fd))));
 
 		close(fd);
 
@@ -128,4 +135,5 @@ igt_simple_main
 	igt_require(valid_connectors);
 
 	drmModeFreeResources(res);
+	close(drm_fd);
 }

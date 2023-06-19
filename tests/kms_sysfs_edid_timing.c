@@ -26,24 +26,28 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#define THRESHOLD_PER_CONNECTOR	10
-#define THRESHOLD_TOTAL		50
-#define CHECK_TIMES		15
+#define THRESHOLD_PER_CONNECTOR		150
+#define THRESHOLD_PER_CONNECTOR_MEAN	140
+#define THRESHOLD_ALL_CONNECTORS_MEAN	100
+#define CHECK_TIMES			15
 
-IGT_TEST_DESCRIPTION("This check the time we take to read the content of all "
-		     "the possible connectors. Without the edid -ENXIO patch "
-		     "(http://permalink.gmane.org/gmane.comp.video.dri.devel/62083), "
-		     "we sometimes take a *really* long time. "
-		     "So let's just check for some reasonable timing here");
-
+IGT_TEST_DESCRIPTION("This test checks the time it takes to reprobe each "
+		     "connector and fails if either the time it takes for "
+		     "one reprobe is too long or if the mean time it takes "
+		     "to reprobe one connector is too long.  Additionally, "
+		     "make sure that the mean time for all connectors is "
+		     "not too long.");
 
 igt_simple_main
 {
 	DIR *dirp;
 	struct dirent *de;
+	struct igt_mean all_mean;
 
 	dirp = opendir("/sys/class/drm");
 	igt_assert(dirp != NULL);
+
+	igt_mean_init(&all_mean);
 
 	while ((de = readdir(dirp))) {
 		struct igt_mean mean = {};
@@ -81,17 +85,23 @@ igt_simple_main
 			  mean.max, mean.max / 1e3, mean.max / 1e6,
 			  mean.mean, mean.mean / 1e3, mean.mean / 1e6);
 
-		if (mean.max > (THRESHOLD_PER_CONNECTOR * 1e6)) {
-			igt_warn("%s: probe time exceed 10ms, "
-				 "max=%.2fms, avg=%.2fms\n", de->d_name,
-				 mean.max / 1e6, mean.mean / 1e6);
-		}
-		igt_assert_f(mean.mean < (THRESHOLD_TOTAL * 1e6),
-			     "%s: average probe time exceeded 50ms, "
-			     "max=%.2fms, avg=%.2fms\n", de->d_name,
+		igt_assert_f(mean.max < THRESHOLD_PER_CONNECTOR * 1e6,
+			     "%s: single probe time exceeded %dms, max=%.2fms, avg=%.2fms\n",
+			     de->d_name, THRESHOLD_PER_CONNECTOR,
 			     mean.max / 1e6, mean.mean / 1e6);
 
-	}
-	closedir(dirp);
+		igt_assert_f(mean.mean < (THRESHOLD_PER_CONNECTOR_MEAN * 1e6),
+			     "%s: mean probe time exceeded %dms, max=%.2fms, avg=%.2fms\n",
+			     de->d_name, THRESHOLD_PER_CONNECTOR_MEAN,
+			     mean.max / 1e6, mean.mean / 1e6);
 
+		igt_mean_add(&all_mean, mean.mean);
+	}
+
+	igt_assert_f(all_mean.mean < THRESHOLD_ALL_CONNECTORS_MEAN * 1e6,
+		     "Mean of all connector means exceeds %dms, max=%.2fms, mean=%.2fms\n",
+		     THRESHOLD_ALL_CONNECTORS_MEAN, all_mean.max / 1e6,
+		     all_mean.mean / 1e6);
+
+	closedir(dirp);
 }

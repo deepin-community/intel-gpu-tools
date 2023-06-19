@@ -29,11 +29,15 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/sysmacros.h>
+#endif
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <i915_drm.h>
+
+#include "i915_pciids.h"
 
 #include "intel_chipset.h"
 #include "perf.h"
@@ -58,6 +62,13 @@
 #include "i915_perf_metrics_rkl.h"
 #include "i915_perf_metrics_dg1.h"
 #include "i915_perf_metrics_adl.h"
+#include "i915_perf_metrics_acmgt1.h"
+#include "i915_perf_metrics_acmgt2.h"
+#include "i915_perf_metrics_acmgt3.h"
+#include "i915_perf_metrics_mtlgt2.h"
+#include "i915_perf_metrics_mtlgt3.h"
+
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 static int
 perf_ioctl(int fd, unsigned long request, void *arg)
@@ -143,6 +154,94 @@ unsupported_i915_perf_platform(struct intel_perf *perf)
 	return NULL;
 }
 
+static bool
+is_acm_gt1(const struct intel_perf_devinfo *devinfo)
+{
+#undef INTEL_VGA_DEVICE
+#define INTEL_VGA_DEVICE(_id, _info) _id
+	static const uint32_t devids[] = {
+		INTEL_DG2_G11_IDS(NULL),
+		INTEL_ATS_M75_IDS(NULL),
+	};
+#undef INTEL_VGA_DEVICE
+	for (uint32_t i = 0; i < ARRAY_SIZE(devids); i++) {
+		if (devids[i] == devinfo->devid)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+is_acm_gt2(const struct intel_perf_devinfo *devinfo)
+{
+#undef INTEL_VGA_DEVICE
+#define INTEL_VGA_DEVICE(_id, _info) _id
+	static const uint32_t devids[] = {
+		INTEL_DG2_G12_IDS(NULL),
+	};
+#undef INTEL_VGA_DEVICE
+	for (uint32_t i = 0; i < ARRAY_SIZE(devids); i++) {
+		if (devids[i] == devinfo->devid)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+is_acm_gt3(const struct intel_perf_devinfo *devinfo)
+{
+#undef INTEL_VGA_DEVICE
+#define INTEL_VGA_DEVICE(_id, _info) _id
+	static const uint32_t devids[] = {
+		INTEL_DG2_G10_IDS(NULL),
+		INTEL_ATS_M150_IDS(NULL),
+	};
+#undef INTEL_VGA_DEVICE
+	for (uint32_t i = 0; i < ARRAY_SIZE(devids); i++) {
+		if (devids[i] == devinfo->devid)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+is_mtl_gt2(const struct intel_perf_devinfo *devinfo)
+{
+#undef INTEL_VGA_DEVICE
+#define INTEL_VGA_DEVICE(_id, _info) _id
+	static const uint32_t devids[] = {
+		INTEL_MTL_M_IDS(NULL),
+		INTEL_MTL_P_GT2_IDS(NULL),
+	};
+#undef INTEL_VGA_DEVICE
+	for (uint32_t i = 0; i < ARRAY_SIZE(devids); i++) {
+		if (devids[i] == devinfo->devid)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+is_mtl_gt3(const struct intel_perf_devinfo *devinfo)
+{
+#undef INTEL_VGA_DEVICE
+#define INTEL_VGA_DEVICE(_id, _info) _id
+	static const uint32_t devids[] = {
+		INTEL_MTL_P_GT3_IDS(NULL),
+	};
+#undef INTEL_VGA_DEVICE
+	for (uint32_t i = 0; i < ARRAY_SIZE(devids); i++) {
+		if (devids[i] == devinfo->devid)
+			return true;
+	}
+
+	return false;
+}
+
 struct intel_perf *
 intel_perf_for_devinfo(uint32_t device_id,
 		       uint32_t revision,
@@ -153,6 +252,10 @@ intel_perf_for_devinfo(uint32_t device_id,
 {
 	const struct intel_device_info *devinfo = intel_get_device_info(device_id);
 	struct intel_perf *perf;
+	uint32_t subslice_mask_len;
+	uint32_t eu_mask_len;
+	uint32_t half_max_subslices;
+	uint64_t half_subslices_mask;
 	int bits_per_subslice;
 
 	if (!devinfo)
@@ -169,7 +272,7 @@ intel_perf_for_devinfo(uint32_t device_id,
 	 * 2x6 does not have 2 samplers).
 	 */
 	perf->devinfo.devid = device_id;
-	perf->devinfo.gen = devinfo->gen;
+	perf->devinfo.graphics_ver = devinfo->graphics_ver;
 	perf->devinfo.revision = revision;
 	perf->devinfo.timestamp_frequency = timestamp_frequency;
 	perf->devinfo.gt_min_freq = gt_min_freq;
@@ -180,10 +283,29 @@ intel_perf_for_devinfo(uint32_t device_id,
 			 "%s", devinfo->codename);
 	}
 
+	/* Store i915 topology. */
+	perf->devinfo.max_slices = topology->max_slices;
+	perf->devinfo.max_subslices_per_slice = topology->max_subslices;
+	perf->devinfo.max_eu_per_subslice = topology->max_eus_per_subslice;
+
+	subslice_mask_len =
+		topology->max_slices * topology->subslice_stride;
+	assert(sizeof(perf->devinfo.subslice_masks) >= subslice_mask_len);
+	memcpy(perf->devinfo.subslice_masks,
+	       &topology->data[topology->subslice_offset],
+	       subslice_mask_len);
+
+	eu_mask_len = topology->eu_stride *
+		topology->max_subslices * topology->max_slices;
+	assert(sizeof(perf->devinfo.eu_masks) >= eu_mask_len);
+	memcpy(perf->devinfo.eu_masks,
+	       &topology->data[topology->eu_offset],
+	       eu_mask_len);
+
 	/* On Gen11+ the equations from the xml files expect an 8bits
 	 * mask per subslice, versus only 3bits on prior Gens.
 	 */
-	bits_per_subslice = devinfo->gen >= 11 ? 8 : 3;
+	bits_per_subslice = devinfo->graphics_ver >= 11 ? 8 : 3;
 	for (uint32_t s = 0; s < topology->max_slices; s++) {
 		if (!slice_available(topology, s))
 			continue;
@@ -205,8 +327,20 @@ intel_perf_for_devinfo(uint32_t device_id,
 	perf->devinfo.n_eu_slices = __builtin_popcount(perf->devinfo.slice_mask);
 	perf->devinfo.n_eu_sub_slices = __builtin_popcount(perf->devinfo.subslice_mask);
 
+	/* Compute number of subslices/dualsubslices in first half of
+	 * the GPU.
+	 */
+	half_max_subslices = topology->max_subslices / 2;
+	half_subslices_mask = perf->devinfo.subslice_mask &
+		((1 << half_max_subslices) - 1);
+	perf->devinfo.n_eu_sub_slices_half_slices = __builtin_popcount(half_subslices_mask);
+
 	/* Valid on most generations except Gen9LP. */
 	perf->devinfo.eu_threads_count = 7;
+
+	/* Most platforms have full 32bit timestamps. */
+	perf->devinfo.oa_timestamp_mask = 0xffffffff;
+	perf->devinfo.oa_timestamp_shift = 0;
 
 	if (devinfo->is_haswell) {
 		intel_perf_load_metrics_hsw(perf);
@@ -271,14 +405,39 @@ intel_perf_for_devinfo(uint32_t device_id,
 			intel_perf_load_metrics_tglgt2(perf);
 			break;
 		default:
-			unsupported_i915_perf_platform(perf);
+			return unsupported_i915_perf_platform(perf);
 		}
 	} else if (devinfo->is_rocketlake) {
 		intel_perf_load_metrics_rkl(perf);
 	} else if (devinfo->is_dg1) {
 		intel_perf_load_metrics_dg1(perf);
-	} else if (devinfo->is_alderlake_s) {
+	} else if (devinfo->is_alderlake_s || devinfo->is_alderlake_p ||
+		   devinfo->is_raptorlake_s || devinfo->is_alderlake_n) {
 		intel_perf_load_metrics_adl(perf);
+	} else if (devinfo->is_dg2) {
+		perf->devinfo.eu_threads_count = 8;
+		/* OA reports have the timestamp value shifted to the
+		 * right by 1 bits, it also means we cannot use the
+		 * top bit for comparison.
+		 */
+		perf->devinfo.oa_timestamp_shift = -1;
+		perf->devinfo.oa_timestamp_mask = 0x7fffffff;
+
+		if (is_acm_gt1(&perf->devinfo))
+			intel_perf_load_metrics_acmgt1(perf);
+		else if (is_acm_gt2(&perf->devinfo))
+			intel_perf_load_metrics_acmgt2(perf);
+		else if (is_acm_gt3(&perf->devinfo))
+			intel_perf_load_metrics_acmgt3(perf);
+		else
+			return unsupported_i915_perf_platform(perf);
+	} else if (devinfo->is_meteorlake) {
+		if (is_mtl_gt2(&perf->devinfo))
+			intel_perf_load_metrics_mtlgt2(perf);
+		else if (is_mtl_gt3(&perf->devinfo))
+			intel_perf_load_metrics_mtlgt3(perf);
+		else
+			return unsupported_i915_perf_platform(perf);
 	} else {
 		return unsupported_i915_perf_platform(perf);
 	}
@@ -286,19 +445,16 @@ intel_perf_for_devinfo(uint32_t device_id,
 	return perf;
 }
 
-static uint32_t
-getparam(int drm_fd, uint32_t param)
+static int
+getparam(int drm_fd, uint32_t param, uint32_t *val)
 {
-        struct drm_i915_getparam gp;
-        int val = -1;
+	struct drm_i915_getparam gp;
 
-        memset(&gp, 0, sizeof(gp));
-        gp.param = param;
-        gp.value = &val;
+	memset(&gp, 0, sizeof(gp));
+	gp.param = param;
+	gp.value = (int *)val;
 
-	perf_ioctl(drm_fd, DRM_IOCTL_I915_GETPARAM, &gp);
-
-        return val;
+	return perf_ioctl(drm_fd, DRM_IOCTL_I915_GETPARAM, &gp);
 }
 
 static bool
@@ -372,22 +528,80 @@ open_master_sysfs_dir(int drm_fd)
 {
 	char path[128];
 	struct stat st;
+	int sysfs;
 
 	if (fstat(drm_fd, &st) || !S_ISCHR(st.st_mode))
                 return -1;
 
-        snprintf(path, sizeof(path), "/sys/dev/char/%d:0",
-                 major(st.st_rdev));
+	snprintf(path, sizeof(path), "/sys/dev/char/%d:%d", major(st.st_rdev), minor(st.st_rdev));
+	sysfs = open(path, O_DIRECTORY);
+	if (sysfs < 0)
+		return sysfs;
 
-	return open(path, O_DIRECTORY);
+	if (minor(st.st_rdev) >= 128) {
+		/* If we were given a renderD* drm_fd, find it's associated cardX node. */
+		char device[100], cmp[100];
+		int device_len, cmp_len, i;
+
+		device_len = readlinkat(sysfs, "device", device, sizeof(device));
+		close(sysfs);
+		if (device_len < 0)
+			return device_len;
+
+		for (i = 0; i < 64; i++) {
+
+			snprintf(path, sizeof(path), "/sys/dev/char/%d:%d", major(st.st_rdev), i);
+			sysfs = open(path, O_DIRECTORY);
+			if (sysfs < 0)
+				continue;
+
+			cmp_len = readlinkat(sysfs, "device", cmp, sizeof(cmp));
+			if (cmp_len == device_len && !memcmp(cmp, device, cmp_len))
+				break;
+
+			close(sysfs);
+			sysfs = -1;
+		}
+	}
+
+	return sysfs;
+}
+
+typedef enum {
+	RPS_MIN_FREQ_MHZ,
+	RPS_MAX_FREQ_MHZ,
+
+	RPS_MAX_ATTR,
+} intel_sysfs_attr_id;
+
+static const char *intel_sysfs_attr_name[2][RPS_MAX_ATTR] =
+{
+	{
+		"gt_min_freq_mhz",
+		"gt_max_freq_mhz",
+	},
+	{
+		"gt/gt0/rps_min_freq_mhz",
+		"gt/gt0/rps_max_freq_mhz",
+	},
+};
+
+static const char *
+intel_sysfs_attr_id_to_name(int sysfs_dirfd, intel_sysfs_attr_id id)
+{
+	assert(id < RPS_MAX_ATTR);
+
+	return !faccessat(sysfs_dirfd, "gt", O_RDONLY, 0) ?
+		intel_sysfs_attr_name[1][id] :
+		intel_sysfs_attr_name[0][id];
 }
 
 struct intel_perf *
 intel_perf_for_fd(int drm_fd)
 {
-	uint32_t device_id = getparam(drm_fd, I915_PARAM_CHIPSET_ID);
-	uint32_t device_revision = getparam(drm_fd, I915_PARAM_REVISION);
-	uint32_t timestamp_frequency = getparam(drm_fd, I915_PARAM_CS_TIMESTAMP_FREQUENCY);
+	uint32_t device_id;
+	uint32_t device_revision;
+	uint32_t timestamp_frequency;
 	uint64_t gt_min_freq;
 	uint64_t gt_max_freq;
 	struct drm_i915_query_topology_info *topology;
@@ -397,12 +611,24 @@ intel_perf_for_fd(int drm_fd)
 	if (sysfs_dir_fd < 0)
 		return NULL;
 
-	if (!read_sysfs(sysfs_dir_fd, "gt_min_freq_mhz", &gt_min_freq) ||
-	    !read_sysfs(sysfs_dir_fd, "gt_max_freq_mhz", &gt_max_freq)) {
+#define read_sysfs_rps(fd, id, value) \
+	read_sysfs(fd, intel_sysfs_attr_id_to_name(fd, id), value)
+
+	if (!read_sysfs_rps(sysfs_dir_fd, RPS_MIN_FREQ_MHZ, &gt_min_freq) ||
+	    !read_sysfs_rps(sysfs_dir_fd, RPS_MAX_FREQ_MHZ, &gt_max_freq)) {
 		close(sysfs_dir_fd);
 		return NULL;
 	}
 	close(sysfs_dir_fd);
+
+	if (getparam(drm_fd, I915_PARAM_CHIPSET_ID, &device_id) ||
+	    getparam(drm_fd, I915_PARAM_REVISION, &device_revision))
+		return NULL;
+
+	/* if OA_TIMESTAMP_FREQUENCY is not supported, fall back to CS_TIMESTAMP_FREQUENCY */
+	if (getparam(drm_fd, I915_PARAM_OA_TIMESTAMP_FREQUENCY, &timestamp_frequency) &&
+	    getparam(drm_fd, I915_PARAM_CS_TIMESTAMP_FREQUENCY, &timestamp_frequency))
+		return NULL;
 
 	topology = query_topology(drm_fd);
 	if (!topology)
@@ -595,7 +821,8 @@ accumulate_uint40(int a_index,
 }
 
 void intel_perf_accumulate_reports(struct intel_perf_accumulator *acc,
-				   int oa_format,
+				   const struct intel_perf *perf,
+				   const struct intel_perf_metric_set *metric_set,
 				   const struct drm_i915_perf_record_header *record0,
 				   const struct drm_i915_perf_record_header *record1)
 {
@@ -607,9 +834,49 @@ void intel_perf_accumulate_reports(struct intel_perf_accumulator *acc,
 
 	memset(acc, 0, sizeof(*acc));
 
-	switch (oa_format) {
+	switch (metric_set->perf_oa_format) {
+	case I915_OA_FORMAT_A24u40_A14u32_B8_C8:
+		/* timestamp */
+		if (perf->devinfo.oa_timestamp_shift >= 0)
+			deltas[idx++] += (end[1] - start[1]) << perf->devinfo.oa_timestamp_shift;
+		else
+			deltas[idx++] += (end[1] - start[1]) >> (-perf->devinfo.oa_timestamp_shift);
+		accumulate_uint32(start + 3, end + 3, deltas + idx++); /* clock */
+
+		/* 4x 32bit A0-3 counters... */
+		for (i = 0; i < 4; i++)
+			accumulate_uint32(start + 4 + i, end + 4 + i, deltas + idx++);
+
+		/* 20x 40bit A4-23 counters... */
+		for (i = 0; i < 20; i++)
+			accumulate_uint40(i + 4, start, end, deltas + idx++);
+
+		/* 4x 32bit A24-27 counters... */
+		for (i = 0; i < 4; i++)
+			accumulate_uint32(start + 28 + i, end + 28 + i, deltas + idx++);
+
+		/* 4x 40bit A28-31 counters... */
+		for (i = 0; i < 4; i++)
+			accumulate_uint40(i + 28, start, end, deltas + idx++);
+
+		/* 5x 32bit A32-36 counters... */
+		for (i = 0; i < 5; i++)
+			accumulate_uint32(start + 36 + i, end + 36 + i, deltas + idx++);
+
+		/* 1x 32bit A37 counter... */
+		accumulate_uint32(start + 46, end + 46, deltas + idx++);
+
+		/* 8x 32bit B counters + 8x 32bit C counters... */
+		for (i = 0; i < 16; i++)
+			accumulate_uint32(start + 48 + i, end + 48 + i, deltas + idx++);
+		break;
+
+	case I915_OAR_FORMAT_A32u40_A4u32_B8_C8:
 	case I915_OA_FORMAT_A32u40_A4u32_B8_C8:
-		accumulate_uint32(start + 1, end + 1, deltas + idx++); /* timestamp */
+		if (perf->devinfo.oa_timestamp_shift >= 0)
+			deltas[idx++] += (end[1] - start[1]) << perf->devinfo.oa_timestamp_shift;
+		else
+			deltas[idx++] += (end[1] - start[1]) >> (-perf->devinfo.oa_timestamp_shift);
 		accumulate_uint32(start + 3, end + 3, deltas + idx++); /* clock */
 
 		/* 32x 40bit A counters... */
@@ -626,7 +893,11 @@ void intel_perf_accumulate_reports(struct intel_perf_accumulator *acc,
 		break;
 
 	case I915_OA_FORMAT_A45_B8_C8:
-		accumulate_uint32(start + 1, end + 1, deltas); /* timestamp */
+		/* timestamp */
+		if (perf->devinfo.oa_timestamp_shift >= 0)
+			deltas[0] += (end[1] - start[1]) << perf->devinfo.oa_timestamp_shift;
+		else
+			deltas[0] += (end[1] - start[1]) >> (-perf->devinfo.oa_timestamp_shift);
 
 		for (i = 0; i < 61; i++)
 			accumulate_uint32(start + 3 + i, end + 3 + i, deltas + 1 + i);
@@ -635,4 +906,105 @@ void intel_perf_accumulate_reports(struct intel_perf_accumulator *acc,
 		assert(0);
 	}
 
+}
+
+uint64_t intel_perf_read_record_timestamp(const struct intel_perf *perf,
+					  const struct intel_perf_metric_set *metric_set,
+					  const struct drm_i915_perf_record_header *record)
+{
+       const uint32_t *report32 = (const uint32_t *)(record + 1);
+       uint64_t ts;
+
+       switch (metric_set->perf_oa_format) {
+       case I915_OA_FORMAT_A24u40_A14u32_B8_C8:
+       case I915_OA_FORMAT_A32u40_A4u32_B8_C8:
+       case I915_OA_FORMAT_A45_B8_C8:
+               ts = report32[1];
+               break;
+
+       default:
+               assert(0);
+       }
+
+       if (perf->devinfo.oa_timestamp_shift >= 0)
+	       ts <<= perf->devinfo.oa_timestamp_shift;
+       else
+	       ts >>= -perf->devinfo.oa_timestamp_shift;
+
+       return ts;
+}
+
+uint64_t intel_perf_read_record_timestamp_raw(const struct intel_perf *perf,
+					  const struct intel_perf_metric_set *metric_set,
+					  const struct drm_i915_perf_record_header *record)
+{
+       const uint32_t *report32 = (const uint32_t *)(record + 1);
+       uint64_t ts;
+
+       switch (metric_set->perf_oa_format) {
+       case I915_OA_FORMAT_A24u40_A14u32_B8_C8:
+       case I915_OA_FORMAT_A32u40_A4u32_B8_C8:
+       case I915_OA_FORMAT_A45_B8_C8:
+               ts = report32[1];
+               break;
+
+       default:
+               assert(0);
+       }
+
+       return ts;
+}
+
+const char *intel_perf_read_report_reason(const struct intel_perf *perf,
+					  const struct drm_i915_perf_record_header *record)
+{
+	const uint32_t *report = (const uint32_t *) (record + 1);
+
+	/* Not really documented on Gfx7/7.5*/
+	if (perf->devinfo.graphics_ver < 8)
+		return "timer";
+
+	/* Gfx8-11 */
+	if (perf->devinfo.graphics_ver < 12) {
+		uint32_t reason = report[0] >> 19;
+		if (reason & (1u << 0))
+			return "timer";
+		if (reason & (1u << 1))
+			return "trigger1";
+		if (reason & (1u << 2))
+			return "trigger2";
+		if (reason & (1u << 3))
+			return "context-switch";
+		if (reason & (1u << 4))
+			return "go-transition";
+
+		if (perf->devinfo.graphics_ver >= 9 &&
+		    reason & (1u << 5))
+			return "clock-ratio-change";
+
+		return "unknown";
+	}
+
+	/* Gfx12 */
+	if (perf->devinfo.graphics_ver <= 12) {
+		uint32_t reason = report[0] >> 19;
+		if (reason & (1u << 0))
+			return "timer";
+		if (reason & (1u << 1))
+			return "trigger1";
+		if (reason & (1u << 2))
+			return "trigger2";
+		if (reason & (1u << 3))
+			return "context-switch";
+		if (reason & (1u << 4))
+			return "go-transition";
+		if (reason & (1u << 5))
+			return "clock-ratio-change";
+		if (reason & (1u << 6))
+			return "mmio-trigger";
+
+		return "unknown";
+	}
+
+	return "unknown";
 }

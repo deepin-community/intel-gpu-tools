@@ -25,6 +25,7 @@
 #include <pthread.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_ring.h"
 #include "igt_debugfs.h"
 #include "igt_dummyload.h"
@@ -96,38 +97,32 @@ filter_engines_can_store_dword(int fd, struct intel_engine_data *ied)
 	ied->nengines = count;
 }
 
-static struct intel_engine_data list_store_engines(int fd, unsigned ring)
+static struct intel_engine_data
+list_engines(int fd, const intel_ctx_t *ctx, unsigned ring)
 {
 	struct intel_engine_data ied = { };
 
 	if (ring == ALL_ENGINES) {
-		ied = intel_init_engine_list(fd, 0);
-		filter_engines_can_store_dword(fd, &ied);
+		ied = intel_engine_list_for_ctx_cfg(fd, &ctx->cfg);
 	} else {
-		if (gem_has_ring(fd, ring) && gem_can_store_dword(fd, ring)) {
-			ied.engines[ied.nengines].flags = ring;
-			strcpy(ied.engines[ied.nengines].name, " ");
-			ied.nengines++;
-		}
+		if (ctx->cfg.num_engines)
+			igt_assert(ring < ctx->cfg.num_engines);
+		else
+			igt_assert(gem_has_ring(fd, ring));
+
+		ied.engines[ied.nengines].flags = ring;
+		strcpy(ied.engines[ied.nengines].name, " ");
+		ied.nengines++;
 	}
 
 	return ied;
 }
 
-static struct intel_engine_data list_engines(int fd, unsigned ring)
+static struct intel_engine_data
+list_store_engines(int fd, const intel_ctx_t *ctx, unsigned ring)
 {
-	struct intel_engine_data ied = { };
-
-	if (ring == ALL_ENGINES) {
-		ied = intel_init_engine_list(fd, 0);
-	} else {
-		if (gem_has_ring(fd, ring)) {
-			ied.engines[ied.nengines].flags = ring;
-			strcpy(ied.engines[ied.nengines].name, " ");
-			ied.nengines++;
-		}
-	}
-
+	struct intel_engine_data ied = list_engines(fd, ctx, ring);
+	filter_engines_can_store_dword(fd, &ied);
 	return ied;
 }
 
@@ -149,11 +144,12 @@ static void xchg_engine(void *array, unsigned i, unsigned j)
 }
 
 static void
-sync_ring(int fd, unsigned ring, int num_children, int timeout)
+sync_ring(int fd, const intel_ctx_t *ctx,
+	  unsigned ring, int num_children, int timeout)
 {
 	struct intel_engine_data ied;
 
-	ied = list_engines(fd, ring);
+	ied = list_engines(fd, ctx, ring);
 	igt_require(ied.nengines);
 	num_children *= ied.nengines;
 
@@ -173,6 +169,7 @@ sync_ring(int fd, unsigned ring, int num_children, int timeout)
 		execbuf.buffers_ptr = to_user_pointer(&object);
 		execbuf.buffer_count = 1;
 		execbuf.flags = ied_flags(&ied, child);
+		execbuf.rsvd1 = ctx->id;
 		gem_execbuf(fd, &execbuf);
 		gem_sync(fd, object.handle);
 
@@ -195,7 +192,8 @@ sync_ring(int fd, unsigned ring, int num_children, int timeout)
 }
 
 static void
-idle_ring(int fd, unsigned int ring, int num_children, int timeout)
+idle_ring(int fd, const intel_ctx_t *ctx, unsigned int ring,
+	  int num_children, int timeout)
 {
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
 	struct drm_i915_gem_exec_object2 object;
@@ -213,6 +211,7 @@ idle_ring(int fd, unsigned int ring, int num_children, int timeout)
 	execbuf.buffers_ptr = to_user_pointer(&object);
 	execbuf.buffer_count = 1;
 	execbuf.flags = ring;
+	execbuf.rsvd1 = ctx->id;
 	gem_execbuf(fd, &execbuf);
 	gem_sync(fd, object.handle);
 
@@ -234,11 +233,13 @@ idle_ring(int fd, unsigned int ring, int num_children, int timeout)
 }
 
 static void
-wakeup_ring(int fd, unsigned ring, int timeout, int wlen)
+wakeup_ring(int fd, const intel_ctx_t *ctx, unsigned ring,
+	    int timeout, int wlen)
 {
 	struct intel_engine_data ied;
+	uint64_t ahnd = get_reloc_ahnd(fd, ctx->id);
 
-	ied = list_store_engines(fd, ring);
+	ied = list_store_engines(fd, ctx, ring);
 	igt_require(ied.nengines);
 
 	intel_detect_and_clear_missed_interrupts(fd);
@@ -250,16 +251,24 @@ wakeup_ring(int fd, unsigned ring, int timeout, int wlen)
 		unsigned long cycles;
 		igt_spin_t *spin;
 
+		ahnd = get_reloc_ahnd(fd, ctx->id);
+
 		memset(&object, 0, sizeof(object));
 		object.handle = gem_create(fd, 4096);
+		object.offset = get_offset(ahnd, object.handle, 4096, 0);
+		if (ahnd)
+			object.flags = EXEC_OBJECT_PINNED;
 		gem_write(fd, object.handle, 0, &bbe, sizeof(bbe));
 
 		memset(&execbuf, 0, sizeof(execbuf));
 		execbuf.buffers_ptr = to_user_pointer(&object);
 		execbuf.buffer_count = 1;
 		execbuf.flags = ied_flags(&ied, child);
+		execbuf.rsvd1 = ctx->id;
 
 		spin = __igt_spin_new(fd,
+				      .ahnd = ahnd,
+				      .ctx = ctx,
 				      .engine = execbuf.flags,
 				      .flags = (IGT_SPIN_POLL_RUN |
 						IGT_SPIN_FAST));
@@ -321,17 +330,21 @@ wakeup_ring(int fd, unsigned ring, int timeout, int wlen)
 
 		igt_spin_free(fd, spin);
 		gem_close(fd, object.handle);
+		put_offset(ahnd, object.handle);
+		put_ahnd(ahnd);
 	}
 	igt_waitchildren_timeout(2*timeout, NULL);
+	put_ahnd(ahnd);
 	igt_assert_eq(intel_detect_and_clear_missed_interrupts(fd), 0);
 }
 
-static void active_ring(int fd, unsigned int ring,
+static void active_ring(int fd, const intel_ctx_t *ctx, unsigned int ring,
 			int num_children, int timeout)
 {
 	struct intel_engine_data ied;
+	uint64_t ahnd = get_reloc_ahnd(fd, ctx->id);
 
-	ied = list_store_engines(fd, ring);
+	ied = list_store_engines(fd, ctx, ring);
 	igt_require(ied.nengines);
 
 	intel_detect_and_clear_missed_interrupts(fd);
@@ -340,11 +353,17 @@ static void active_ring(int fd, unsigned int ring,
 		unsigned long cycles;
 		igt_spin_t *spin[2];
 
+		ahnd = get_reloc_ahnd(fd, ctx->id);
+
 		spin[0] = __igt_spin_new(fd,
+					 .ahnd = ahnd,
+					 .ctx = ctx,
 					 .engine = ied_flags(&ied, child),
 					 .flags = IGT_SPIN_FAST);
 
 		spin[1] = __igt_spin_new(fd,
+					 .ahnd = ahnd,
+					 .ctx = ctx,
 					 .engine = ied_flags(&ied, child),
 					 .flags = IGT_SPIN_FAST);
 
@@ -366,21 +385,26 @@ static void active_ring(int fd, unsigned int ring,
 		} while ((elapsed = gettime()) < end);
 		igt_spin_free(fd, spin[1]);
 		igt_spin_free(fd, spin[0]);
+		put_ahnd(ahnd);
 
 		igt_info("%s %ld cycles: %.3f us\n",
 			 ied_name(&ied, child),
 			 cycles, (elapsed - start) * 1e6 / cycles);
 	}
 	igt_waitchildren_timeout(2*timeout, NULL);
+	put_ahnd(ahnd);
 	igt_assert_eq(intel_detect_and_clear_missed_interrupts(fd), 0);
 }
 
 static void
-active_wakeup_ring(int fd, unsigned ring, int timeout, int wlen)
+active_wakeup_ring(int fd, const intel_ctx_t *ctx, unsigned ring,
+		   int timeout, int wlen)
 {
 	struct intel_engine_data ied;
+	uint64_t ahnd0 = get_reloc_ahnd(fd, 0);
+	uint64_t ahnd = get_reloc_ahnd(fd, ctx->id);
 
-	ied = list_store_engines(fd, ring);
+	ied = list_store_engines(fd, ctx, ring);
 	igt_require(ied.nengines);
 
 	intel_detect_and_clear_missed_interrupts(fd);
@@ -392,22 +416,31 @@ active_wakeup_ring(int fd, unsigned ring, int timeout, int wlen)
 		unsigned long cycles;
 		igt_spin_t *spin[2];
 
+		ahnd0 = get_reloc_ahnd(fd, 0);
+		ahnd = get_reloc_ahnd(fd, ctx->id);
+
 		memset(&object, 0, sizeof(object));
 		object.handle = gem_create(fd, 4096);
+		object.offset = get_offset(ahnd, object.handle, 4096, 0);
+		if (ahnd)
+			object.offset = EXEC_OBJECT_PINNED;
 		gem_write(fd, object.handle, 0, &bbe, sizeof(bbe));
 
 		memset(&execbuf, 0, sizeof(execbuf));
 		execbuf.buffers_ptr = to_user_pointer(&object);
 		execbuf.buffer_count = 1;
 		execbuf.flags = ied_flags(&ied, child);
+		execbuf.rsvd1 = ctx->id;
 
 		spin[0] = __igt_spin_new(fd,
+					 .ahnd = ahnd0,
 					 .engine = execbuf.flags,
 					 .flags = (IGT_SPIN_POLL_RUN |
 						   IGT_SPIN_FAST));
 		igt_assert(igt_spin_has_poll(spin[0]));
 
 		spin[1] = __igt_spin_new(fd,
+					 .ahnd = ahnd0,
 					 .engine = execbuf.flags,
 					 .flags = (IGT_SPIN_POLL_RUN |
 						   IGT_SPIN_FAST));
@@ -484,18 +517,25 @@ active_wakeup_ring(int fd, unsigned ring, int timeout, int wlen)
 		igt_spin_free(fd, spin[1]);
 		igt_spin_free(fd, spin[0]);
 		gem_close(fd, object.handle);
+		put_offset(ahnd, object.handle);
+		put_ahnd(ahnd);
+		put_ahnd(ahnd0);
 	}
 	igt_waitchildren_timeout(2*timeout, NULL);
+	put_ahnd(ahnd);
+	put_ahnd(ahnd0);
 	igt_assert_eq(intel_detect_and_clear_missed_interrupts(fd), 0);
 }
 
 static void
-store_ring(int fd, unsigned ring, int num_children, int timeout)
+store_ring(int fd, const intel_ctx_t *ctx, unsigned ring,
+	   int num_children, int timeout)
 {
 	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
 	struct intel_engine_data ied;
+	bool has_relocs = gem_has_relocations(fd);
 
-	ied = list_store_engines(fd, ring);
+	ied = list_store_engines(fd, ctx, ring);
 	igt_require(ied.nengines);
 	num_children *= ied.nengines;
 
@@ -516,6 +556,7 @@ store_ring(int fd, unsigned ring, int num_children, int timeout)
 		execbuf.flags |= I915_EXEC_HANDLE_LUT;
 		if (gen < 6)
 			execbuf.flags |= I915_EXEC_SECURE;
+		execbuf.rsvd1 = ctx->id;
 
 		memset(object, 0, sizeof(object));
 		object[0].handle = gem_create(fd, 4096);
@@ -524,10 +565,11 @@ store_ring(int fd, unsigned ring, int num_children, int timeout)
 		gem_execbuf(fd, &execbuf);
 
 		object[0].flags |= EXEC_OBJECT_WRITE;
+		object[0].flags |= has_relocs ? 0 : EXEC_OBJECT_PINNED;
 		object[1].handle = gem_create(fd, 20*1024);
 
 		object[1].relocs_ptr = to_user_pointer(reloc);
-		object[1].relocation_count = 1024;
+		object[1].relocation_count = has_relocs ? 1024 : 0;
 
 		batch = gem_mmap__cpu(fd, object[1].handle, 0, 20*1024,
 				      PROT_WRITE | PROT_READ);
@@ -586,14 +628,16 @@ store_ring(int fd, unsigned ring, int num_children, int timeout)
 }
 
 static void
-switch_ring(int fd, unsigned ring, int num_children, int timeout)
+switch_ring(int fd, const intel_ctx_t *ctx, unsigned ring,
+	    int num_children, int timeout)
 {
 	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
 	struct intel_engine_data ied;
+	bool has_relocs = gem_has_relocations(fd);
 
 	gem_require_contexts(fd);
 
-	ied = list_store_engines(fd, ring);
+	ied = list_store_engines(fd, ctx, ring);
 	igt_require(ied.nengines);
 	num_children *= ied.nengines;
 
@@ -603,6 +647,7 @@ switch_ring(int fd, unsigned ring, int num_children, int timeout)
 			struct drm_i915_gem_exec_object2 object[2];
 			struct drm_i915_gem_relocation_entry reloc[1024];
 			struct drm_i915_gem_execbuffer2 execbuf;
+			const intel_ctx_t *ctx;
 		} contexts[2];
 		double elapsed, baseline;
 		unsigned long cycles;
@@ -620,7 +665,9 @@ switch_ring(int fd, unsigned ring, int num_children, int timeout)
 			c->execbuf.flags |= I915_EXEC_HANDLE_LUT;
 			if (gen < 6)
 				c->execbuf.flags |= I915_EXEC_SECURE;
-			c->execbuf.rsvd1 = gem_context_create(fd);
+
+			c->ctx = intel_ctx_create(fd, &ctx->cfg);
+			c->execbuf.rsvd1 = c->ctx->id;
 
 			memset(c->object, 0, sizeof(c->object));
 			c->object[0].handle = gem_create(fd, 4096);
@@ -632,7 +679,7 @@ switch_ring(int fd, unsigned ring, int num_children, int timeout)
 			c->object[1].handle = gem_create(fd, sz);
 
 			c->object[1].relocs_ptr = to_user_pointer(c->reloc);
-			c->object[1].relocation_count = 1024 * i;
+			c->object[1].relocation_count = has_relocs ? 1024 * i : 0;
 
 			batch = gem_mmap__cpu(fd, c->object[1].handle, 0, sz,
 					      PROT_WRITE | PROT_READ);
@@ -716,7 +763,7 @@ switch_ring(int fd, unsigned ring, int num_children, int timeout)
 		for (int i = 0; i < ARRAY_SIZE(contexts); i++) {
 			gem_close(fd, contexts[i].object[1].handle);
 			gem_close(fd, contexts[i].object[0].handle);
-			gem_context_destroy(fd, contexts[i].execbuf.rsvd1);
+			intel_ctx_destroy(fd, contexts[i].ctx);
 		}
 	}
 	igt_waitchildren_timeout(timeout+10, NULL);
@@ -765,7 +812,8 @@ static void *waiter(void *arg)
 }
 
 static void
-__store_many(int fd, unsigned ring, int timeout, unsigned long *cycles)
+__store_many(int fd, const intel_ctx_t *ctx, unsigned ring,
+	     int timeout, unsigned long *cycles)
 {
 	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
@@ -776,6 +824,7 @@ __store_many(int fd, unsigned ring, int timeout, unsigned long *cycles)
 	int order[64];
 	uint32_t *batch, *b;
 	int done;
+	bool has_relocs = gem_has_relocations(fd);
 
 	memset(&execbuf, 0, sizeof(execbuf));
 	execbuf.buffers_ptr = to_user_pointer(object);
@@ -784,6 +833,7 @@ __store_many(int fd, unsigned ring, int timeout, unsigned long *cycles)
 	execbuf.flags |= I915_EXEC_HANDLE_LUT;
 	if (gen < 6)
 		execbuf.flags |= I915_EXEC_SECURE;
+	execbuf.rsvd1 = ctx->id;
 
 	memset(object, 0, sizeof(object));
 	object[0].handle = gem_create(fd, 4096);
@@ -791,9 +841,10 @@ __store_many(int fd, unsigned ring, int timeout, unsigned long *cycles)
 	execbuf.buffer_count = 1;
 	gem_execbuf(fd, &execbuf);
 	object[0].flags |= EXEC_OBJECT_WRITE;
+	object[0].flags |= has_relocs ? 0 : EXEC_OBJECT_PINNED;
 
 	object[1].relocs_ptr = to_user_pointer(reloc);
-	object[1].relocation_count = 1024;
+	object[1].relocation_count = has_relocs ? 1024 : 0;
 	execbuf.buffer_count = 2;
 
 	memset(reloc, 0, sizeof(reloc));
@@ -893,7 +944,8 @@ __store_many(int fd, unsigned ring, int timeout, unsigned long *cycles)
 }
 
 static void
-store_many(int fd, unsigned int ring, int num_children, int timeout)
+store_many(int fd, const intel_ctx_t *ctx, unsigned int ring,
+	   int num_children, int timeout)
 {
 	struct intel_engine_data ied;
 	unsigned long *shared;
@@ -901,14 +953,14 @@ store_many(int fd, unsigned int ring, int num_children, int timeout)
 	shared = mmap(NULL, 4096, PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	igt_assert(shared != MAP_FAILED);
 
-	ied = list_store_engines(fd, ring);
+	ied = list_store_engines(fd, ctx, ring);
 	igt_require(ied.nengines);
 
 	intel_detect_and_clear_missed_interrupts(fd);
 
 	for (int n = 0; n < ied.nengines; n++) {
 		igt_fork(child, 1)
-			__store_many(fd,
+			__store_many(fd, ctx,
 				     ied_flags(&ied, n),
 				     timeout,
 				     &shared[n]);
@@ -924,11 +976,11 @@ store_many(int fd, unsigned int ring, int num_children, int timeout)
 }
 
 static void
-sync_all(int fd, int num_children, int timeout)
+sync_all(int fd, const intel_ctx_t *ctx, int num_children, int timeout)
 {
 	struct intel_engine_data ied;
 
-	ied = list_engines(fd, ALL_ENGINES);
+	ied = list_engines(fd, ctx, ALL_ENGINES);
 	igt_require(ied.nengines);
 
 	intel_detect_and_clear_missed_interrupts(fd);
@@ -946,6 +998,7 @@ sync_all(int fd, int num_children, int timeout)
 		memset(&execbuf, 0, sizeof(execbuf));
 		execbuf.buffers_ptr = to_user_pointer(&object);
 		execbuf.buffer_count = 1;
+		execbuf.rsvd1 = ctx->id;
 		gem_execbuf(fd, &execbuf);
 		gem_sync(fd, object.handle);
 
@@ -970,12 +1023,13 @@ sync_all(int fd, int num_children, int timeout)
 }
 
 static void
-store_all(int fd, int num_children, int timeout)
+store_all(int fd, const intel_ctx_t *ctx, int num_children, int timeout)
 {
 	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
 	struct intel_engine_data ied;
+	bool has_relocs = gem_has_relocations(fd);
 
-	ied = list_store_engines(fd, ALL_ENGINES);
+	ied = list_store_engines(fd, ctx, ALL_ENGINES);
 	igt_require(ied.nengines);
 
 	intel_detect_and_clear_missed_interrupts(fd);
@@ -994,6 +1048,7 @@ store_all(int fd, int num_children, int timeout)
 		execbuf.flags |= I915_EXEC_HANDLE_LUT;
 		if (gen < 6)
 			execbuf.flags |= I915_EXEC_SECURE;
+		execbuf.rsvd1 = ctx->id;
 
 		memset(object, 0, sizeof(object));
 		object[0].handle = gem_create(fd, 4096);
@@ -1002,10 +1057,11 @@ store_all(int fd, int num_children, int timeout)
 		gem_execbuf(fd, &execbuf);
 
 		object[0].flags |= EXEC_OBJECT_WRITE;
+		object[0].flags |= has_relocs ? 0 : EXEC_OBJECT_PINNED;
 		object[1].handle = gem_create(fd, 1024*16 + 4096);
 
 		object[1].relocs_ptr = to_user_pointer(reloc);
-		object[1].relocation_count = 1024;
+		object[1].relocation_count = has_relocs ? 1024 : 0;
 
 		batch = gem_mmap__cpu(fd, object[1].handle, 0, 16*1024 + 4096,
 				      PROT_WRITE | PROT_READ);
@@ -1069,20 +1125,22 @@ store_all(int fd, int num_children, int timeout)
 }
 
 static void
-preempt(int fd, unsigned ring, int num_children, int timeout)
+preempt(int fd, const intel_ctx_t *ctx, unsigned ring,
+	int num_children, int timeout)
 {
 	struct intel_engine_data ied;
-	uint32_t ctx[2];
+	const intel_ctx_t *tmp_ctx[2];
+	uint64_t ahnd = get_reloc_ahnd(fd, 0); /* just offset provider */
 
-	ied = list_engines(fd, ALL_ENGINES);
+	ied = list_engines(fd, ctx, ALL_ENGINES);
 	igt_require(ied.nengines);
 	num_children *= ied.nengines;
 
-	ctx[0] = gem_context_create(fd);
-	gem_context_set_priority(fd, ctx[0], MIN_PRIO);
+	tmp_ctx[0] = intel_ctx_create(fd, &ctx->cfg);
+	gem_context_set_priority(fd, tmp_ctx[0]->id, MIN_PRIO);
 
-	ctx[1] = gem_context_create(fd);
-	gem_context_set_priority(fd, ctx[1], MAX_PRIO);
+	tmp_ctx[1] = intel_ctx_create(fd, &ctx->cfg);
+	gem_context_set_priority(fd, tmp_ctx[1]->id, MAX_PRIO);
 
 	intel_detect_and_clear_missed_interrupts(fd);
 	igt_fork(child, num_children) {
@@ -1092,15 +1150,20 @@ preempt(int fd, unsigned ring, int num_children, int timeout)
 		double start, elapsed;
 		unsigned long cycles;
 
+		ahnd = get_reloc_ahnd(fd, 0);
+
 		memset(&object, 0, sizeof(object));
 		object.handle = gem_create(fd, 4096);
+		object.offset = get_offset(ahnd, object.handle, 4096, 0);
+		if (ahnd)
+			object.flags = EXEC_OBJECT_PINNED;
 		gem_write(fd, object.handle, 0, &bbe, sizeof(bbe));
 
 		memset(&execbuf, 0, sizeof(execbuf));
 		execbuf.buffers_ptr = to_user_pointer(&object);
 		execbuf.buffer_count = 1;
 		execbuf.flags = ied_flags(&ied, child);
-		execbuf.rsvd1 = ctx[1];
+		execbuf.rsvd1 = tmp_ctx[1]->id;
 		gem_execbuf(fd, &execbuf);
 		gem_sync(fd, object.handle);
 
@@ -1109,7 +1172,8 @@ preempt(int fd, unsigned ring, int num_children, int timeout)
 		do {
 			igt_spin_t *spin =
 				__igt_spin_new(fd,
-					       .ctx = ctx[0],
+					       .ahnd = ahnd,
+					       .ctx = tmp_ctx[0],
 					       .engine = execbuf.flags);
 
 			do {
@@ -1124,12 +1188,15 @@ preempt(int fd, unsigned ring, int num_children, int timeout)
 			 ied_name(&ied, child), cycles, elapsed * 1e6/cycles);
 
 		gem_close(fd, object.handle);
+		put_offset(ahnd, object.handle);
+		put_ahnd(ahnd);
 	}
 	igt_waitchildren_timeout(timeout+10, NULL);
+	put_ahnd(ahnd);
 	igt_assert_eq(intel_detect_and_clear_missed_interrupts(fd), 0);
 
-	gem_context_destroy(fd, ctx[1]);
-	gem_context_destroy(fd, ctx[0]);
+	intel_ctx_destroy(fd, tmp_ctx[1]);
+	intel_ctx_destroy(fd, tmp_ctx[0]);
 }
 
 igt_main
@@ -1137,41 +1204,70 @@ igt_main
 	const int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
 	const struct {
 		const char *name;
-		void (*func)(int fd, unsigned int engine,
+		void (*func)(int fd, const intel_ctx_t *ctx, unsigned int engine,
 			     int num_children, int timeout);
 		int num_children;
 		int timeout;
+		const char *describe;
 	} all[] = {
-		{ "basic-each", sync_ring, 1, 2 },
-		{ "basic-store-each", store_ring, 1, 2 },
-		{ "basic-many-each", store_many, 0, 2 },
-		{ "switch-each", switch_ring, 1, 20 },
-		{ "forked-switch-each", switch_ring, ncpus, 20 },
-		{ "forked-each", sync_ring, ncpus, 20 },
-		{ "forked-store-each", store_ring, ncpus, 20 },
-		{ "active-each", active_ring, 0, 20 },
-		{ "wakeup-each", wakeup_ring, 20, 1 },
-		{ "active-wakeup-each", active_wakeup_ring, 20, 1 },
-		{ "double-wakeup-each", wakeup_ring, 20, 2 },
+		{ "basic-each", sync_ring, 1, 2,
+			"Check synchronisation of ring" },
+		{ "basic-store-each", store_ring, 1, 2,
+			"Check that store synchronisation works" },
+		{ "basic-many-each", store_many, 0, 2,
+			"Create race condition and see if we can"
+			" catch interrupts" },
+		{ "switch-each", switch_ring, 1, 20,
+			"Check sync after context switch" },
+		{ "forked-switch-each", switch_ring, ncpus, 20,
+			"Check sync after context switch parallelly" },
+		{ "forked-each", sync_ring, ncpus, 20,
+			"Forked variant of sync_ring, which checks synchronisation"
+			" of ring with parallel executions" },
+		{ "forked-store-each", store_ring, ncpus, 20,
+			"Forked variant of store_ring, check if parallel store"
+			" synchronisation works" },
+		{ "active-each", active_ring, 0, 20,
+			"Exercise waiting while keeping the GPU busy" },
+		{ "wakeup-each", wakeup_ring, 20, 1,
+			"Stress test for nop + sync" },
+		{ "active-wakeup-each", active_wakeup_ring, 20, 1,
+			"Measure wakeup latency while also scheduling the next batch" },
+		{ "double-wakeup-each", wakeup_ring, 20, 2,
+			"Double stress test for nop + sync" },
 		{}
 	}, individual[] = {
-		{ "default", sync_ring, 1, 20 },
-		{ "idle", idle_ring, 0, 20 },
-		{ "active", active_ring, 0, 20 },
-		{ "wakeup", wakeup_ring, 20, 1 },
-		{ "active-wakeup", active_wakeup_ring, 20, 1 },
-		{ "double-wakeup", wakeup_ring, 20, 2 },
-		{ "store", store_ring, 1, 20 },
-		{ "switch", switch_ring, 1, 20 },
-		{ "forked-switch", switch_ring, ncpus, 20 },
-		{ "many", store_many, 0, 20 },
-		{ "forked", sync_ring, ncpus, 20 },
-		{ "forked-store", store_ring, ncpus, 20 },
+		{ "default", sync_ring, 1, 20,
+			"Check synchronisation of rings" },
+		{ "idle", idle_ring, 0, 20,
+			"Exercise and measure idle requests" },
+		{ "active", active_ring, 0, 20,
+			"Exercise waiting while keeping the GPU busy" },
+		{ "wakeup", wakeup_ring, 20, 1,
+			"Stress for nop + sync" },
+		{ "active-wakeup", active_wakeup_ring, 20, 1,
+			"Measure wakeup latency while also scheduling the next batch" },
+		{ "double-wakeup", wakeup_ring, 20, 2,
+			"Double stress test for nop + sync" },
+		{ "store", store_ring, 1, 20,
+			"Check that store synchronisation works" },
+		{ "switch", switch_ring, 1, 20,
+			"Check sync after context switch" },
+		{ "forked-switch", switch_ring, ncpus, 20,
+			"Check sync after context switch parallelly" },
+		{ "many", store_many, 0, 20,
+			"Create race condition and see if we can catch interrupts" },
+		{ "forked", sync_ring, ncpus, 20,
+			"Check synchronisation of ring with parallel executions" },
+		{ "forked-store", store_ring, ncpus, 20,
+			"Check store synchronisation works with parallel multiple"
+			" executions" },
 		{}
 	};
 #define for_each_test(t, T) for(typeof(*T) *t = T; t->name; t++)
 
 	const struct intel_execution_engine2 *e;
+	const intel_ctx_t *ctx;
 	int fd = -1;
 
 	igt_fixture {
@@ -1179,47 +1275,61 @@ igt_main
 		igt_require_gem(fd);
 		gem_submission_print_method(fd);
 		gem_scheduler_print_capability(fd);
+		ctx = intel_ctx_create_all_physical(fd);
 
 		igt_fork_hang_detector(fd);
+		intel_allocator_multiprocess_start();
 	}
 
 	/* Legacy for selecting rings. */
 	for_each_test(t, individual) {
-		igt_subtest_with_dynamic_f("%s", t->name) {
+		igt_describe_f("%s for each legacy engine.", t->describe);
+		igt_subtest_with_dynamic_f("legacy-%s", t->name) {
 			for (const struct intel_execution_ring *l = intel_execution_rings; l->name; l++) {
 				igt_dynamic_f("%s", l->name) {
-					t->func(fd, eb_ring(l),
+					t->func(fd, intel_ctx_0(fd), eb_ring(l),
 						t->num_children, t->timeout);
 				}
 			}
 		}
 	}
 
+	igt_describe("Basic test to wait upon a batch on all rings.");
 	igt_subtest("basic-all")
-		sync_all(fd, 1, 2);
-	igt_subtest("basic-store-all")
-		store_all(fd, 1, 2);
+		sync_all(fd, ctx, 1, 2);
 
-	igt_subtest("all")
-		sync_all(fd, 1, 20);
+	igt_describe("Basic version of store synchronisation test.");
+	igt_subtest("basic-store-all")
+		store_all(fd, ctx, 1, 2);
+
+	igt_describe("Extended version of existing basic-all test.");
+	igt_subtest("wait-all")
+		sync_all(fd, ctx, 1, 20);
+	igt_describe("Extended version of existing basic-store-all test.");
 	igt_subtest("store-all")
-		store_all(fd, 1, 20);
+		store_all(fd, ctx, 1, 20);
+
+	igt_describe("Parallel execution of batch on all rings and then wait.");
 	igt_subtest("forked-all")
-		sync_all(fd, ncpus, 20);
+		sync_all(fd, ctx, ncpus, 20);
+
+	igt_describe("Parallel execution of store synchronisation.");
 	igt_subtest("forked-store-all")
-		store_all(fd, ncpus, 20);
+		store_all(fd, ctx, ncpus, 20);
 
 	for_each_test(t, all) {
+		igt_describe_f("%s.", t->describe);
 		igt_subtest_f("%s", t->name)
-			t->func(fd, ALL_ENGINES, t->num_children, t->timeout);
+			t->func(fd, ctx, ALL_ENGINES, t->num_children, t->timeout);
 	}
 
 	/* New way of selecting engines. */
 	for_each_test(t, individual) {
+		igt_describe_f("%s on each engine.", t->describe);
 		igt_subtest_with_dynamic_f("%s", t->name) {
-			__for_each_physical_engine(fd, e) {
+			for_each_ctx_engine(fd, ctx, e) {
 				igt_dynamic_f("%s", e->name) {
-					t->func(fd, e->flags,
+					t->func(fd, ctx, e->flags,
 						t->num_children, t->timeout);
 				}
 			}
@@ -1233,18 +1343,26 @@ igt_main
 			igt_require(gem_scheduler_has_preemption(fd));
 		}
 
+		igt_describe("Check and measure how well we can submit a second"
+			     " high priority task when the engine is already"
+			     " busy with a low priority task on all engines.");
 		igt_subtest("preempt-all")
-			preempt(fd, ALL_ENGINES, 1, 20);
+			preempt(fd, ctx, ALL_ENGINES, 1, 20);
+
+		igt_describe("For each context engine check how priority of task are"
+			     " submitted when engine is already busy.");
 		igt_subtest_with_dynamic("preempt") {
-			__for_each_physical_engine(fd, e) {
+			for_each_ctx_engine(fd, ctx, e) {
 				igt_dynamic_f("%s", e->name)
-					preempt(fd, e->flags, ncpus, 20);
+					preempt(fd, ctx, e->flags, ncpus, 20);
 			}
 		}
 	}
 
 	igt_fixture {
+		intel_allocator_multiprocess_stop();
 		igt_stop_hang_detector();
+		intel_ctx_destroy(fd, ctx);
 		close(fd);
 	}
 }

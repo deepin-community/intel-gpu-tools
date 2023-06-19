@@ -31,6 +31,7 @@
 #include <i915_drm.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_engine_topology.h"
 #include "i915/gem_submission.h"
 
@@ -51,21 +52,7 @@
  * currently used hardware submission method. Different generations of hardware
  * support different submission backends, currently we're distinguishing 3
  * different methods: legacy ringbuffer submission, execlists, GuC submission.
- * For legacy ringbuffer submission, there's also a variation where we're using
- * semaphores for synchronization between engines.
  */
-
-static bool has_semaphores(int fd, int dir)
-{
-	int val = 0;
-	struct drm_i915_getparam gp = {
-		gp.param = I915_PARAM_HAS_SEMAPHORES,
-		gp.value = &val,
-	};
-	if (ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp) < 0)
-		val = igt_sysfs_get_boolean(dir, "semaphores");
-	return val;
-}
 
 /**
  * gem_submission_method:
@@ -76,8 +63,7 @@ static bool has_semaphores(int fd, int dir)
 unsigned gem_submission_method(int fd)
 {
 	const int gen = intel_gen(intel_get_drm_devid(fd));
-	unsigned flags = 0;
-
+	unsigned method = GEM_SUBMISSION_RINGBUF;
 	int dir;
 
 	dir = igt_params_open(fd);
@@ -85,21 +71,13 @@ unsigned gem_submission_method(int fd)
 		return 0;
 
 	if (igt_sysfs_get_u32(dir, "enable_guc") & 1) {
-		flags |= GEM_SUBMISSION_GUC | GEM_SUBMISSION_EXECLISTS;
-		goto out;
+		method = GEM_SUBMISSION_GUC;
+	} else if (gen >= 8) {
+		method = GEM_SUBMISSION_EXECLISTS;
 	}
 
-	if (gen >= 8) {
-		flags |= GEM_SUBMISSION_EXECLISTS;
-		goto out;
-	}
-
-	if (has_semaphores(fd, dir))
-		flags |= GEM_SUBMISSION_SEMAPHORES;
-
-out:
 	close(dir);
-	return flags;
+	return method;
 }
 
 /**
@@ -110,37 +88,24 @@ out:
  */
 void gem_submission_print_method(int fd)
 {
-	const unsigned flags = gem_submission_method(fd);
+	const unsigned method = gem_submission_method(fd);
 	const struct intel_device_info *info;
 
 	info = intel_get_device_info(intel_get_drm_devid(fd));
 	if (info)
 		igt_info("Running on %s\n", info->codename);
 
-	if (flags & GEM_SUBMISSION_GUC) {
+	if (method == GEM_SUBMISSION_GUC) {
 		igt_info("Using GuC submission\n");
 		return;
 	}
 
-	if (flags & GEM_SUBMISSION_EXECLISTS) {
+	if (method == GEM_SUBMISSION_EXECLISTS) {
 		igt_info("Using Execlists submission\n");
 		return;
 	}
 
-	igt_info("Using Legacy submission%s\n",
-		 flags & GEM_SUBMISSION_SEMAPHORES ? ", with semaphores" : "");
-}
-
-/**
- * gem_has_semaphores:
- * @fd: open i915 drm file descriptor
- *
- * Feature test macro to query whether the driver is using semaphores for
- * synchronization between engines.
- */
-bool gem_has_semaphores(int fd)
-{
-	return gem_submission_method(fd) & GEM_SUBMISSION_SEMAPHORES;
+	igt_info("Using Legacy submission\n");
 }
 
 /**
@@ -150,9 +115,9 @@ bool gem_has_semaphores(int fd)
  * Feature test macro to query whether the driver is using execlists as a
  * hardware submission method.
  */
-bool gem_has_execlists(int fd)
+bool gem_using_execlists(int fd)
 {
-	return gem_submission_method(fd) & GEM_SUBMISSION_EXECLISTS;
+	return gem_submission_method(fd) == GEM_SUBMISSION_EXECLISTS;
 }
 
 /**
@@ -162,9 +127,9 @@ bool gem_has_execlists(int fd)
  * Feature test macro to query whether the driver is using the GuC as a
  * hardware submission method.
  */
-bool gem_has_guc_submission(int fd)
+bool gem_using_guc_submission(int fd)
 {
-	return gem_submission_method(fd) & GEM_SUBMISSION_GUC;
+	return gem_submission_method(fd) == GEM_SUBMISSION_GUC;
 }
 
 static bool is_wedged(int i915)
@@ -176,47 +141,51 @@ static bool is_wedged(int i915)
 }
 
 /**
- * gem_test_engine:
+ * gem_test_all_engines:
  * @i915: open i915 drm file descriptor
- * @engine: the engine (I915_EXEC_RING id) to exercise
  *
  * Execute a nop batch on the engine specified, or ALL_ENGINES for all,
  * and check it executes.
  */
-void gem_test_engine(int i915, unsigned int engine)
+void gem_test_all_engines(int i915)
 {
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
+	const struct intel_execution_engine2 *e2;
 	struct drm_i915_gem_exec_object2 obj = { };
 	struct drm_i915_gem_execbuffer2 execbuf = {
 		.buffers_ptr = to_user_pointer(&obj),
 		.buffer_count = 1,
 	};
+	const intel_ctx_t *ctx;
 
 	i915 = gem_reopen_driver(i915);
 	igt_assert(!is_wedged(i915));
 
+	ctx = intel_ctx_create_all_physical(i915);
+	execbuf.rsvd1 = ctx->id;
+
 	obj.handle = gem_create(i915, 4096);
 	gem_write(i915, obj.handle, 0, &bbe, sizeof(bbe));
 
-	if (engine == ALL_ENGINES) {
-		const struct intel_execution_engine2 *e2;
-
-		__for_each_physical_engine(i915, e2) {
-			execbuf.flags = e2->flags;
-			gem_execbuf(i915, &execbuf);
-		}
-	} else {
-		execbuf.flags = engine;
+	for_each_ctx_engine(i915, ctx, e2) {
+		execbuf.flags = e2->flags;
 		gem_execbuf(i915, &execbuf);
 	}
 	gem_sync(i915, obj.handle);
 	gem_close(i915, obj.handle);
 
 	igt_assert(!is_wedged(i915));
+	intel_ctx_destroy(i915, ctx);
 	close(i915);
 }
 
-int gem_cmdparser_version(int i915, uint32_t engine)
+/**
+ * gem_cmdparser_version:
+ * @i915: open i915 drm file descriptor
+ *
+ * Returns the command parser version
+ */
+int gem_cmdparser_version(int i915)
 {
 	int version = 0;
 	drm_i915_getparam_t gp = {
@@ -226,6 +195,34 @@ int gem_cmdparser_version(int i915, uint32_t engine)
 
 	ioctl(i915, DRM_IOCTL_I915_GETPARAM, &gp);
 	return version;
+}
+
+/**
+ * gem_engine_has_cmdparser:
+ * @i915: open i915 drm file descriptor
+ * @class: an intel_ctx_cfg_t
+ * @engine: an engine specifier
+ *
+ * Returns true if the given engine has a command parser
+ */
+bool gem_engine_has_cmdparser(int i915, const intel_ctx_cfg_t *cfg,
+			      unsigned int engine)
+{
+	const int gen = intel_gen(intel_get_drm_devid(i915));
+	const int parser_version = gem_cmdparser_version(i915);
+	const int class = intel_ctx_cfg_engine_class(cfg, engine);
+
+	if (parser_version < 0)
+		return false;
+
+	if (gen == 7)
+		return true;
+
+	/* GFX version 9 BLT command parsing was added in parser version 10 */
+	if (gen == 9 && class == I915_ENGINE_CLASS_COPY && parser_version >= 10)
+		return true;
+
+	return false;
 }
 
 bool gem_has_blitter(int i915)
@@ -249,7 +246,7 @@ static bool gem_engine_has_immutable_submission(int i915, int class)
 	const int gen = intel_gen(intel_get_drm_devid(i915));
         int parser_version;
 
-	parser_version = gem_cmdparser_version(i915, 0);
+	parser_version = gem_cmdparser_version(i915);
 	if (parser_version < 0)
 		return false;
 
@@ -305,7 +302,7 @@ static void alarm_handler(int sig)
 }
 
 static unsigned int
-__measure_ringsize(int i915, unsigned int engine)
+__measure_ringsize(int i915, uint32_t ctx_id, unsigned int engine)
 {
 	struct sigaction old_sa, sa = { .sa_handler = alarm_handler };
 	struct drm_i915_gem_exec_object2 obj[2];
@@ -322,6 +319,7 @@ __measure_ringsize(int i915, unsigned int engine)
 	memset(&execbuf, 0, sizeof(execbuf));
 	execbuf.buffers_ptr = to_user_pointer(&obj[1]);
 	execbuf.buffer_count = 1;
+	execbuf.rsvd1 = ctx_id;
 	execbuf.flags = engine;
 	gem_execbuf(i915, &execbuf);
 
@@ -371,8 +369,10 @@ __measure_ringsize(int i915, unsigned int engine)
 	return count / 2 - 2;
 }
 
-unsigned int gem_submission_measure(int i915, unsigned int engine)
+unsigned int gem_submission_measure(int i915, const intel_ctx_cfg_t *cfg,
+				    unsigned int engine)
 {
+	const intel_ctx_t *ctx;
 	unsigned int size;
 	bool nonblock;
 
@@ -380,18 +380,26 @@ unsigned int gem_submission_measure(int i915, unsigned int engine)
 	if (!nonblock)
 		fcntl(i915, F_SETFL, fcntl(i915, F_GETFL) | O_NONBLOCK);
 
+	igt_assert(cfg);
+	if (gem_has_contexts(i915))
+		ctx = intel_ctx_create(i915, cfg);
+	else
+		ctx = intel_ctx_0(i915);
+
 	if (engine == ALL_ENGINES) {
 		struct intel_execution_engine2 *e;
 
 		size = -1;
-		__for_each_physical_engine(i915, e) {
-			unsigned int this =  __measure_ringsize(i915, e->flags);
+		for_each_ctx_engine(i915, ctx, e) {
+			unsigned int this =  __measure_ringsize(i915, ctx->id, e->flags);
 			if (this < size)
 				size = this;
 		}
 	} else {
-		size =  __measure_ringsize(i915, engine);
+		size =  __measure_ringsize(i915, ctx->id, engine);
 	}
+
+	intel_ctx_destroy(i915, ctx);
 
 	if (!nonblock)
 		fcntl(i915, F_SETFL, fcntl(i915, F_GETFL) & ~O_NONBLOCK);
@@ -427,4 +435,36 @@ bool gem_has_relocations(int i915)
 	gem_close(i915, obj.handle);
 
 	return has_relocs;
+}
+
+/**
+ * gem_allows_obj_alignment
+ * @fd: opened i915 drm file descriptor
+ *
+ * Check does i915 driver allows setting object alignment in exec object to
+ * handle in kernel and adjust object offset accordingly.
+ *
+ * Returns: true if kernel supports setting offset to be aligned, otherwise
+ * false.
+ */
+bool gem_allows_obj_alignment(int fd)
+{
+	struct drm_i915_gem_exec_object2 obj = {
+		.handle = gem_create(fd, 4096),
+	};
+	struct drm_i915_gem_execbuffer2 execbuf = {
+		.buffers_ptr = to_user_pointer(&obj),
+		.buffer_count = 1,
+	};
+	bool ret;
+	const uint32_t bbe = MI_BATCH_BUFFER_END;
+
+	gem_write(fd, obj.handle, 0, &bbe, sizeof(bbe));
+	gem_execbuf(fd, &execbuf);
+
+	obj.alignment = 0x2000;
+	ret = __gem_execbuf(fd, &execbuf) == 0;
+	gem_close(fd, obj.handle);
+
+	return ret;
 }

@@ -32,6 +32,7 @@
  */
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_ring.h"
 #include "igt.h"
 #include "igt_device.h"
@@ -50,6 +51,8 @@
 #define HIBERNATE 0x40
 #define NEWFD 0x80
 
+IGT_TEST_DESCRIPTION("Exercise many tiny batchbuffer operations, in the hope of catching"
+		     " failure to manage the ring properly near full.");
 static unsigned int ring_size;
 
 static void check_bo(int fd, uint32_t handle)
@@ -93,7 +96,8 @@ static void fill_ring(int fd,
 	}
 }
 
-static void setup_execbuf(int fd,
+#define NUMSTORES 1024
+static void setup_execbuf(int fd, const intel_ctx_t *ctx,
 			  struct drm_i915_gem_execbuffer2 *execbuf,
 			  struct drm_i915_gem_exec_object2 *obj,
 			  struct drm_i915_gem_relocation_entry *reloc,
@@ -103,35 +107,48 @@ static void setup_execbuf(int fd,
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
 	uint32_t *batch, *b;
 	int i;
+	uint64_t ahnd = get_reloc_ahnd(fd, ctx->id);
 
 	memset(execbuf, 0, sizeof(*execbuf));
 	memset(obj, 0, 2*sizeof(*obj));
-	memset(reloc, 0, 1024*sizeof(*reloc));
+	memset(reloc, 0, NUMSTORES * sizeof(*reloc));
 
 	execbuf->buffers_ptr = to_user_pointer(obj);
-	execbuf->flags = ring | (1 << 11) | (1 << 12);
+	execbuf->flags = ring | I915_EXEC_NO_RELOC | I915_EXEC_HANDLE_LUT;
 
 	if (gen > 3 && gen < 6)
 		execbuf->flags |= I915_EXEC_SECURE;
 
+	execbuf->rsvd1 = ctx->id;
+
 	obj[0].handle = gem_create(fd, 4096);
+	if (ahnd) {
+		obj[0].offset = get_offset(ahnd, obj[0].handle, 4096, 0);
+		obj[0].flags |= EXEC_OBJECT_PINNED | EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+	}
+
 	gem_write(fd, obj[0].handle, 0, &bbe, sizeof(bbe));
 	execbuf->buffer_count = 1;
 	gem_execbuf(fd, execbuf);
 
 	obj[0].flags |= EXEC_OBJECT_WRITE;
-	obj[1].handle = gem_create(fd, 1024*16 + 4096);
-
+	obj[1].handle = gem_create(fd, NUMSTORES * 16 + 4096);
 	obj[1].relocs_ptr = to_user_pointer(reloc);
-	obj[1].relocation_count = 1024;
+	obj[1].relocation_count = !ahnd ? NUMSTORES : 0;
 
-	batch = gem_mmap__cpu(fd, obj[1].handle, 0, 16*1024 + 4096,
+	if (ahnd) {
+		obj[1].offset = get_offset(ahnd, obj[1].handle,
+				NUMSTORES * 16 + 4096, 0);
+		obj[1].flags |= EXEC_OBJECT_PINNED | EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+	}
+
+	batch = gem_mmap__cpu(fd, obj[1].handle, 0, NUMSTORES * 16 + 4096,
 			      PROT_WRITE | PROT_READ);
 	gem_set_domain(fd, obj[1].handle,
 		       I915_GEM_DOMAIN_CPU, I915_GEM_DOMAIN_CPU);
 
 	b = batch;
-	for (i = 0; i < 1024; i++) {
+	for (i = 0; i < NUMSTORES; i++) {
 		uint64_t offset;
 
 		reloc[i].presumed_offset = obj[0].offset;
@@ -159,31 +176,34 @@ static void setup_execbuf(int fd,
 		*b++ = i;
 	}
 	*b++ = MI_BATCH_BUFFER_END;
-	munmap(batch, 16*1024+4096);
+	munmap(batch, NUMSTORES * 16 + 4096);
 
 	execbuf->buffer_count = 2;
 	gem_execbuf(fd, execbuf);
+	put_ahnd(ahnd);
 
 	check_bo(fd, obj[0].handle);
 }
 
-static void run_test(int fd, unsigned ring, unsigned flags, unsigned timeout)
+static void run_test(int fd, const intel_ctx_t *ctx, unsigned ring,
+		     unsigned flags, unsigned timeout)
 {
 	struct drm_i915_gem_exec_object2 obj[2];
 	struct drm_i915_gem_relocation_entry reloc[1024];
 	struct drm_i915_gem_execbuffer2 execbuf;
 	igt_hang_t hang;
+	uint64_t ahnd = get_reloc_ahnd(fd, ctx->id);
 
 	if (flags & (SUSPEND | HIBERNATE)) {
-		run_test(fd, ring, 0, 0);
+		run_test(fd, ctx, ring, 0, 0);
 		gem_quiescent_gpu(fd);
 	}
 
-	setup_execbuf(fd, &execbuf, obj, reloc, ring);
+	setup_execbuf(fd, ctx, &execbuf, obj, reloc, ring);
 
 	memset(&hang, 0, sizeof(hang));
 	if (flags & HANG)
-		hang = igt_hang_ring(fd, ring & ~(3<<13));
+		hang = igt_hang_ring_with_ahnd(fd, ring & ~(3<<13), ahnd);
 
 	if (flags & (CHILD | FORKED | BOMB)) {
 		int nchild;
@@ -197,16 +217,16 @@ static void run_test(int fd, unsigned ring, unsigned flags, unsigned timeout)
 
 		igt_debug("Forking %d children\n", nchild);
 		igt_fork(child, nchild) {
+			const intel_ctx_t *child_ctx = NULL;
 			if (flags & NEWFD) {
-				int this;
+				fd = gem_reopen_driver(fd);
+				child_ctx = intel_ctx_create(fd, &ctx->cfg);
 
-				this = gem_reopen_driver(fd);
-				gem_context_copy_engines(fd, 0, this, 0);
-				fd = this;
-
-				setup_execbuf(fd, &execbuf, obj, reloc, ring);
+				setup_execbuf(fd, child_ctx, &execbuf, obj, reloc, ring);
 			}
 			fill_ring(fd, &execbuf, flags, timeout);
+			if (child_ctx)
+				intel_ctx_destroy(fd, child_ctx);
 		}
 
 		if (flags & SUSPEND)
@@ -234,8 +254,9 @@ static void run_test(int fd, unsigned ring, unsigned flags, unsigned timeout)
 
 	if (flags & (SUSPEND | HIBERNATE)) {
 		gem_quiescent_gpu(fd);
-		run_test(fd, ring, 0, 0);
+		run_test(fd, ctx, ring, 0, 0);
 	}
+	put_ahnd(ahnd);
 }
 
 static uint32_t batch_create(int i915)
@@ -272,19 +293,27 @@ igt_main
 		const char *suffix;
 		unsigned flags;
 		unsigned timeout;
+		const char *description;
 	} modes[] = {
-		{ "basic", 0, 0 },
-		{ "interruptible", INTERRUPTIBLE, 1 },
-		{ "hang", HANG, 10 },
-		{ "child", CHILD, 0 },
-		{ "forked", FORKED, 0 },
-		{ "fd", FORKED | NEWFD, 0 },
-		{ "bomb", BOMB | NEWFD | INTERRUPTIBLE, 150 },
-		{ "S3", BOMB | SUSPEND, 30 },
-		{ "S4", BOMB | HIBERNATE, 30 },
+		{ "basic", 0, 0, "Basic check how the driver handles a full ring"},
+		{ "interruptible", INTERRUPTIBLE, 1, "Exercise all potential injection sites by"
+						     " using igt_sigiter interface to repeat the"
+						     " ringfill testing"},
+		{ "hang", HANG, 10, "Exercise many batchbuffer operations along with"
+				    " a hang batch until ring is full"},
+		{ "child", CHILD, 0, "Check to fill the ring parallely using fork" },
+		{ "forked", FORKED, 0, "Check to fill the ring parallely using fork" },
+		{ "fd", FORKED | NEWFD, 0, "Fills the ring upto maximim parallely using"
+					   " fork with different fd's" },
+		{ "bomb", BOMB | NEWFD | INTERRUPTIBLE, 150, "Fills the ring upto maximim parallely"
+							     " using fork with different fd's along"
+							     " with interruptions" },
+		{ "S3", BOMB | SUSPEND, 30, "Handle a full ring across suspend cycle"},
+		{ "S4", BOMB | HIBERNATE, 30, "Handle a full ring across hibernate cycle"},
 		{ NULL }
 	}, *m;
 	bool master = false;
+	const intel_ctx_t *ctx;
 	int fd = -1;
 
 	igt_fixture {
@@ -304,25 +333,26 @@ igt_main
 		ring_size = gem_measure_ring_inflight(fd, ALL_ENGINES, 0);
 		igt_info("Ring size: %d batches\n", ring_size);
 		igt_require(ring_size);
+
+		ctx = intel_ctx_create_all_physical(fd);
 	}
 
 	/* Legacy path for selecting "rings". */
 	for (m = modes; m->suffix; m++) {
+		igt_describe_f("%s - on legacy ring.", m->description);
 		igt_subtest_with_dynamic_f("legacy-%s", m->suffix) {
-			const struct intel_execution_ring *e;
-
 			igt_skip_on(m->flags & NEWFD && master);
 
-			for (e = intel_execution_rings; e->name; e++) {
-				if (!gem_has_ring(fd, eb_ring(e)))
-					continue;
-
+			for_each_ring(e, fd) {
 				igt_dynamic_f("%s", e->name) {
 					igt_require(gem_can_store_dword(fd, eb_ring(e)));
-					run_test(fd, eb_ring(e),
+					intel_allocator_multiprocess_start();
+					run_test(fd, intel_ctx_0(fd),
+						 eb_ring(e),
 						 m->flags,
 						 m->timeout);
 					gem_quiescent_gpu(fd);
+					intel_allocator_multiprocess_stop();
 				}
 			}
 		}
@@ -330,38 +360,47 @@ igt_main
 
 	/* New interface for selecting "engines". */
 	for (m = modes; m->suffix; m++) {
+		igt_describe_f("%s.", m->description);
 		igt_subtest_with_dynamic_f("engines-%s", m->suffix) {
 			const struct intel_execution_engine2 *e;
 
 			igt_skip_on(m->flags & NEWFD && master);
-			__for_each_physical_engine(fd, e) {
+			for_each_ctx_engine(fd, ctx, e) {
 				if (!gem_class_can_store_dword(fd, e->class))
 					continue;
 
 				igt_dynamic_f("%s", e->name) {
-					run_test(fd, e->flags,
+					intel_allocator_multiprocess_start();
+					run_test(fd, ctx,
+						 e->flags,
 						 m->flags,
 						 m->timeout);
 					gem_quiescent_gpu(fd);
+					intel_allocator_multiprocess_stop();
 				}
 			}
 		}
 	}
 
+	igt_describe("Basic check to fill the ring upto maximum on all engines simultaneously.");
 	igt_subtest("basic-all") {
 		const struct intel_execution_engine2 *e;
+		intel_allocator_multiprocess_start();
 
-		__for_each_physical_engine(fd, e) {
+		for_each_ctx_engine(fd, ctx, e) {
 			if (!gem_class_can_store_dword(fd, e->class))
 				continue;
 
 			igt_fork(child, 1)
-				run_test(fd, e->flags, 0, 1);
+				run_test(fd, ctx, e->flags, 0, 1);
 		}
 
 		igt_waitchildren();
+		intel_allocator_multiprocess_stop();
 	}
 
-	igt_fixture
+	igt_fixture {
+		intel_ctx_destroy(fd, ctx);
 		close(fd);
+	}
 }

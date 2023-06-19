@@ -32,7 +32,11 @@ extern "C" {
 
 #include "igt_list.h"
 
-struct intel_device_info;
+#define _DIV_ROUND_UP(a, b)  (((a) + (b) - 1) / (b))
+
+#define INTEL_DEVICE_MAX_SLICES           (6)  /* Maximum on gfx10 */
+#define INTEL_DEVICE_MAX_SUBSLICES        (8)  /* Maximum on gfx11 */
+#define INTEL_DEVICE_MAX_EUS_PER_SUBSLICE (16) /* Maximum on gfx12 */
 
 struct intel_perf_devinfo {
 	char devname[20];
@@ -50,18 +54,93 @@ struct intel_perf_devinfo {
 	 * Their values are build up from the topology fields.
 	 */
 	uint32_t devid;
-	uint32_t gen;
+	uint32_t graphics_ver;
 	uint32_t revision;
+	/**
+	 * Bit shifting required to put OA report timestamps into
+	 * timestamp_frequency (some HW generations can shift
+	 * timestamp values to the right by a number of bits).
+	 */
+	int32_t  oa_timestamp_shift;
+	/**
+	 * On some platforms only part of the timestamp bits are valid
+	 * (on previous platforms we would get full 32bits, newer
+	 * platforms can have fewer). It's important to know when
+	 * correlating the full 36bits timestamps to the OA report
+	 * timestamps.
+	 */
+	uint64_t  oa_timestamp_mask;
+	/* Frequency of the timestamps in Hz */
 	uint64_t timestamp_frequency;
 	uint64_t gt_min_freq;
 	uint64_t gt_max_freq;
 
+	/* Total number of EUs */
 	uint64_t n_eus;
+	/* Total number of EUs in a slice */
 	uint64_t n_eu_slices;
+	/* Total number of subslices/dualsubslices */
 	uint64_t n_eu_sub_slices;
+	/* Number of subslices/dualsubslices in the first half of the
+	 * slices.
+	 */
+	uint64_t n_eu_sub_slices_half_slices;
+	/* Mask of available subslices/dualsubslices */
 	uint64_t subslice_mask;
+	/* Mask of available slices */
 	uint64_t slice_mask;
+	/* Number of threads in one EU */
 	uint64_t eu_threads_count;
+
+	/**
+	 * Maximu number of slices present on this device (can be more than
+	 * num_slices if some slices are fused).
+	 */
+	uint16_t max_slices;
+
+	/**
+	 * Maximu number of subslices per slice present on this device (can be more
+	 * than the maximum value in the num_subslices[] array if some subslices are
+	 * fused).
+	 */
+	uint16_t max_subslices_per_slice;
+
+	/**
+	 * Stride to access subslice_masks[].
+	 */
+	uint16_t subslice_slice_stride;
+
+	/**
+	 * Maximum number of EUs per subslice (can be more than
+	 * num_eu_per_subslice if some EUs are fused off).
+	 */
+	uint16_t max_eu_per_subslice;
+
+	/**
+	 * Strides to access eu_masks[].
+	 */
+	uint16_t eu_slice_stride;
+	uint16_t eu_subslice_stride;
+
+	/**
+	 * A bit mask of the slices available.
+	 */
+	uint8_t slice_masks[_DIV_ROUND_UP(INTEL_DEVICE_MAX_SLICES, 8)];
+
+	/**
+	 * An array of bit mask of the subslices available, use subslice_slice_stride
+	 * to access this array.
+	 */
+	uint8_t subslice_masks[INTEL_DEVICE_MAX_SLICES *
+			       _DIV_ROUND_UP(INTEL_DEVICE_MAX_SUBSLICES, 8)];
+
+	/**
+	 * An array of bit mask of EUs available, use eu_slice_stride &
+	 * eu_subslice_stride to access this array.
+	 */
+	uint8_t eu_masks[INTEL_DEVICE_MAX_SLICES *
+			 INTEL_DEVICE_MAX_SUBSLICES *
+			 _DIV_ROUND_UP(INTEL_DEVICE_MAX_EUS_PER_SUBSLICE, 8)];
 };
 
 typedef enum {
@@ -110,6 +189,7 @@ typedef enum {
 	INTEL_PERF_LOGICAL_COUNTER_UNIT_EU_ATOMIC_REQUESTS_TO_L3_CACHE_LINES,
 	INTEL_PERF_LOGICAL_COUNTER_UNIT_EU_REQUESTS_TO_L3_CACHE_LINES,
 	INTEL_PERF_LOGICAL_COUNTER_UNIT_EU_BYTES_PER_L3_CACHE_LINE,
+	INTEL_PERF_LOGICAL_COUNTER_UNIT_GBPS,
 
 	INTEL_PERF_LOGICAL_COUNTER_UNIT_MAX
 } intel_perf_logical_counter_unit_t;
@@ -211,6 +291,31 @@ struct intel_perf {
 struct drm_i915_perf_record_header;
 struct drm_i915_query_topology_info;
 
+static inline bool
+intel_perf_devinfo_slice_available(const struct intel_perf_devinfo *devinfo,
+				   int slice)
+{
+	return (devinfo->slice_masks[slice / 8] & (1U << (slice % 8))) != 0;
+}
+
+static inline bool
+intel_perf_devinfo_subslice_available(const struct intel_perf_devinfo *devinfo,
+				      int slice, int subslice)
+{
+	return (devinfo->subslice_masks[slice * devinfo->subslice_slice_stride +
+					subslice / 8] & (1U << (subslice % 8))) != 0;
+}
+
+static inline bool
+intel_perf_devinfo_eu_available(const struct intel_perf_devinfo *devinfo,
+				int slice, int subslice, int eu)
+{
+	unsigned subslice_offset = slice * devinfo->eu_slice_stride +
+		subslice * devinfo->eu_subslice_stride;
+
+	return (devinfo->eu_masks[subslice_offset + eu / 8] & (1U << eu % 8)) != 0;
+}
+
 struct intel_perf *intel_perf_for_fd(int drm_fd);
 struct intel_perf *intel_perf_for_devinfo(uint32_t device_id,
 					  uint32_t revision,
@@ -230,9 +335,21 @@ void intel_perf_add_metric_set(struct intel_perf *perf,
 void intel_perf_load_perf_configs(struct intel_perf *perf, int drm_fd);
 
 void intel_perf_accumulate_reports(struct intel_perf_accumulator *acc,
-				   int oa_format,
+				   const struct intel_perf *perf,
+				   const struct intel_perf_metric_set *metric_set,
 				   const struct drm_i915_perf_record_header *record0,
 				   const struct drm_i915_perf_record_header *record1);
+
+uint64_t intel_perf_read_record_timestamp(const struct intel_perf *perf,
+					  const struct intel_perf_metric_set *metric_set,
+					  const struct drm_i915_perf_record_header *record);
+
+uint64_t intel_perf_read_record_timestamp_raw(const struct intel_perf *perf,
+					      const struct intel_perf_metric_set *metric_set,
+					      const struct drm_i915_perf_record_header *record);
+
+const char *intel_perf_read_report_reason(const struct intel_perf *perf,
+					  const struct drm_i915_perf_record_header *record);
 
 #ifdef __cplusplus
 };

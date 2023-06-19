@@ -39,7 +39,9 @@ int igt_debugfs_connector_dir(int device, char *conn_name, int mode);
 int igt_debugfs_pipe_dir(int device, int pipe, int mode);
 
 int igt_debugfs_open(int fd, const char *filename, int mode);
+bool igt_debugfs_exists(int fd, const char *filename, int mode);
 void __igt_debugfs_read(int fd, const char *filename, char *buf, int size);
+void __igt_debugfs_write(int fd, const char *filename, const char *buf, int size);
 int igt_debugfs_simple_read(int dir, const char *filename, char *buf, int size);
 bool igt_debugfs_search(int fd, const char *filename, const char *substring);
 
@@ -54,62 +56,17 @@ bool igt_debugfs_search(int fd, const char *filename, const char *substring);
 #define igt_debugfs_read(fd, filename, buf) \
 		__igt_debugfs_read(fd, (filename), (buf), sizeof(buf))
 
-/*
- * Pipe CRC
- */
-
 /**
- * igt_pipe_crc_t:
+ * igt_debugfs_write:
+ * @fd: the drm device file fd
+ * @filename: name of the debugfs file
+ * @buf: buffer to be written to the debugfs file
  *
- * Pipe CRC support structure. Needs to be allocated and set up with
- * igt_pipe_crc_new() for a specific pipe and pipe CRC source value.
+ * This is just a convenience wrapper for __igt_debugfs_write. See its
+ * documentation.
  */
-typedef struct _igt_pipe_crc igt_pipe_crc_t;
-
-#define DRM_MAX_CRC_NR 10
-/**
- * igt_crc_t:
- * @frame: frame number of the capture CRC
- * @n_words: internal field, don't access
- * @crc: internal field, don't access
- *
- * Pipe CRC value. All other members than @frame are private and should not be
- * inspected by testcases.
- */
-typedef struct {
-	uint32_t frame;
-	bool has_valid_frame;
-	int n_words;
-	uint32_t crc[DRM_MAX_CRC_NR];
-} igt_crc_t;
-
-#define INTEL_PIPE_CRC_SOURCE_AUTO "auto"
-#define AMDGPU_PIPE_CRC_SOURCE_DPRX "dprx"
-
-bool igt_find_crc_mismatch(const igt_crc_t *a, const igt_crc_t *b, int *index);
-void igt_assert_crc_equal(const igt_crc_t *a, const igt_crc_t *b);
-bool igt_check_crc_equal(const igt_crc_t *a, const igt_crc_t *b);
-char *igt_crc_to_string_extended(igt_crc_t *crc, char delimiter, int crc_size);
-char *igt_crc_to_string(igt_crc_t *crc);
-
-void igt_require_pipe_crc(int fd);
-igt_pipe_crc_t *
-igt_pipe_crc_new(int fd, enum pipe pipe, const char *source);
-igt_pipe_crc_t *
-igt_pipe_crc_new_nonblock(int fd, enum pipe pipe, const char *source);
-void igt_pipe_crc_free(igt_pipe_crc_t *pipe_crc);
-void igt_pipe_crc_start(igt_pipe_crc_t *pipe_crc);
-void igt_pipe_crc_stop(igt_pipe_crc_t *pipe_crc);
-__attribute__((warn_unused_result))
-int igt_pipe_crc_get_crcs(igt_pipe_crc_t *pipe_crc, int n_crcs,
-			  igt_crc_t **out_crcs);
-void igt_pipe_crc_drain(igt_pipe_crc_t *pipe_crc);
-void igt_pipe_crc_get_single(igt_pipe_crc_t *pipe_crc, igt_crc_t *out_crc);
-void igt_pipe_crc_get_current(int drm_fd, igt_pipe_crc_t *pipe_crc, igt_crc_t *crc);
-void igt_pipe_crc_get_for_frame(int drm_fd, igt_pipe_crc_t *pipe_crc,
-				unsigned int vblank, igt_crc_t *crc);
-
-void igt_pipe_crc_collect_crc(igt_pipe_crc_t *pipe_crc, igt_crc_t *out_crc);
+#define igt_debugfs_write(fd, filename, buf) \
+		__igt_debugfs_write(fd, (filename), (buf), sizeof(buf))
 
 void igt_hpd_storm_set_threshold(int fd, unsigned int threshold);
 void igt_hpd_storm_reset(int fd);

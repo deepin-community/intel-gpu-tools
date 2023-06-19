@@ -45,6 +45,7 @@
 #include <drm.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 
 IGT_TEST_DESCRIPTION("Run a couple of big batches to force the unbind on"
@@ -134,7 +135,7 @@ static void minor_evictions(int fd, uint64_t size, uint64_t count)
 	uint64_t n, m, alignment;
 	int pass, fail;
 
-	intel_require_memory(2 * count, size, CHECK_RAM);
+	igt_require_memory(2 * count, size, CHECK_RAM);
 
 	bo = malloc(3*count*sizeof(*bo));
 	igt_assert(bo);
@@ -165,7 +166,7 @@ static void major_evictions(int fd, uint64_t size, uint64_t count)
 	int loop;
 	uint32_t *bo;
 
-	intel_require_memory(count, size, CHECK_RAM);
+	igt_require_memory(count, size, CHECK_RAM);
 
 	bo = malloc(count*sizeof(*bo));
 	igt_assert(bo);
@@ -197,6 +198,7 @@ igt_main
 		fd = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(fd);
 		gem_require_blitter(fd);
+		igt_require(gem_allows_obj_alignment(fd));
 		igt_fork_hang_detector(fd);
 	}
 

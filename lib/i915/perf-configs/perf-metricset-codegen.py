@@ -69,8 +69,8 @@ def output_counter_report(set, counter):
     c("counter->type = INTEL_PERF_LOGICAL_COUNTER_TYPE_{0};\n".format(semantic_type_uc))
     c("counter->storage = INTEL_PERF_LOGICAL_COUNTER_STORAGE_{0};\n".format(data_type_uc))
     c("counter->unit = INTEL_PERF_LOGICAL_COUNTER_UNIT_{0};\n".format(output_units(counter.get('units'))))
-    c("counter->read_{0} = {1};\n".format(data_type, set.read_funcs[counter.get('symbol_name')]))
-    c("counter->max_{0} = {1};\n".format(data_type, set.max_funcs[counter.get('symbol_name')]))
+    c("counter->read_{0} = {1};\n".format(data_type, set.read_funcs["$" + counter.get('symbol_name')]))
+    c("counter->max_{0} = {1};\n".format(data_type, set.max_funcs["$" + counter.get('symbol_name')]))
     c("intel_perf_add_logical_counter(perf, counter, \"{0}\");\n".format(counter.get('mdapi_group')))
 
     if availability:
@@ -123,6 +123,19 @@ def generate_metric_sets(args, gen):
                 metric_set->gpu_time_offset = 0;
                 metric_set->a_offset = 1;
                 metric_set->b_offset = metric_set->a_offset + 45;
+                metric_set->c_offset = metric_set->b_offset + 8;
+                metric_set->perfcnt_offset = metric_set->c_offset + 8;
+
+            """))
+        elif gen.chipset.startswith("acm") or gen.chipset.startswith("mtl"):
+            c(textwrap.dedent("""\
+                metric_set->perf_oa_format = I915_OA_FORMAT_A24u40_A14u32_B8_C8;
+
+                metric_set->perf_raw_size = 256;
+                metric_set->gpu_time_offset = 0;
+                metric_set->gpu_clock_offset = 1;
+                metric_set->a_offset = 2;
+                metric_set->b_offset = metric_set->a_offset + 38;
                 metric_set->c_offset = metric_set->b_offset + 8;
                 metric_set->perfcnt_offset = metric_set->c_offset + 8;
 

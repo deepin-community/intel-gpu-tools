@@ -26,47 +26,287 @@
 #include "igt_vec.h"
 #include <math.h>
 
-
 IGT_TEST_DESCRIPTION("Test display plane scaling");
+
+enum scaler_combo_test_type {
+	TEST_PLANES_UPSCALE = 0,
+	TEST_PLANES_DOWNSCALE,
+	TEST_PLANES_UPSCALE_DOWNSCALE
+};
 
 typedef struct {
 	uint32_t devid;
 	int drm_fd;
 	igt_display_t display;
-	igt_crc_t ref_crc;
-
-	int image_w;
-	int image_h;
-
 	struct igt_fb fb[4];
-
-	igt_plane_t *plane1;
-	igt_plane_t *plane2;
-	igt_plane_t *plane3;
-	igt_plane_t *plane4;
 	bool extended;
 } data_t;
 
-static int get_num_scalers(data_t* d, enum pipe pipe)
+const struct {
+	const char * const describe;
+	const char * const name;
+	const double sf;
+	const bool is_upscale;
+} scaler_with_pixel_format_tests[] = {
+	{
+		"Tests upscaling with pixel formats, from 20x20 fb.",
+		"plane-upscale-with-pixel-format-20x20",
+		0.0,
+		true,
+	},
+	{
+		"Tests upscaling with pixel formats for 0.25 scaling factor.",
+		"plane-upscale-with-pixel-format-factor-0-25",
+		0.25,
+		true,
+	},
+	{
+		"Tests downscaling with pixel formats for 0.25 scaling factor.",
+		"plane-downscale-with-pixel-format-factor-0-25",
+		0.25,
+		false,
+	},
+	{
+		"Tests downscaling with pixel formats for 0.5 scaling factor.",
+		"plane-downscale-with-pixel-format-factor-0-5",
+		0.5,
+		false,
+	},
+	{
+		"Tests downscaling with pixel formats for 0.75 scaling factor.",
+		"plane-downscale-with-pixel-format-factor-0-75",
+		0.75,
+		false,
+	},
+	{
+		"Tests scaling with pixel formats, unity scaling.",
+		"plane-scaler-with-pixel-format-unity-scaling",
+		1.0,
+		true,
+	},
+};
+
+const struct {
+	const char * const describe;
+	const char * const name;
+	const double sf;
+	const bool is_upscale;
+} scaler_with_rotation_tests[] = {
+	{
+		"Tests upscaling with rotation, from 20x20 fb.",
+		"plane-upscale-with-rotation-20x20",
+		0.0,
+		true,
+	},
+	{
+		"Tests upscaling with rotation for 0.25 scaling factor.",
+		"plane-upscale-with-rotation-factor-0-25",
+		0.25,
+		true,
+	},
+	{
+		"Tests downscaling with rotation for 0.25 scaling factor.",
+		"plane-downscale-with-rotation-factor-0-25",
+		0.25,
+		false,
+	},
+	{
+		"Tests downscaling with rotation for 0.5 scaling factor.",
+		"plane-downscale-with-rotation-factor-0-5",
+		0.25,
+		false,
+	},
+	{
+		"Tests downscaling with rotation for 0.75 scaling factor.",
+		"plane-downscale-with-rotation-factor-0-75",
+		0.75,
+		false,
+	},
+	{
+		"Tests scaling with rotation, unity scaling.",
+		"plane-scaler-with-rotation-unity-scaling",
+		1.0,
+		true,
+	},
+};
+
+const struct {
+	const char * const describe;
+	const char * const name;
+	const double sf;
+	const bool is_upscale;
+} scaler_with_modifiers_tests[] = {
+	{
+		"Tests upscaling with modifiers, from 20x20 fb.",
+		"plane-upscale-with-modifiers-20x20",
+		0.0,
+		true,
+	},
+	{
+		"Tests upscaling with modifiers for 0.25 scaling factor.",
+		"plane-upscale-with-modifiers-factor-0-25",
+		0.25,
+		true,
+	},
+	{
+		"Tests downscaling with modifiers for 0.25 scaling factor.",
+		"plane-downscale-with-modifiers-factor-0-25",
+		0.25,
+		false,
+	},
+	{
+		"Tests downscaling with modifiers for 0.5 scaling factor.",
+		"plane-downscale-with-modifiers-factor-0-5",
+		0.5,
+		false,
+	},
+	{
+		"Tests downscaling with modifiers for 0.75 scaling factor.",
+		"plane-downscale-with-modifiers-factor-0-75",
+		0.75,
+		false,
+	},
+	{
+		"Tests scaling with modifiers, unity scaling.",
+		"plane-scaler-with-modifiers-unity-scaling",
+		1.0,
+		true,
+	},
+};
+
+const struct {
+	const char * const describe;
+	const char * const name;
+	const double sf_plane1;
+	const double sf_plane2;
+	const enum scaler_combo_test_type test_type;
+} scaler_with_2_planes_tests[] = {
+	{
+		"Tests upscaling of 2 planes, from 20x20 fb.",
+		"planes-upscale-20x20",
+		0.0,
+		0.0,
+		TEST_PLANES_UPSCALE,
+	},
+	{
+		"Tests upscaling of 2 planes for 0.25 scaling factor.",
+		"planes-upscale-factor-0-25",
+		0.25,
+		0.25,
+		TEST_PLANES_UPSCALE,
+	},
+	{
+		"Tests scaling of 2 planes, unity scaling.",
+		"planes-scaler-unity-scaling",
+		1.0,
+		1.0,
+		TEST_PLANES_UPSCALE,
+	},
+	{
+		"Tests downscaling of 2 planes for 0.25 scaling factor.",
+		"planes-downscale-factor-0-25",
+		0.25,
+		0.25,
+		TEST_PLANES_DOWNSCALE,
+	},
+	{
+		"Tests downscaling of 2 planes for 0.5 scaling factor.",
+		"planes-downscale-factor-0-5",
+		0.5,
+		0.5,
+		TEST_PLANES_DOWNSCALE,
+	},
+	{
+		"Tests downscaling of 2 planes for 0.75 scaling factor.",
+		"planes-downscale-factor-0-75",
+		0.75,
+		0.75,
+		TEST_PLANES_DOWNSCALE,
+	},
+	{
+		"Tests upscaling (20x20) and downscaling (scaling factor 0.25) of 2 planes.",
+		"planes-upscale-20x20-downscale-factor-0-25",
+		0.0,
+		0.25,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+	{
+		"Tests upscaling (20x20) and downscaling (scaling factor 0.5) of 2 planes.",
+		"planes-upscale-20x20-downscale-factor-0-5",
+		0.0,
+		0.5,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+	{
+		"Tests upscaling (20x20) and downscaling (scaling factor 0.75) of 2 planes.",
+		"planes-upscale-20x20-downscale-factor-0-75",
+		0.0,
+		0.75,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+	{
+		"Tests upscaling (scaling factor 0.25) and downscaling (scaling factor 0.25) of 2 planes.",
+		"planes-upscale-factor-0-25-downscale-factor-0-25",
+		0.25,
+		0.25,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+	{
+		"Tests upscaling (scaling factor 0.25) and downscaling (scaling factor 0.5) of 2 planes.",
+		"planes-upscale-factor-0-25-downscale-factor-0-5",
+		0.25,
+		0.5,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+	{
+		"Tests upscaling (scaling factor 0.25) and downscaling (scaling factor 0.75) of 2 planes.",
+		"planes-upscale-factor-0-25-downscale-factor-0-75",
+		0.25,
+		0.75,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+	{
+		"Tests scaling (unity) and downscaling (scaling factor 0.25) of 2 planes.",
+		"planes-unity-scaling-downscale-factor-0-25",
+		1.0,
+		0.25,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+	{
+		"Tests scaling (unity) and downscaling (scaling factor 0.5) of 2 planes.",
+		"planes-unity-scaling-downscale-factor-0-5",
+		1.0,
+		0.5,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+	{
+		"Tests scaling (unity) and downscaling (scaling factor 0.75) of 2 planes.",
+		"planes-unity-scaling-downscale-factor-0-75",
+		1.0,
+		0.75,
+		TEST_PLANES_UPSCALE_DOWNSCALE,
+	},
+};
+
+static int get_width(drmModeModeInfo *mode, double scaling_factor)
 {
-	if (!is_i915_device(d->drm_fd))
-		return 1;
-
-	igt_require(intel_gen(d->devid) >= 9);
-
-	if (intel_gen(d->devid) >= 10)
-		return 2;
-	else if (pipe != PIPE_C)
-		return 2;
+	if (scaling_factor == 0.0)
+		return 20;
 	else
-		return 1;
+		return mode->hdisplay * scaling_factor;
+}
+
+static int get_height(drmModeModeInfo *mode, double scaling_factor)
+{
+	if (scaling_factor == 0.0)
+		return 20;
+	else
+		return mode->vdisplay * scaling_factor;
 }
 
 static void cleanup_fbs(data_t *data)
 {
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(data->fb); i++)
+	for (int i = 0; i < ARRAY_SIZE(data->fb); i++)
 		igt_remove_fb(data->drm_fd, &data->fb[i]);
 }
 
@@ -77,78 +317,61 @@ static void cleanup_crtc(data_t *data)
 	cleanup_fbs(data);
 }
 
-static void prepare_crtc(data_t *data, igt_output_t *output, enum pipe pipe,
-			igt_plane_t *plane, drmModeModeInfo *mode)
-{
-	igt_display_t *display = &data->display;
-	uint64_t tiling = is_i915_device(data->drm_fd) ?
-		LOCAL_I915_FORMAT_MOD_X_TILED : LOCAL_DRM_FORMAT_MOD_NONE;
-
-	cleanup_crtc(data);
-
-	igt_output_set_pipe(output, pipe);
-
-	igt_skip_on(!igt_display_has_format_mod(display, DRM_FORMAT_XRGB8888,
-						tiling));
-
-	/* allocate fb for plane 1 */
-	igt_create_pattern_fb(data->drm_fd, mode->hdisplay, mode->vdisplay,
-			      DRM_FORMAT_XRGB8888,
-			      tiling,
-			      &data->fb[0]);
-
-	igt_plane_set_fb(plane, &data->fb[0]);
-
-	if (plane->type != DRM_PLANE_TYPE_PRIMARY) {
-		igt_plane_t *primary;
-		int ret;
-
-		/* Do we succeed without enabling the primary plane? */
-		ret = igt_display_try_commit2(display, COMMIT_ATOMIC);
-		if (!ret)
-			return;
-
-		/*
-		 * Fallback: set the primary plane to actually enable the pipe.
-		 * Some drivers always require the primary plane to be enabled.
-		 */
-		primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
-		igt_plane_set_fb(primary, &data->fb[0]);
-	}
-	igt_display_commit2(display, COMMIT_ATOMIC);
-}
-
 static void check_scaling_pipe_plane_rot(data_t *d, igt_plane_t *plane,
 					 uint32_t pixel_format,
-					 uint64_t tiling, enum pipe pipe,
+					 uint64_t modifier,
+					 int width, int height,
+					 bool is_upscale,
+					 enum pipe pipe,
 					 igt_output_t *output,
 					 igt_rotation_t rot)
 {
 	igt_display_t *display = &d->display;
-	int width, height;
 	drmModeModeInfo *mode;
+	int commit_ret;
+	int w, h;
 
-	cleanup_crtc(d);
-
-	igt_output_set_pipe(output, pipe);
 	mode = igt_output_get_mode(output);
 
-	/* create buffer in the range of  min and max source side limit.*/
-	width = height = 20;
-	igt_create_color_fb(display->drm_fd, width, height,
-		       pixel_format, tiling, 0.0, 1.0, 0.0, &d->fb[0]);
-	igt_plane_set_fb(plane, &d->fb[0]);
+	if (is_upscale) {
+		w = width;
+		h = height;
+	} else {
+		w = mode->hdisplay;
+		h = mode->vdisplay;
+	}
 
-	/* Check min to full resolution upscaling */
+	/*
+	 * guarantee even value width/height to avoid fractional
+	 * uv component in chroma subsampling for yuv 4:2:0 formats
+	 * */
+	w = ALIGN(w, 2);
+	h = ALIGN(h, 2);
+
+	igt_create_color_fb(display->drm_fd, w, h,
+			    pixel_format, modifier, 0.0, 1.0, 0.0, &d->fb[0]);
+
+	igt_plane_set_fb(plane, &d->fb[0]);
 	igt_fb_set_position(&d->fb[0], plane, 0, 0);
-	igt_fb_set_size(&d->fb[0], plane, width, height);
+	igt_fb_set_size(&d->fb[0], plane, w, h);
 	igt_plane_set_position(plane, 0, 0);
-	igt_plane_set_size(plane, mode->hdisplay, mode->vdisplay);
+
+	if (is_upscale)
+		igt_plane_set_size(plane, mode->hdisplay, mode->vdisplay);
+	else
+		igt_plane_set_size(plane, width, height);
+
 	igt_plane_set_rotation(plane, rot);
-	igt_display_commit2(display, COMMIT_ATOMIC);
+	commit_ret = igt_display_try_commit2(display, COMMIT_ATOMIC);
 
 	igt_plane_set_fb(plane, NULL);
 	igt_plane_set_position(plane, 0, 0);
+	cleanup_fbs(d);
+
+	igt_skip_on_f(commit_ret == -ERANGE || commit_ret == -EINVAL,
+		      "Unsupported scaling factor with fb size %dx%d\n",
+		      w, h);
+	igt_assert_eq(commit_ret, 0);
 }
 
 static const igt_rotation_t rotations[] = {
@@ -157,36 +380,6 @@ static const igt_rotation_t rotations[] = {
 	IGT_ROTATION_180,
 	IGT_ROTATION_270,
 };
-
-static bool can_rotate(data_t *d, unsigned format, uint64_t tiling,
-		       igt_rotation_t rot)
-{
-
-	if (!is_i915_device(d->drm_fd))
-		return true;
-
-	switch (format) {
-	case DRM_FORMAT_RGB565:
-		if (intel_gen(d->devid) >= 11)
-			break;
-		/* fall through */
-	case DRM_FORMAT_C8:
-	case DRM_FORMAT_XRGB16161616F:
-	case DRM_FORMAT_XBGR16161616F:
-	case DRM_FORMAT_ARGB16161616F:
-	case DRM_FORMAT_ABGR16161616F:
-	case DRM_FORMAT_Y210:
-	case DRM_FORMAT_Y212:
-	case DRM_FORMAT_Y216:
-	case DRM_FORMAT_XVYU12_16161616:
-	case DRM_FORMAT_XVYU16161616:
-		return false;
-	default:
-		break;
-	}
-
-	return true;
-}
 
 static bool can_scale(data_t *d, unsigned format)
 {
@@ -198,7 +391,7 @@ static bool can_scale(data_t *d, unsigned format)
 	case DRM_FORMAT_XBGR16161616F:
 	case DRM_FORMAT_ARGB16161616F:
 	case DRM_FORMAT_ABGR16161616F:
-		if (intel_gen(d->devid) >= 11)
+		if (intel_display_ver(d->devid) >= 11)
 			return true;
 		/* fall through */
 	case DRM_FORMAT_C8:
@@ -242,342 +435,116 @@ static bool test_pipe_iteration(data_t *data, enum pipe pipe, int iteration)
 	return true;
 }
 
-static void test_scaler_with_rotation_pipe(data_t *d, enum pipe pipe,
+static const uint64_t modifiers[] = {
+	DRM_FORMAT_MOD_LINEAR,
+	I915_FORMAT_MOD_X_TILED,
+	I915_FORMAT_MOD_Y_TILED,
+	I915_FORMAT_MOD_Yf_TILED,
+	I915_FORMAT_MOD_4_TILED
+};
+
+static void test_scaler_with_modifier_pipe(data_t *d,
+					   int width, int height,
+					   bool is_upscale,
+					   enum pipe pipe,
 					   igt_output_t *output)
 {
 	igt_display_t *display = &d->display;
+	unsigned format = DRM_FORMAT_XRGB8888;
 	igt_plane_t *plane;
-	uint64_t tiling = is_i915_device(d->drm_fd) ?
-		LOCAL_I915_FORMAT_MOD_Y_TILED : LOCAL_DRM_FORMAT_MOD_NONE;
 
-	igt_require(get_num_scalers(d, pipe) > 0);
+	cleanup_crtc(d);
 
 	igt_output_set_pipe(output, pipe);
+
+	for_each_plane_on_pipe(display, pipe, plane) {
+		if (plane->type == DRM_PLANE_TYPE_CURSOR)
+			continue;
+
+		for (int i = 0; i < ARRAY_SIZE(modifiers); i++) {
+			uint64_t modifier = modifiers[i];
+
+			if (igt_plane_has_format_mod(plane, format, modifier))
+				check_scaling_pipe_plane_rot(d, plane,
+							     format, modifier,
+							     width, height,
+							     is_upscale,
+							     pipe, output,
+							     IGT_ROTATION_0);
+		}
+	}
+}
+
+static void test_scaler_with_rotation_pipe(data_t *d,
+					   int width, int height,
+					   bool is_upscale,
+					   enum pipe pipe,
+					   igt_output_t *output)
+{
+	igt_display_t *display = &d->display;
+	unsigned format = DRM_FORMAT_XRGB8888;
+	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+	igt_plane_t *plane;
+
+	cleanup_crtc(d);
+
+	igt_output_set_pipe(output, pipe);
+
 	for_each_plane_on_pipe(display, pipe, plane) {
 		if (plane->type == DRM_PLANE_TYPE_CURSOR)
 			continue;
 
 		for (int i = 0; i < ARRAY_SIZE(rotations); i++) {
 			igt_rotation_t rot = rotations[i];
-			struct igt_vec tested_formats;
 
-			igt_vec_init(&tested_formats, sizeof(uint32_t));
-
-			for (int j = 0; j < plane->drm_plane->count_formats; j++) {
-				unsigned format = plane->drm_plane->formats[j];
-
-				if (test_format(d, &tested_formats, format) &&
-				    igt_plane_has_format_mod(plane, format, tiling) &&
-				    can_rotate(d, format, tiling, rot) &&
-				    can_scale(d, format))
-					check_scaling_pipe_plane_rot(d, plane, format,
-								     tiling, pipe,
-								     output, rot);
-			}
-
-			igt_vec_fini(&tested_formats);
+			if (igt_plane_has_rotation(plane, rot))
+				check_scaling_pipe_plane_rot(d, plane,
+							     format, modifier,
+							     width, height,
+							     is_upscale,
+							     pipe, output,
+							     rot);
 		}
 	}
 }
 
-static const uint64_t tilings[] = {
-	LOCAL_DRM_FORMAT_MOD_NONE,
-	LOCAL_I915_FORMAT_MOD_X_TILED,
-	LOCAL_I915_FORMAT_MOD_Y_TILED,
-	LOCAL_I915_FORMAT_MOD_Yf_TILED
-};
-
-static void test_scaler_with_pixel_format_pipe(data_t *d, enum pipe pipe, igt_output_t *output)
+static void test_scaler_with_pixel_format_pipe(data_t *d, int width, int height, bool is_upscale,
+					       enum pipe pipe, igt_output_t *output)
 {
 	igt_display_t *display = &d->display;
+	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
 	igt_plane_t *plane;
 
-	igt_require(get_num_scalers(d, pipe) > 0);
+	cleanup_crtc(d);
 
 	igt_output_set_pipe(output, pipe);
 
 	for_each_plane_on_pipe(display, pipe, plane) {
+		struct igt_vec tested_formats;
+
 		if (plane->type == DRM_PLANE_TYPE_CURSOR)
 			continue;
 
-		for (int i = 0; i < ARRAY_SIZE(tilings); i++) {
-			uint64_t tiling = tilings[i];
-			struct igt_vec tested_formats;
+		igt_vec_init(&tested_formats, sizeof(uint32_t));
 
-			igt_vec_init(&tested_formats, sizeof(uint32_t));
+		for (int j = 0; j < plane->drm_plane->count_formats; j++) {
+			uint32_t format = plane->drm_plane->formats[j];
 
-			for (int j = 0; j < plane->drm_plane->count_formats; j++) {
-				uint32_t format = plane->drm_plane->formats[j];
-
-				if (test_format(d, &tested_formats, format) &&
-				    igt_plane_has_format_mod(plane, format, tiling) &&
-				    can_scale(d, format))
-					check_scaling_pipe_plane_rot(d, plane,
-								     format, tiling,
-								     pipe, output, IGT_ROTATION_0);
-			}
-
-			igt_vec_fini(&tested_formats);
-		}
-	}
-}
-
-/* does iterative scaling on plane2 */
-static void iterate_plane_scaling(data_t *d, drmModeModeInfo *mode)
-{
-	igt_display_t *display = &d->display;
-
-	if (mode->hdisplay >= d->fb[1].width) {
-		int w, h;
-		/* fixed fb */
-		igt_fb_set_position(&d->fb[1], d->plane2, 0, 0);
-		igt_fb_set_size(&d->fb[1], d->plane2, d->fb[1].width, d->fb[1].height);
-		igt_plane_set_position(d->plane2, 0, 0);
-
-		/* adjust plane size */
-		for (w = d->fb[1].width; w <= mode->hdisplay; w+=10) {
-			h = w * d->fb[1].height / d->fb[1].width;
-			igt_plane_set_size(d->plane2, w, h);
-			igt_display_commit2(display, COMMIT_ATOMIC);
-		}
-	} else {
-		int w, h;
-		/* fixed plane */
-		igt_plane_set_position(d->plane2, 0, 0);
-		igt_plane_set_size(d->plane2, mode->hdisplay, mode->vdisplay);
-		igt_fb_set_position(&d->fb[1], d->plane2, 0, 0);
-
-		/* adjust fb size */
-		for (w = mode->hdisplay; w <= d->fb[1].width; w+=10) {
-			/* Source coordinates must not be clipped. */
-			h = min(w * mode->hdisplay / mode->vdisplay, d->fb[1].height);
-			igt_fb_set_size(&d->fb[1], d->plane2, w, h);
-			igt_display_commit2(display, COMMIT_ATOMIC);
-		}
-	}
-}
-
-static void
-test_plane_scaling_on_pipe(data_t *d, enum pipe pipe, igt_output_t *output)
-{
-	igt_display_t *display = &d->display;
-	igt_pipe_t *pipe_obj = &display->pipes[pipe];
-	drmModeModeInfo *mode;
-	int primary_plane_scaling = 0; /* For now */
-	uint64_t tiling = is_i915_device(display->drm_fd) ?
-		LOCAL_I915_FORMAT_MOD_X_TILED : LOCAL_DRM_FORMAT_MOD_NONE;
-
-	igt_require(get_num_scalers(d, pipe) > 0);
-
-	igt_skip_on(!igt_display_has_format_mod(display, DRM_FORMAT_XRGB8888,
-						tiling));
-
-	mode = igt_output_get_mode(output);
-
-	/* Set up display with plane 1 */
-	d->plane1 = igt_pipe_get_plane_type(pipe_obj, DRM_PLANE_TYPE_PRIMARY);
-	prepare_crtc(d, output, pipe, d->plane1, mode);
-
-	igt_create_color_pattern_fb(display->drm_fd, 600, 600,
-				    DRM_FORMAT_XRGB8888,
-				    tiling,
-				    .5, .5, .5, &d->fb[1]);
-
-	igt_create_pattern_fb(d->drm_fd,
-			      mode->hdisplay, mode->vdisplay,
-			      DRM_FORMAT_XRGB8888,
-			      tiling,
-			      &d->fb[2]);
-
-	if (primary_plane_scaling) {
-		/* Primary plane upscaling */
-		igt_fb_set_position(&d->fb[0], d->plane1, 100, 100);
-		igt_fb_set_size(&d->fb[0], d->plane1, 500, 500);
-		igt_plane_set_position(d->plane1, 0, 0);
-		igt_plane_set_size(d->plane1, mode->hdisplay, mode->vdisplay);
-		igt_display_commit2(display, COMMIT_ATOMIC);
-
-		/* Primary plane 1:1 no scaling */
-		igt_fb_set_position(&d->fb[0], d->plane1, 0, 0);
-		igt_fb_set_size(&d->fb[0], d->plane1, d->fb[0].width, d->fb[0].height);
-		igt_plane_set_position(d->plane1, 0, 0);
-		igt_plane_set_size(d->plane1, mode->hdisplay, mode->vdisplay);
-		igt_display_commit2(display, COMMIT_ATOMIC);
-	}
-
-	/* Set up fb[1]->plane2 mapping. */
-	d->plane2 = igt_pipe_get_plane_type_index(pipe_obj,
-						  DRM_PLANE_TYPE_OVERLAY, 0);
-
-	if (!d->plane2) {
-		igt_debug("Plane-2 doesnt exist on pipe %s\n", kmstest_pipe_name(pipe));
-		return;
-	}
-
-	igt_plane_set_fb(d->plane2, &d->fb[1]);
-
-	/* 2nd plane windowed */
-	igt_fb_set_position(&d->fb[1], d->plane2, 100, 100);
-	igt_fb_set_size(&d->fb[1], d->plane2, d->fb[1].width-200, d->fb[1].height-200);
-	igt_plane_set_position(d->plane2, 100, 100);
-	igt_plane_set_size(d->plane2, mode->hdisplay-200, mode->vdisplay-200);
-	igt_display_commit2(display, COMMIT_ATOMIC);
-
-	iterate_plane_scaling(d, mode);
-
-	/* 2nd plane up scaling */
-	igt_fb_set_position(&d->fb[1], d->plane2, 100, 100);
-	igt_fb_set_size(&d->fb[1], d->plane2, 500, 500);
-	igt_plane_set_position(d->plane2, 10, 10);
-	igt_plane_set_size(d->plane2, mode->hdisplay-20, mode->vdisplay-20);
-	igt_display_commit2(display, COMMIT_ATOMIC);
-
-	/* 2nd plane downscaling */
-	igt_fb_set_position(&d->fb[1], d->plane2, 0, 0);
-	igt_fb_set_size(&d->fb[1], d->plane2, d->fb[1].width, d->fb[1].height);
-	igt_plane_set_position(d->plane2, 10, 10);
-
-	/* Downscale (10/9)x of original image */
-	igt_plane_set_size(d->plane2, (d->fb[1].width * 10)/9, (d->fb[1].height * 10)/9);
-	igt_display_commit2(display, COMMIT_ATOMIC);
-
-	if (primary_plane_scaling) {
-		/* Primary plane up scaling */
-		igt_fb_set_position(&d->fb[0], d->plane1, 100, 100);
-		igt_fb_set_size(&d->fb[0], d->plane1, 500, 500);
-		igt_plane_set_position(d->plane1, 0, 0);
-		igt_plane_set_size(d->plane1, mode->hdisplay, mode->vdisplay);
-		igt_display_commit2(display, COMMIT_ATOMIC);
-	}
-
-	/* Set up fb[2]->plane3 mapping. */
-	d->plane3 = igt_pipe_get_plane_type_index(pipe_obj,
-						  DRM_PLANE_TYPE_OVERLAY, 1);
-	if(!d->plane3) {
-		igt_debug("Plane-3 doesnt exist on pipe %s\n", kmstest_pipe_name(pipe));
-		return;
-	}
-
-	igt_plane_set_fb(d->plane3, &d->fb[2]);
-
-	/* 3rd plane windowed - no scaling */
-	igt_fb_set_position(&d->fb[2], d->plane3, 100, 100);
-	igt_fb_set_size(&d->fb[2], d->plane3, d->fb[2].width-300, d->fb[2].height-300);
-	igt_plane_set_position(d->plane3, 100, 100);
-	igt_plane_set_size(d->plane3, mode->hdisplay-300, mode->vdisplay-300);
-	igt_display_commit2(display, COMMIT_ATOMIC);
-
-	/* Switch scaler from plane 2 to plane 3 */
-	igt_fb_set_position(&d->fb[1], d->plane2, 100, 100);
-	igt_fb_set_size(&d->fb[1], d->plane2, d->fb[1].width-200, d->fb[1].height-200);
-	igt_plane_set_position(d->plane2, 100, 100);
-	igt_plane_set_size(d->plane2, d->fb[1].width-200, d->fb[1].height-200);
-
-	igt_fb_set_position(&d->fb[2], d->plane3, 100, 100);
-	igt_fb_set_size(&d->fb[2], d->plane3, d->fb[2].width-400, d->fb[2].height-400);
-	igt_plane_set_position(d->plane3, 10, 10);
-	igt_plane_set_size(d->plane3, mode->hdisplay-300, mode->vdisplay-300);
-	igt_display_commit2(display, COMMIT_ATOMIC);
-
-	if (primary_plane_scaling) {
-		/* Switch scaler from plane 1 to plane 2 */
-		igt_fb_set_position(&d->fb[0], d->plane1, 0, 0);
-		igt_fb_set_size(&d->fb[0], d->plane1, d->fb[0].width, d->fb[0].height);
-		igt_plane_set_position(d->plane1, 0, 0);
-		igt_plane_set_size(d->plane1, mode->hdisplay, mode->vdisplay);
-
-		igt_fb_set_position(&d->fb[1], d->plane2, 100, 100);
-		igt_fb_set_size(&d->fb[1], d->plane2, d->fb[1].width-500,d->fb[1].height-500);
-		igt_plane_set_position(d->plane2, 100, 100);
-		igt_plane_set_size(d->plane2, mode->hdisplay-200, mode->vdisplay-200);
-		igt_display_commit2(display, COMMIT_ATOMIC);
-	}
-}
-
-static void
-__test_scaler_with_clipping_clamping_scenario(data_t *d, drmModeModeInfo *mode)
-{
-	igt_plane_set_fb(d->plane1, &d->fb[1]);
-	igt_plane_set_fb(d->plane2, &d->fb[2]);
-
-	igt_fb_set_position(&d->fb[1], d->plane1, 0, 0);
-	igt_fb_set_size(&d->fb[1], d->plane1, 300, 300);
-	igt_plane_set_position(d->plane1, 100, 400);
-	igt_fb_set_position(&d->fb[2], d->plane2, 0, 0);
-	igt_fb_set_size(&d->fb[2], d->plane2, 400, 400);
-	igt_plane_set_position(d->plane2, 100, 100);
-
-	/* scaled window size is outside the modeset area.*/
-	igt_plane_set_size(d->plane1, mode->hdisplay + 200,
-					    mode->vdisplay + 200);
-	igt_plane_set_size(d->plane2, mode->hdisplay + 100,
-					    mode->vdisplay + 100);
-
-	/*
-	 * Can't guarantee that the clipped coordinates are
-	 * suitably aligned for yuv. So allow the commit to fail.
-	 */
-	if (igt_format_is_yuv(d->fb[1].drm_format) ||
-	    igt_format_is_yuv(d->fb[2].drm_format))
-		igt_display_try_commit2(&d->display, COMMIT_ATOMIC);
-	else
-		igt_display_commit2(&d->display, COMMIT_ATOMIC);
-}
-
-static void
-test_scaler_with_clipping_clamping_scenario(data_t *d, enum pipe pipe, igt_output_t *output)
-{
-	igt_pipe_t *pipe_obj = &d->display.pipes[pipe];
-	drmModeModeInfo *mode;
-	struct igt_vec tested_formats1;
-
-	igt_require(get_num_scalers(d, pipe) >= 2);
-
-	mode = igt_output_get_mode(output);
-	d->plane1 = igt_pipe_get_plane_type(pipe_obj, DRM_PLANE_TYPE_PRIMARY);
-	d->plane2 = igt_pipe_get_plane_type(pipe_obj, DRM_PLANE_TYPE_OVERLAY);
-	prepare_crtc(d, output, pipe, d->plane1, mode);
-
-	igt_vec_init(&tested_formats1, sizeof(uint32_t));
-
-	for (int i = 0; i < d->plane1->drm_plane->count_formats; i++) {
-		unsigned f1 = d->plane1->drm_plane->formats[i];
-		struct igt_vec tested_formats2;
-
-		if (!test_pipe_iteration(d, pipe, i))
-			continue;
-
-		if (!test_format(d, &tested_formats1, f1) ||
-		    !can_scale(d, f1))
-			continue;
-
-		igt_vec_init(&tested_formats2, sizeof(uint32_t));
-
-		igt_create_pattern_fb(d->drm_fd,
-				      mode->hdisplay, mode->vdisplay, f1,
-				      LOCAL_I915_FORMAT_MOD_X_TILED, &d->fb[1]);
-
-		for (int j = 0; j < d->plane2->drm_plane->count_formats; j++) {
-			unsigned f2 = d->plane2->drm_plane->formats[j];
-
-			if (!test_format(d, &tested_formats2, f2) ||
-			    !can_scale(d, f2))
+			if (!test_pipe_iteration(d, pipe, j))
 				continue;
 
-			igt_create_pattern_fb(d->drm_fd,
-					      mode->hdisplay, mode->vdisplay, f2,
-					      LOCAL_I915_FORMAT_MOD_Y_TILED,
-					      &d->fb[2]);
-
-			__test_scaler_with_clipping_clamping_scenario(d, mode);
-			igt_remove_fb(d->drm_fd, &d->fb[2]);
+			if (test_format(d, &tested_formats, format) &&
+			    igt_plane_has_format_mod(plane, format, modifier) &&
+			    can_scale(d, format))
+			    check_scaling_pipe_plane_rot(d, plane,
+							 format, modifier,
+							 width, height,
+							 is_upscale,
+							 pipe, output, IGT_ROTATION_0);
 		}
-		igt_remove_fb(d->drm_fd, &d->fb[1]);
 
-		igt_vec_fini(&tested_formats2);
+		igt_vec_fini(&tested_formats);
 	}
-
-	igt_vec_fini(&tested_formats1);
 }
 
 static void find_connected_pipe(igt_display_t *display, bool second, enum pipe *pipe, igt_output_t **output)
@@ -606,14 +573,179 @@ static void find_connected_pipe(igt_display_t *display, bool second, enum pipe *
 		igt_require_f(found, "No valid outputs found\n");
 }
 
+static void
+__test_planes_scaling_combo(data_t *d, int w1, int h1, int w2, int h2,
+			    enum pipe pipe, igt_output_t *output,
+			    igt_plane_t *p1, igt_plane_t *p2,
+			    struct igt_fb *fb1, struct igt_fb *fb2,
+			    enum scaler_combo_test_type test_type)
+{
+	igt_display_t *display = &d->display;
+	drmModeModeInfo *mode;
+	int ret;
+
+	mode = igt_output_get_mode(output);
+
+	igt_plane_set_fb(p1, fb1);
+	igt_plane_set_fb(p2, fb2);
+
+	if (test_type == TEST_PLANES_UPSCALE) {
+		/* first plane upscaling */
+		igt_plane_set_size(p1, mode->hdisplay, mode->vdisplay);
+		/* second plane upscaling */
+		igt_plane_set_size(p2, mode->hdisplay - 20, mode->vdisplay - 20);
+	}
+	if (test_type == TEST_PLANES_DOWNSCALE) {
+		/* first plane downscaling */
+		igt_plane_set_size(p1, w1, h1);
+		/* second plane downscaling */
+		igt_plane_set_size(p2, w2, h2);
+	}
+	if (test_type == TEST_PLANES_UPSCALE_DOWNSCALE) {
+		/* first plane upscaling */
+		igt_plane_set_size(p1, mode->hdisplay, mode->vdisplay);
+		/* second plane downscaling */
+		igt_plane_set_size(p2, w2, h2);
+	}
+
+	ret = igt_display_try_commit_atomic(display, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+
+	igt_plane_set_fb(p1, NULL);
+	igt_plane_set_fb(p2, NULL);
+
+	igt_skip_on_f(ret == -EINVAL || ret == -ERANGE,
+		      "Scaling op not supported by driver\n");
+	igt_assert_eq(ret, 0);
+}
+
+static void setup_fb(int fd, int width, int height,
+		     double r, double g, double b,
+		     struct igt_fb *fb)
+{
+	igt_create_color_pattern_fb(fd, width, height,
+				    DRM_FORMAT_XRGB8888,
+				    I915_TILING_NONE,
+				    r, g, b, fb);
+}
+
+static void
+test_planes_scaling_combo(data_t *d, int w1, int h1, int w2, int h2,
+			  enum pipe pipe, igt_output_t *output,
+			  enum scaler_combo_test_type test_type)
+{
+	igt_display_t *display = &d->display;
+	drmModeModeInfo *mode;
+
+	cleanup_crtc(d);
+
+	igt_output_set_pipe(output, pipe);
+	mode = igt_output_get_mode(output);
+
+	if (test_type == TEST_PLANES_UPSCALE) {
+		setup_fb(display->drm_fd, w1, h1, 1.0, 0.0, 0.0, &d->fb[1]);
+		setup_fb(display->drm_fd, w2, h2, 0.0, 1.0, 0.0, &d->fb[2]);
+	}
+	if (test_type == TEST_PLANES_DOWNSCALE) {
+		setup_fb(display->drm_fd, mode->hdisplay, mode->vdisplay, 1.0, 0.0, 0.0, &d->fb[1]);
+		setup_fb(display->drm_fd, mode->hdisplay, mode->vdisplay, 0.0, 1.0, 0.0, &d->fb[2]);
+	}
+	if (test_type == TEST_PLANES_UPSCALE_DOWNSCALE) {
+		setup_fb(display->drm_fd, w1, h1, 1.0, 0.0, 0.0, &d->fb[1]);
+		setup_fb(display->drm_fd, mode->hdisplay, mode->vdisplay, 0.0, 1.0, 0.0, &d->fb[2]);
+	}
+
+	for (int k = 0; k < display->pipes[pipe].n_planes; k++) {
+		igt_plane_t *p1, *p2;
+
+		p1 = &display->pipes[pipe].planes[k];
+		igt_require(p1);
+		p2 = &display->pipes[pipe].planes[k+1];
+		igt_require(p2);
+
+		if (p1->type == DRM_PLANE_TYPE_CURSOR || p2->type == DRM_PLANE_TYPE_CURSOR)
+				continue;
+
+		__test_planes_scaling_combo(d, w1, h1, w2, h2,
+					    pipe, output, p1, p2,
+					    &d->fb[1], &d->fb[2],
+					    test_type);
+	}
+
+	cleanup_fbs(d);
+}
+
+static void
+test_invalid_num_scalers(data_t *d, enum pipe pipe, igt_output_t *output)
+{
+	igt_display_t *display = &d->display;
+	igt_pipe_t *pipe_obj = &display->pipes[pipe];
+	int width, height;
+	igt_plane_t *plane[3];
+	drmModeModeInfo *mode;
+	int ret;
+
+	cleanup_crtc(d);
+
+	igt_output_set_pipe(output, pipe);
+
+	width = height = 20;
+	mode = igt_output_get_mode(output);
+
+	plane[0] = igt_pipe_get_plane_type_index(pipe_obj, DRM_PLANE_TYPE_OVERLAY, 0);
+	igt_require(plane[0]);
+	plane[1] = igt_pipe_get_plane_type_index(pipe_obj, DRM_PLANE_TYPE_OVERLAY, 1);
+	igt_require(plane[1]);
+	plane[2] = igt_pipe_get_plane_type_index(pipe_obj, DRM_PLANE_TYPE_OVERLAY, 2);
+	igt_require(plane[2]);
+
+	igt_create_color_pattern_fb(display->drm_fd,
+                                    width, height,
+                                    DRM_FORMAT_XRGB8888,
+                                    I915_TILING_NONE,
+                                    1.0, 0.0, 0.0, &d->fb[0]);
+	igt_create_color_pattern_fb(display->drm_fd,
+                                    width, height,
+                                    DRM_FORMAT_XRGB8888,
+                                    I915_TILING_NONE,
+                                    0.0, 1.0, 0.0, &d->fb[1]);
+	igt_create_color_pattern_fb(display->drm_fd,
+                                    width, height,
+                                    DRM_FORMAT_XRGB8888,
+                                    I915_TILING_NONE,
+                                    0.0, 0.0, 1.0, &d->fb[2]);
+
+	igt_plane_set_fb(plane[0], &d->fb[0]);
+	igt_plane_set_fb(plane[1], &d->fb[1]);
+	igt_plane_set_fb(plane[2], &d->fb[2]);
+
+	igt_plane_set_size(plane[0], mode->hdisplay, mode->vdisplay);
+	igt_plane_set_size(plane[1], mode->hdisplay, mode->vdisplay);
+	igt_plane_set_size(plane[2], mode->hdisplay, mode->vdisplay);
+
+	/* This commit is expected to fail for i915 devices. i915 devices support
+	 * max 2 scalers/pipe. In dmesg we can find: Too many scaling requests 3 > 2.
+	 * For devices (non-i915, or possible future i915) that are able to perform this
+	 * amount of scaling; handle that case aswell.
+	 * */
+	ret = igt_display_try_commit_atomic(display, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+	igt_skip_on_f(ret == 0, "Cannot test handling of too many scaling ops, the device supports a large amount.\n");
+	igt_assert_eq(ret, -EINVAL);
+
+	/* cleanup */
+	igt_plane_set_fb(plane[0], NULL);
+	igt_plane_set_fb(plane[1], NULL);
+	igt_plane_set_fb(plane[2], NULL);
+	cleanup_fbs(d);
+}
+
 static void test_scaler_with_multi_pipe_plane(data_t *d)
 {
 	igt_display_t *display = &d->display;
 	igt_output_t *output1, *output2;
 	drmModeModeInfo *mode1, *mode2;
+	igt_plane_t *plane[4];
 	enum pipe pipe1, pipe2;
-	uint64_t tiling = is_i915_device(display->drm_fd) ?
-		LOCAL_I915_FORMAT_MOD_Y_TILED : LOCAL_DRM_FORMAT_MOD_NONE;
+	int ret1, ret2;
 
 	cleanup_crtc(d);
 
@@ -625,50 +757,66 @@ static void test_scaler_with_multi_pipe_plane(data_t *d)
 	igt_output_set_pipe(output1, pipe1);
 	igt_output_set_pipe(output2, pipe2);
 
-	d->plane1 = igt_output_get_plane(output1, 0);
-	d->plane2 = get_num_scalers(d, pipe1) >= 2 ? igt_output_get_plane(output1, 1) : NULL;
-	d->plane3 = igt_output_get_plane(output2, 0);
-	d->plane4 = get_num_scalers(d, pipe2) >= 2 ? igt_output_get_plane(output2, 1) : NULL;
+	plane[0] = igt_output_get_plane(output1, 0);
+	igt_require(plane[0]);
+	plane[1] = igt_output_get_plane(output1, 0);
+	igt_require(plane[1]);
+	plane[2] = igt_output_get_plane(output2, 1);
+	igt_require(plane[2]);
+	plane[3] = igt_output_get_plane(output2, 1);
+	igt_require(plane[3]);
+
+	igt_create_pattern_fb(d->drm_fd, 600, 600,
+			      DRM_FORMAT_XRGB8888,
+			      I915_TILING_NONE, &d->fb[0]);
+	igt_create_pattern_fb(d->drm_fd, 500, 500,
+			      DRM_FORMAT_XRGB8888,
+			      I915_TILING_NONE, &d->fb[1]);
+	igt_create_pattern_fb(d->drm_fd, 700, 700,
+			      DRM_FORMAT_XRGB8888,
+			      I915_TILING_NONE, &d->fb[2]);
+	igt_create_pattern_fb(d->drm_fd, 400, 400,
+			      DRM_FORMAT_XRGB8888,
+			      I915_TILING_NONE, &d->fb[3]);
+
+	igt_plane_set_fb(plane[0], &d->fb[0]);
+	igt_plane_set_fb(plane[1], &d->fb[1]);
+	igt_plane_set_fb(plane[2], &d->fb[2]);
+	igt_plane_set_fb(plane[3], &d->fb[3]);
+
+	if (igt_display_try_commit_atomic(display,
+				DRM_MODE_ATOMIC_TEST_ONLY |
+				DRM_MODE_ATOMIC_ALLOW_MODESET,
+				NULL) != 0) {
+		bool found = igt_override_all_active_output_modes_to_fit_bw(display);
+		igt_require_f(found, "No valid mode combo found.\n");
+	}
+
+	igt_display_commit2(display, COMMIT_ATOMIC);
 
 	mode1 = igt_output_get_mode(output1);
 	mode2 = igt_output_get_mode(output2);
 
-	igt_skip_on(!igt_display_has_format_mod(display, DRM_FORMAT_XRGB8888,
-						tiling));
+	/* upscaling primary */
+	igt_plane_set_size(plane[0], mode1->hdisplay, mode1->vdisplay);
+	igt_plane_set_size(plane[2], mode2->hdisplay, mode2->vdisplay);
+	ret1 = igt_display_try_commit2(display, COMMIT_ATOMIC);
 
-	igt_create_pattern_fb(d->drm_fd, 600, 600,
-			      DRM_FORMAT_XRGB8888,
-			      tiling, &d->fb[0]);
+	/* upscaling sprites */
+	igt_plane_set_size(plane[1], mode1->hdisplay, mode1->vdisplay);
+	igt_plane_set_size(plane[3], mode2->hdisplay, mode2->vdisplay);
+	ret2 = igt_display_try_commit2(display, COMMIT_ATOMIC);
 
-	igt_create_pattern_fb(d->drm_fd, 500, 500,
-			      DRM_FORMAT_XRGB8888,
-			      tiling, &d->fb[1]);
+	igt_plane_set_fb(plane[0], NULL);
+	igt_plane_set_fb(plane[1], NULL);
+	igt_plane_set_fb(plane[2], NULL);
+	igt_plane_set_fb(plane[3], NULL);
+	cleanup_fbs(d);
 
-	igt_create_pattern_fb(d->drm_fd, 700, 700,
-			      DRM_FORMAT_XRGB8888,
-			      tiling, &d->fb[2]);
-
-	igt_create_pattern_fb(d->drm_fd, 400, 400,
-			      DRM_FORMAT_XRGB8888,
-			      tiling, &d->fb[3]);
-
-	igt_plane_set_fb(d->plane1, &d->fb[0]);
-	if (d->plane2)
-		igt_plane_set_fb(d->plane2, &d->fb[1]);
-	igt_plane_set_fb(d->plane3, &d->fb[2]);
-	if (d->plane4)
-		igt_plane_set_fb(d->plane4, &d->fb[3]);
-	igt_display_commit2(display, COMMIT_ATOMIC);
-
-	/* Upscaling Primary */
-	igt_plane_set_size(d->plane1, mode1->hdisplay, mode1->vdisplay);
-	igt_plane_set_size(d->plane3, mode2->hdisplay, mode2->vdisplay);
-	igt_display_commit2(display, COMMIT_ATOMIC);
-
-	/* Upscaling Sprites */
-	igt_plane_set_size(d->plane2 ?: d->plane1, mode1->hdisplay, mode1->vdisplay);
-	igt_plane_set_size(d->plane4 ?: d->plane3, mode2->hdisplay, mode2->vdisplay);
-	igt_display_commit2(display, COMMIT_ATOMIC);
+	igt_skip_on_f(ret1 == -ERANGE || ret1 == -EINVAL ||
+		      ret2 == -ERANGE || ret1 == -EINVAL,
+		      "Scaling op is not supported by driver\n");
+	igt_assert_eq(ret1 && ret2, 0);
 }
 
 static int opt_handler(int opt, int opt_index, void *_data)
@@ -699,7 +847,7 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 	enum pipe pipe;
 
 	igt_fixture {
-		data.drm_fd = drm_open_driver_master(DRIVER_INTEL | DRIVER_AMDGPU);
+		data.drm_fd = drm_open_driver_master(DRIVER_ANY);
 		igt_display_require(&data.display, data.drm_fd);
 		data.devid = is_i915_device(data.drm_fd) ?
 			intel_get_drm_devid(data.drm_fd) : 0;
@@ -709,39 +857,133 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 	igt_subtest_group {
 		igt_output_t *output;
 
-		igt_describe("Tests plane scaling per pipe.");
-		igt_subtest_with_dynamic("plane-scaling") {
+		for (int index = 0; index < ARRAY_SIZE(scaler_with_pixel_format_tests); index++) {
+			igt_describe(scaler_with_pixel_format_tests[index].describe);
+			igt_subtest_with_dynamic(scaler_with_pixel_format_tests[index].name) {
 			for_each_pipe_with_single_output(&data.display, pipe, output)
-				igt_dynamic_f("pipe-%s-plane-scaling", kmstest_pipe_name(pipe))
-					test_plane_scaling_on_pipe(&data, pipe, output);
+				igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), igt_output_name(output)) {
+					drmModeModeInfo *mode;
+
+					mode = igt_output_get_mode(output);
+
+					test_scaler_with_pixel_format_pipe(&data,
+							get_width(mode, scaler_with_pixel_format_tests[index].sf),
+							get_height(mode, scaler_with_pixel_format_tests[index].sf),
+							scaler_with_pixel_format_tests[index].is_upscale,
+							pipe, output);
+				}
+			}
 		}
 
-		igt_describe("Tests scaling with pixel formats.");
-		igt_subtest_with_dynamic("scaler-with-pixel-format") {
+		for (int index = 0; index < ARRAY_SIZE(scaler_with_rotation_tests); index++) {
+			igt_describe(scaler_with_rotation_tests[index].describe);
+			igt_subtest_with_dynamic(scaler_with_rotation_tests[index].name) {
 			for_each_pipe_with_single_output(&data.display, pipe, output)
-				igt_dynamic_f("pipe-%s-scaler-with-pixel-format", kmstest_pipe_name(pipe))
-					test_scaler_with_pixel_format_pipe(&data, pipe, output);
+				igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), igt_output_name(output)) {
+					drmModeModeInfo *mode;
+
+					mode = igt_output_get_mode(output);
+
+					test_scaler_with_rotation_pipe(&data,
+							get_width(mode, scaler_with_rotation_tests[index].sf),
+							get_height(mode, scaler_with_rotation_tests[index].sf),
+							scaler_with_rotation_tests[index].is_upscale,
+							pipe, output);
+				}
+			}
 		}
 
-		igt_describe("Tests scaling with tiling rotation.");
-		igt_subtest_with_dynamic("scaler-with-rotation") {
+		for (int index = 0; index < ARRAY_SIZE(scaler_with_modifiers_tests); index++) {
+			igt_describe(scaler_with_modifiers_tests[index].describe);
+			igt_subtest_with_dynamic(scaler_with_modifiers_tests[index].name) {
 			for_each_pipe_with_single_output(&data.display, pipe, output)
-				igt_dynamic_f("pipe-%s-scaler-with-rotation", kmstest_pipe_name(pipe))
-					test_scaler_with_rotation_pipe(&data, pipe, output);
+				igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), igt_output_name(output)) {
+					drmModeModeInfo *mode;
+
+					mode = igt_output_get_mode(output);
+
+					test_scaler_with_modifier_pipe(&data,
+							get_width(mode, scaler_with_rotation_tests[index].sf),
+							get_height(mode, scaler_with_rotation_tests[index].sf),
+							scaler_with_rotation_tests[index].is_upscale,
+							pipe, output);
+				}
+			}
 		}
 
-		igt_describe("Tests scaling with clipping and clamping.");
-		igt_subtest_with_dynamic("scaler-with-clipping-clamping") {
+		igt_describe("Tests scaling with clipping and clamping, pixel formats.");
+		igt_subtest_with_dynamic("plane-scaler-with-clipping-clamping-pixel-formats") {
+			for_each_pipe_with_single_output(&data.display, pipe, output) {
+				drmModeModeInfo *mode;
+
+				mode = igt_output_get_mode(output);
+
+				igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), igt_output_name(output))
+					test_scaler_with_pixel_format_pipe(&data, mode->hdisplay + 100,
+							mode->vdisplay + 100, false, pipe, output);
+			}
+		}
+
+		igt_describe("Tests scaling with clipping and clamping, rotation.");
+		igt_subtest_with_dynamic("plane-scaler-with-clipping-clamping-rotation") {
+			for_each_pipe_with_single_output(&data.display, pipe, output) {
+				drmModeModeInfo *mode;
+
+				mode = igt_output_get_mode(output);
+
+				igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), igt_output_name(output))
+					test_scaler_with_rotation_pipe(&data, mode->hdisplay + 100,
+							mode->vdisplay + 100, false, pipe, output);
+			}
+		}
+
+		igt_describe("Tests scaling with clipping and clamping, modifiers.");
+		igt_subtest_with_dynamic("plane-scaler-with-clipping-clamping-modifiers") {
+			for_each_pipe_with_single_output(&data.display, pipe, output) {
+				drmModeModeInfo *mode;
+
+				mode = igt_output_get_mode(output);
+
+				igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), igt_output_name(output))
+					test_scaler_with_modifier_pipe(&data, mode->hdisplay + 100,
+							mode->vdisplay + 100, false, pipe, output);
+			}
+		}
+
+		for (int index = 0; index < ARRAY_SIZE(scaler_with_2_planes_tests); index++) {
+			igt_describe(scaler_with_2_planes_tests[index].describe);
+			igt_subtest_with_dynamic(scaler_with_2_planes_tests[index].name) {
 			for_each_pipe_with_single_output(&data.display, pipe, output)
-				igt_dynamic_f("pipe-%s-scaler-with-clipping-clamping", kmstest_pipe_name(pipe))
-					test_scaler_with_clipping_clamping_scenario(&data, pipe, output);
+				igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), igt_output_name(output)) {
+					drmModeModeInfo *mode;
+
+					mode = igt_output_get_mode(output);
+
+					test_planes_scaling_combo(&data,
+							get_width(mode, scaler_with_2_planes_tests[index].sf_plane1),
+							get_height(mode, scaler_with_2_planes_tests[index].sf_plane1),
+							get_width(mode, scaler_with_2_planes_tests[index].sf_plane2),
+							get_height(mode, scaler_with_2_planes_tests[index].sf_plane2),
+							pipe, output, scaler_with_2_planes_tests[index].test_type);
+				}
+			}
+		}
+
+		igt_describe("Negative test for number of scalers per pipe.");
+		igt_subtest_with_dynamic("invalid-num-scalers") {
+			for_each_pipe_with_valid_output(&data.display, pipe, output)
+				igt_dynamic_f("pipe-%s-%s-invalid-num-scalers",
+					       kmstest_pipe_name(pipe), igt_output_name(output))
+					test_invalid_num_scalers(&data, pipe, output);
 		}
 	}
 
-	igt_describe("Tests scaling with multi-pipe scenario.");
+	igt_describe("Tests scaling with multi-pipe.");
 	igt_subtest_f("2x-scaler-multi-pipe")
 		test_scaler_with_multi_pipe_plane(&data);
 
-	igt_fixture
+	igt_fixture {
 		igt_display_fini(&data.display);
+		close(data.drm_fd);
+	}
 }

@@ -31,6 +31,7 @@
 #include <time.h>
 #include <xf86drmMode.h>
 
+#include "igt_aux.h"
 #include "igt_core.h"
 #include "igt_edid.h"
 
@@ -59,8 +60,11 @@ static const char monitor_range_padding[] = {
 
 const uint8_t hdmi_ieee_oui[3] = {0x03, 0x0C, 0x00};
 
-/* vfreq is in Hz */
-static void std_timing_set(struct std_timing *st, int hsize, int vfreq,
+/**
+ * std_timing_set: Sets the EDID standard timing for a given @hsize, @vfreq
+ * in Hz and @aspect ratio
+ */
+ void std_timing_set(struct std_timing *st, int hsize, int vfreq,
 			   enum std_timing_aspect aspect)
 {
 	assert(hsize >= 256 && hsize <= 2288);
@@ -183,10 +187,14 @@ void detailed_timing_set_string(struct detailed_timing *dt,
 
 	np->type = type;
 
-	strncpy(ds->str, str, sizeof(ds->str));
-	len = strlen(str);
+	len = min(strlen(str), sizeof(ds->str));
+	memcpy(ds->str, str, len);
+
 	if (len < sizeof(ds->str))
-		ds->str[len] = '\n';
+		ds->str[len++] = '\n';
+
+	while (len < sizeof(ds->str))
+		ds->str[len++] = ' ';
 }
 
 /**
@@ -313,7 +321,25 @@ void edid_update_checksum(struct edid *edid)
 			ext->data.cea.checksum =
 				compute_checksum((uint8_t *) ext,
 						 sizeof(struct edid_ext));
+		else if (ext->tag == EDID_EXT_DISPLAYID) {
+			ext->data.tile.extension_checksum =
+				compute_checksum((uint8_t *) &ext->data.tile,
+						 sizeof(struct edid_ext));
+			ext->data.tile.checksum =
+				compute_checksum((uint8_t *) ext,
+						 sizeof(struct edid_ext));
+		}
 	}
+}
+
+/**
+ * base_edid_update_checksum: compute and update the checksum of the main EDID
+ * block
+ */
+void base_edid_update_checksum(struct edid *edid)
+{
+	edid->checksum = compute_checksum((uint8_t *) edid,
+					  sizeof(struct edid));
 }
 
 /**
@@ -324,6 +350,72 @@ size_t edid_get_size(const struct edid *edid)
 {
 	return sizeof(struct edid) +
 	       edid->extensions_len * sizeof(struct edid_ext);
+}
+
+static int ieee_oui(uint8_t oui[CEA_VSDB_HEADER_SIZE])
+{
+         return (oui[2] << 16) | (oui[1] << 8) | oui[0];
+}
+
+/**
+ * edid_get_deep_color_from_vsdb: return the Deep Color info from Vendor
+ * Specific Data Block (VSDB), if VSDB not found then return zero.
+ */
+uint8_t edid_get_deep_color_from_vsdb(const struct edid *edid)
+{
+	const struct edid_ext *edid_ext;
+	const struct edid_cea *edid_cea;
+	const char *cea_data;
+	uint8_t deep_color = 0;
+	int offset, i, j;
+
+	/*
+	 * Read from vendor specific data block first, if vsdb not found
+	 * return 0.
+	 */
+	for (i = 0; i < edid->extensions_len; i++) {
+		edid_ext = &edid->extensions[i];
+		edid_cea = &edid_ext->data.cea;
+
+		if ((edid_ext->tag != EDID_EXT_CEA) ||
+		    (edid_cea->revision != 3))
+			continue;
+
+		offset = edid_cea->dtd_start;
+		cea_data = edid_cea->data;
+
+		for (j = 0; j < offset; j += (cea_data[j] & 0x1F) + 1) {
+			struct edid_cea_data_block *vsdb =
+				(struct edid_cea_data_block *)(cea_data + j);
+
+			if (((vsdb->type_len & 0xE0) >> 5) != EDID_CEA_DATA_VENDOR_SPECIFIC)
+				continue;
+
+			if (ieee_oui(vsdb->data.vsdbs->ieee_oui) == 0x000C03)
+				deep_color = vsdb->data.vsdbs->data.hdmi.flags1;
+
+			if (deep_color & (7 << 4))
+				return deep_color;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * edid_get_bit_depth: Read from the Video Input Definition and return the
+ * Color Bit Depth if Input is a Digital Video, else return zero.
+ */
+uint8_t edid_get_bit_depth_from_vid(const struct edid *edid)
+{
+	/*
+	 * Video Signal Interface: Bit 7 (1:Digital, 0:Analog)
+	 * Color Bit Depth: Bits 6 → 4
+	 */
+	if (!(edid->input & (1 << 7)))
+		return 0;
+
+	return ((edid->input & (7 << 4)) >> 4);
 }
 
 /**
@@ -456,6 +548,15 @@ size_t edid_cea_data_block_set_speaker_alloc(struct edid_cea_data_block *block,
 	memcpy(block->data.speakers, speakers, size);
 
 	return sizeof(struct edid_cea_data_block) + size;
+}
+
+/**
+ * edid_ext_set_tile initialize an EDID extension block to be identified
+ * as a tiled display topology block
+ */
+void edid_ext_set_displayid(struct edid_ext *ext)
+{
+	ext->tag = EDID_EXT_DISPLAYID;
 }
 
 /**

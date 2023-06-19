@@ -7,6 +7,7 @@
 #include <json.h>
 
 #include "igt.h"
+#include "runnercomms.h"
 
 #include "settings.h"
 #include "job_list.h"
@@ -112,6 +113,7 @@ static void job_list_filter_test(const char *name, const char *filterarg1, const
 		igt_subtest_f("job-list-filters-%s-%s", name, multiple ? "multiple" : "normal") {
 			struct job_list list;
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       /* Ugly but does the trick */
 					       multiple ? "--multiple-mode" : "--sync",
 					       filterarg1, filterarg2,
@@ -138,7 +140,7 @@ static void job_list_filter_test(const char *name, const char *filterarg1, const
 	}
 
 	igt_fixture {
-		free_settings(settings);
+		clear_settings(settings);
 		free(settings);
 	}
 }
@@ -187,6 +189,7 @@ static void assert_settings_equal(struct settings *one, struct settings *two)
 	igt_assert_eqstr(one->test_list, two->test_list);
 	igt_assert_eqstr(one->name, two->name);
 	igt_assert_eq(one->dry_run, two->dry_run);
+	igt_assert_eq(one->allow_non_root, two->allow_non_root);
 	igt_assert_eq(one->sync, two->sync);
 	igt_assert_eq(one->log_level, two->log_level);
 	igt_assert_eq(one->overwrite, two->overwrite);
@@ -198,6 +201,7 @@ static void assert_settings_equal(struct settings *one, struct settings *two)
 	igt_assert_eqstr(one->results_path, two->results_path);
 	igt_assert_eq(one->piglit_style_dmesg, two->piglit_style_dmesg);
 	igt_assert_eq(one->dmesg_warn_level, two->dmesg_warn_level);
+	igt_assert_eq(one->prune_mode, two->prune_mode);
 }
 
 static void assert_job_list_equal(struct job_list *one, struct job_list *two)
@@ -236,6 +240,16 @@ static void assert_execution_results_exist(int dirfd)
 	assert_execution_created(dirfd, "dmesg.txt");
 }
 
+static void write_packet_with_canary(int fd, struct runnerpacket *packet)
+{
+	uint32_t canary = socket_dump_canary();
+
+	write(fd, &canary, sizeof(canary));
+	write(fd, packet, packet->size);
+
+	free(packet);
+}
+
 igt_main
 {
 	struct settings *settings = malloc(sizeof(*settings));
@@ -264,6 +278,7 @@ igt_main
 
 	igt_subtest("default-settings") {
 		const char *argv[] = { "runner",
+				       "--allow-non-root",
 				       "test-root-dir",
 				       "path-to-results",
 		};
@@ -277,6 +292,7 @@ igt_main
 		igt_assert(!settings->dry_run);
 		igt_assert_eq(settings->include_regexes.size, 0);
 		igt_assert_eq(settings->exclude_regexes.size, 0);
+		igt_assert(igt_list_empty(&settings->env_vars));
 		igt_assert(!settings->sync);
 		igt_assert_eq(settings->log_level, LOG_LEVEL_NORMAL);
 		igt_assert(!settings->overwrite);
@@ -285,6 +301,7 @@ igt_main
 		igt_assert_eq(settings->per_test_timeout, 0);
 		igt_assert_eq(settings->overall_timeout, 0);
 		igt_assert(!settings->use_watchdog);
+		igt_assert_eq(settings->prune_mode, 0);
 		igt_assert(strstr(settings->test_root, "test-root-dir") != NULL);
 		igt_assert(strstr(settings->results_path, "path-to-results") != NULL);
 
@@ -348,6 +365,7 @@ igt_main
 
 		igt_subtest("absolute-path-usage") {
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       "--test-list", pathtotestlist,
 					       testdatadir,
 					       dirname,
@@ -382,6 +400,7 @@ igt_main
 
 	igt_subtest("environment-overrides-test-root-flag") {
 		const char *argv[] = { "runner",
+				       "--allow-non-root",
 				       "test-root-dir",
 				       "path-to-results",
 		};
@@ -414,7 +433,10 @@ igt_main
 
 	igt_subtest("parse-all-settings") {
 		char blacklist_name[PATH_MAX], blacklist2_name[PATH_MAX];
+		struct environment_variable *env_var;
+
 		const char *argv[] = { "runner",
+				       "--allow-non-root",
 				       "-n", "foo",
 				       "--abort-on-monitored-error=taint,lockdep",
 				       "--disk-usage-limit=4096",
@@ -425,6 +447,8 @@ igt_main
 				       "-t", "pattern2",
 				       "-x", "xpattern1",
 				       "-x", "xpattern2",
+				       "-e", "HAVE_A_NICE=TESTING",
+				       "--environment", "ENVS_WITH_JUST_KEYS",
 				       "-b", blacklist_name,
 				       "--blacklist", blacklist2_name,
 				       "-s",
@@ -437,9 +461,15 @@ igt_main
 				       "--use-watchdog",
 				       "--piglit-style-dmesg",
 				       "--dmesg-warn-level=3",
+				       "--collect-code-cov",
+				       "--coverage-per-test",
+				       "--collect-script", "/usr/bin/true",
+				       "--prune-mode=keep-subtests",
 				       "test-root-dir",
 				       "path-to-results",
 		};
+
+		setenv("ENVS_WITH_JUST_KEYS", "SHOULD_WORK", 1);
 
 		sprintf(blacklist_name, "%s/test-blacklist.txt", testdatadir);
 		sprintf(blacklist2_name, "%s/test-blacklist2.txt", testdatadir);
@@ -451,14 +481,28 @@ igt_main
 		igt_assert(strstr(settings->test_list, "path-to-test-list") != NULL);
 		igt_assert_eqstr(settings->name, "foo");
 		igt_assert(settings->dry_run);
+		igt_assert(settings->allow_non_root);
+
 		igt_assert_eq(settings->include_regexes.size, 2);
 		igt_assert_eqstr(settings->include_regexes.regex_strings[0], "pattern1");
 		igt_assert_eqstr(settings->include_regexes.regex_strings[1], "pattern2");
+
 		igt_assert_eq(settings->exclude_regexes.size, 4);
 		igt_assert_eqstr(settings->exclude_regexes.regex_strings[0], "xpattern1");
 		igt_assert_eqstr(settings->exclude_regexes.regex_strings[1], "xpattern2");
 		igt_assert_eqstr(settings->exclude_regexes.regex_strings[2], "xpattern3"); /* From blacklist */
 		igt_assert_eqstr(settings->exclude_regexes.regex_strings[3], "xpattern4"); /* From blacklist2 */
+
+		igt_assert(!igt_list_empty(&settings->env_vars));
+
+		env_var = igt_list_first_entry(&settings->env_vars, env_var, link);
+		igt_assert_eqstr(env_var->key, "HAVE_A_NICE");
+		igt_assert_eqstr(env_var->value, "TESTING");
+
+		env_var = igt_list_last_entry(&settings->env_vars, env_var, link);
+		igt_assert_eqstr(env_var->key, "ENVS_WITH_JUST_KEYS");
+		igt_assert_eqstr(env_var->value, "SHOULD_WORK");
+
 		igt_assert(settings->sync);
 		igt_assert_eq(settings->log_level, LOG_LEVEL_VERBOSE);
 		igt_assert(settings->overwrite);
@@ -467,6 +511,7 @@ igt_main
 		igt_assert_eq(settings->per_test_timeout, 72);
 		igt_assert_eq(settings->overall_timeout, 360);
 		igt_assert(settings->use_watchdog);
+		igt_assert_eq(settings->prune_mode, PRUNE_KEEP_SUBTESTS);
 		igt_assert(strstr(settings->test_root, "test-root-dir") != NULL);
 		igt_assert(strstr(settings->results_path, "path-to-results") != NULL);
 
@@ -484,6 +529,7 @@ igt_main
 
 	igt_subtest("dmesg-warn-level-inferred") {
 		const char *argv[] = { "runner",
+				       "--allow-non-root",
 				       "test-root-dir",
 				       "path-to-results",
 		};
@@ -496,6 +542,7 @@ igt_main
 
 	igt_subtest("dmesg-warn-level-inferred-with-piglit-style") {
 		const char *argv[] = { "runner",
+				       "--allow-non-root",
 				       "--piglit-style-dmesg",
 				       "test-root-dir",
 				       "path-to-results",
@@ -509,6 +556,7 @@ igt_main
 
 	igt_subtest("dmesg-warn-level-overridable-with-piglit-style") {
 		const char *argv[] = { "runner",
+				       "--allow-non-root",
 				       "--piglit-style-dmesg",
 				       "--dmesg-warn-level=3",
 				       "test-root-dir",
@@ -560,6 +608,7 @@ igt_main
 	igt_subtest("abort-conditions") {
 		const char *argv[] = { "runner",
 				       "--abort-on-monitored-error=taint",
+				       "--allow-non-root",
 				       "test-root-dir",
 				       "results-path",
 		};
@@ -619,10 +668,38 @@ igt_main
 		igt_assert_eq_u64(settings->disk_usage_limit, 1024UL * 1024UL * 1024UL);
 	}
 
+	igt_subtest("prune-modes") {
+		const char *argv[] = { "runner",
+			               "--prune-mode=keep-dynamic-subtests",
+				       "test-root-dir",
+				       "results-path",
+		};
+
+		igt_assert(parse_options(ARRAY_SIZE(argv), (char**)argv, settings));
+		igt_assert_eq(settings->prune_mode, PRUNE_KEEP_DYNAMIC);
+
+		argv[1] = "--prune-mode=keep-dynamic";
+		igt_assert(parse_options(ARRAY_SIZE(argv), (char**)argv, settings));
+		igt_assert_eq(settings->prune_mode, PRUNE_KEEP_DYNAMIC);
+
+		argv[1] = "--prune-mode=keep-subtests";
+		igt_assert(parse_options(ARRAY_SIZE(argv), (char**)argv, settings));
+		igt_assert_eq(settings->prune_mode, PRUNE_KEEP_SUBTESTS);
+
+		argv[1] = "--prune-mode=keep-all";
+		igt_assert(parse_options(ARRAY_SIZE(argv), (char**)argv, settings));
+		igt_assert_eq(settings->prune_mode, PRUNE_KEEP_ALL);
+
+		argv[1] = "--prune-mode=keep-requested";
+		igt_assert(parse_options(ARRAY_SIZE(argv), (char**)argv, settings));
+		igt_assert_eq(settings->prune_mode, PRUNE_KEEP_REQUESTED);
+	}
+
 	igt_subtest("parse-clears-old-data") {
 		const char *argv[] = { "runner",
 				       "-n", "foo",
 				       "--dry-run",
+				       "--allow-non-root",
 				       "test-root-dir",
 				       "results-path",
 		};
@@ -656,6 +733,7 @@ igt_main
 
 		igt_subtest("validate-ok") {
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       "--test-list", filename,
 					       testdatadir,
 					       "path-to-results",
@@ -882,6 +960,7 @@ igt_main
 					       "--overall-timeout", "360",
 					       "--use-watchdog",
 					       "--piglit-style-dmesg",
+					       "--prune-mode=keep-all",
 					       testdatadir,
 					       dirname,
 			};
@@ -905,7 +984,7 @@ igt_main
 			close(fd);
 			close(dirfd);
 			clear_directory(dirname);
-			free_settings(cmp_settings);
+			clear_settings(cmp_settings);
 			free(cmp_settings);
 		}
 	}
@@ -981,8 +1060,12 @@ igt_main
 
 		igt_subtest("dry-run-option") {
 			struct execute_state state;
+			struct environment_variable *env_var;
+
 			const char *argv[] = { "runner",
 					       "--dry-run",
+					       "--allow-non-root",
+					       "-e", "JUST_TESTING=ENV_VARS",
 					       "-x", "^abort",
 					       testdatadir,
 					       dirname,
@@ -1009,6 +1092,9 @@ igt_main
 			igt_assert_f((fd = openat(dirfd, "joblist.txt", O_RDONLY)) >= 0,
 				     "Dry run initialization didn't serialize the job list.\n");
 			close(fd);
+			igt_assert_f((fd = openat(dirfd, "environment.txt", O_RDONLY)) >= 0,
+			             "Dry run initialization didn't serialize the environment file.\n");
+			close(fd);
 			igt_assert_f((fd = openat(dirfd, "uname.txt", O_RDONLY)) < 0,
 				     "Dry run initialization created uname.txt.\n");
 
@@ -1029,6 +1115,10 @@ igt_main
 				     "Dry run resume didn't create result directory.\n");
 			igt_assert_f((fd = openat(subdirfd, "journal.txt", O_RDONLY)) >= 0,
 				     "Dry run resume didn't create a journal.\n");
+
+			env_var = igt_list_first_entry(&settings->env_vars, env_var, link);
+			igt_assert_eqstr(env_var->key, "JUST_TESTING");
+			igt_assert_eqstr(env_var->value, "ENV_VARS");
 		}
 
 		igt_fixture {
@@ -1055,6 +1145,7 @@ igt_main
 		igt_subtest("execute-initialize-new-run") {
 			struct execute_state state;
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       testdatadir,
 					       dirname,
 			};
@@ -1102,6 +1193,7 @@ igt_main
 		igt_subtest("execute-initialize-subtest-started") {
 			struct execute_state state;
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       "--multiple-mode",
 					       "-t", "successtest",
 					       testdatadir,
@@ -1125,7 +1217,63 @@ igt_main
 			igt_assert(write(fd, journaltext, strlen(journaltext)) == strlen(journaltext));
 
 			free_job_list(list);
-			free_settings(settings);
+			clear_settings(settings);
+			igt_assert(initialize_execute_state_from_resume(dirfd, &state, settings, list));
+
+			igt_assert_eq(state.next, 0);
+			igt_assert_eq(list->size, 1);
+			igt_assert_eq(list->entries[0].subtest_count, 2);
+			igt_assert_eqstr(list->entries[0].subtests[0], "*");
+			igt_assert_eqstr(list->entries[0].subtests[1], excludestring);
+		}
+
+		igt_fixture {
+			close(fd);
+			close(subdirfd);
+			close(dirfd);
+			clear_directory(dirname);
+			free_job_list(list);
+			free(list);
+		}
+	}
+
+	igt_subtest_group {
+		char dirname[] = "tmpdirXXXXXX";
+		struct job_list *list = malloc(sizeof(*list));
+		volatile int dirfd = -1, subdirfd = -1, fd = -1;
+
+		igt_fixture {
+			init_job_list(list);
+			igt_require(mkdtemp(dirname) != NULL);
+		}
+
+		igt_subtest("execute-initialize-subtest-started-comms") {
+			struct execute_state state;
+			const char *argv[] = { "runner",
+					       "--allow-non-root",
+					       "--multiple-mode",
+					       "-t", "successtest",
+					       testdatadir,
+					       dirname,
+			};
+			const char excludestring[] = "!first-subtest";
+
+			igt_assert(parse_options(ARRAY_SIZE(argv), (char**)argv, settings));
+			igt_assert(create_job_list(list, settings));
+			igt_assert(list->size == 1);
+			igt_assert(list->entries[0].subtest_count == 0);
+
+			igt_assert(serialize_settings(settings));
+			igt_assert(serialize_job_list(list, settings));
+
+			igt_assert((dirfd = open(dirname, O_DIRECTORY | O_RDONLY)) >= 0);
+			igt_assert(mkdirat(dirfd, "0", 0770) == 0);
+			igt_assert((subdirfd = openat(dirfd, "0", O_DIRECTORY | O_RDONLY)) >= 0);
+			igt_assert((fd = openat(subdirfd, "comms", O_CREAT | O_WRONLY | O_EXCL, 0660)) >= 0);
+			write_packet_with_canary(fd, runnerpacket_subtest_start("first-subtest"));
+
+			free_job_list(list);
+			clear_settings(settings);
 			igt_assert(initialize_execute_state_from_resume(dirfd, &state, settings, list));
 
 			igt_assert_eq(state.next, 0);
@@ -1158,6 +1306,7 @@ igt_main
 		igt_subtest("execute-initialize-all-subtests-started") {
 			struct execute_state state;
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       "--multiple-mode",
 					       "-t", "successtest@first-subtest",
 					       "-t", "successtest@second-subtest",
@@ -1181,7 +1330,63 @@ igt_main
 			igt_assert(write(fd, journaltext, strlen(journaltext)) == strlen(journaltext));
 
 			free_job_list(list);
-			free_settings(settings);
+			clear_settings(settings);
+			igt_assert(initialize_execute_state_from_resume(dirfd, &state, settings, list));
+
+			/* All subtests are in journal, the entry should be considered completed */
+			igt_assert_eq(state.next, 1);
+			igt_assert_eq(list->size, 1);
+			igt_assert_eq(list->entries[0].subtest_count, 4);
+		}
+
+		igt_fixture {
+			close(fd);
+			close(subdirfd);
+			close(dirfd);
+			clear_directory(dirname);
+			free_job_list(list);
+			free(list);
+		}
+	}
+
+	igt_subtest_group {
+		char dirname[] = "tmpdirXXXXXX";
+		struct job_list *list = malloc(sizeof(*list));
+		volatile int dirfd = -1, subdirfd = -1, fd = -1;
+
+		igt_fixture {
+			init_job_list(list);
+			igt_require(mkdtemp(dirname) != NULL);
+		}
+
+		igt_subtest("execute-initialize-all-subtests-started-comms") {
+			struct execute_state state;
+			const char *argv[] = { "runner",
+					       "--allow-non-root",
+					       "--multiple-mode",
+					       "-t", "successtest@first-subtest",
+					       "-t", "successtest@second-subtest",
+					       testdatadir,
+					       dirname,
+			};
+
+			igt_assert(parse_options(ARRAY_SIZE(argv), (char**)argv, settings));
+			igt_assert(create_job_list(list, settings));
+			igt_assert(list->size == 1);
+			igt_assert(list->entries[0].subtest_count == 2);
+
+			igt_assert(serialize_settings(settings));
+			igt_assert(serialize_job_list(list, settings));
+
+			igt_assert((dirfd = open(dirname, O_DIRECTORY | O_RDONLY)) >= 0);
+			igt_assert(mkdirat(dirfd, "0", 0770) == 0);
+			igt_assert((subdirfd = openat(dirfd, "0", O_DIRECTORY | O_RDONLY)) >= 0);
+			igt_assert((fd = openat(subdirfd, "comms", O_CREAT | O_WRONLY | O_EXCL, 0660)) >= 0);
+			write_packet_with_canary(fd, runnerpacket_subtest_start("first-subtest"));
+			write_packet_with_canary(fd, runnerpacket_subtest_start("second-subtest"));
+
+			free_job_list(list);
+			clear_settings(settings);
 			igt_assert(initialize_execute_state_from_resume(dirfd, &state, settings, list));
 
 			/* All subtests are in journal, the entry should be considered completed */
@@ -1213,6 +1418,7 @@ igt_main
 		igt_subtest("execute-initialize-subtests-complete") {
 			struct execute_state state;
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       "--multiple-mode",
 					       testdatadir,
 					       dirname,
@@ -1241,7 +1447,67 @@ igt_main
 			igt_assert_eq(write(fd, journaltext, sizeof(journaltext)), sizeof(journaltext));
 
 			free_job_list(list);
-			free_settings(settings);
+			clear_settings(settings);
+			igt_assert(initialize_execute_state_from_resume(dirfd, &state, settings, list));
+
+			igt_assert_eq(state.next, 1);
+			igt_assert_eq(list->size, NUM_TESTDATA_BINARIES);
+		}
+
+		igt_fixture {
+			close(fd);
+			close(subdirfd);
+			close(dirfd);
+			clear_directory(dirname);
+			free_job_list(list);
+			free(list);
+		}
+	}
+
+	igt_subtest_group {
+		char dirname[] = "tmpdirXXXXXX";
+		struct job_list *list = malloc(sizeof(*list));
+		volatile int dirfd = -1, subdirfd = -1, fd = -1;
+
+		igt_fixture {
+			init_job_list(list);
+			igt_require(mkdtemp(dirname) != NULL);
+		}
+
+		igt_subtest("execute-initialize-subtests-complete-comms") {
+			struct execute_state state;
+			const char *argv[] = { "runner",
+					       "--allow-non-root",
+					       "--multiple-mode",
+					       testdatadir,
+					       dirname,
+			};
+
+			igt_assert(parse_options(ARRAY_SIZE(argv), (char**)argv, settings));
+			igt_assert(create_job_list(list, settings));
+			igt_assert(list->size == NUM_TESTDATA_BINARIES);
+
+			if (!strcmp(list->entries[0].binary, "no-subtests")) {
+				struct job_list_entry tmp = list->entries[0];
+				list->entries[0] = list->entries[1];
+				list->entries[1] = tmp;
+			}
+
+			igt_assert(list->entries[0].subtest_count == 0);
+
+			igt_assert(serialize_settings(settings));
+			igt_assert(serialize_job_list(list, settings));
+
+			igt_assert_lte(0, dirfd = open(dirname, O_DIRECTORY | O_RDONLY));
+			igt_assert_eq(mkdirat(dirfd, "0", 0770), 0);
+			igt_assert((subdirfd = openat(dirfd, "0", O_DIRECTORY | O_RDONLY)) >= 0);
+			igt_assert((fd = openat(subdirfd, "comms", O_CREAT | O_WRONLY | O_EXCL, 0660)) >= 0);
+			write_packet_with_canary(fd, runnerpacket_subtest_start("first-subtest"));
+			write_packet_with_canary(fd, runnerpacket_subtest_start("second-subtest"));
+			write_packet_with_canary(fd, runnerpacket_exit(0, "0.000s"));
+
+			free_job_list(list);
+			clear_settings(settings);
 			igt_assert(initialize_execute_state_from_resume(dirfd, &state, settings, list));
 
 			igt_assert_eq(state.next, 1);
@@ -1278,6 +1544,7 @@ igt_main
 			igt_subtest_f("execute-subtests-%s", multiple ? "multiple" : "normal") {
 				struct execute_state state;
 				const char *argv[] = { "runner",
+						       "--allow-non-root",
 						       multiple ? "--multiple-mode" : "--sync",
 						       "-t", "successtest.*-subtest",
 						       testdatadir,
@@ -1406,6 +1673,8 @@ igt_main
 			char dirname[] = "tmpdirXXXXXX";
 
 			igt_fixture {
+				/* This test checks that the stdout parsing for result without time data works, so use that */
+				setenv("IGT_RUNNER_DISABLE_SOCKET_COMMUNICATION", "1", 1);
 				igt_require(mkdtemp(dirname) != NULL);
 				rmdir(dirname);
 			}
@@ -1413,6 +1682,7 @@ igt_main
 			igt_subtest_f("execute-skipper-journal-%s", multiple ? "multiple" : "normal") {
 				struct execute_state state;
 				const char *argv[] = { "runner",
+						       "--allow-non-root",
 						       multiple ? "--multiple-mode" : "--sync",
 						       "-t", "skippers",
 						       testdatadir,
@@ -1469,6 +1739,7 @@ igt_main
 				close(dirfd);
 				clear_directory(dirname);
 				free_job_list(list);
+				unsetenv("IGT_RUNNER_DISABLE_SOCKET_COMMUNICATION");
 			}
 		}
 
@@ -1499,6 +1770,7 @@ igt_main
 			struct execute_state state;
 			struct json_object *results, *tests;
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       "--test-list", filename,
 					       testdatadir,
 					       dirname,
@@ -1554,6 +1826,7 @@ igt_main
 			struct execute_state state;
 			struct json_object *results, *tests;
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       "-t", "^dynamic$",
 					       testdatadir,
 					       dirname,
@@ -1599,6 +1872,7 @@ igt_main
 			struct execute_state state;
 			struct json_object *results, *tests;
 			const char *argv[] = { "runner",
+					       "--allow-non-root",
 					       "-t", "^abort-simple$",
 					       testdatadir,
 					       dirname,
@@ -1646,6 +1920,7 @@ igt_main
 				struct execute_state state;
 				struct json_object *results, *tests;
 				const char *argv[] = { "runner",
+						       "--allow-non-root",
 						       "-t", "^abort$",
 						       multiple ? "--multiple-mode" : "--sync",
 						       testdatadir,
@@ -1701,6 +1976,7 @@ igt_main
 				struct execute_state state;
 				struct json_object *results, *tests;
 				const char *argv[] = { "runner", multiple ? "--multiple-mode" : "--sync",
+						       "--allow-non-root",
 						       "-t", "^abort-fixture$",
 						       testdatadir,
 						       dirname,
@@ -1767,6 +2043,7 @@ igt_main
 				struct execute_state state;
 				struct json_object *results, *tests;
 				const char *argv[] = { "runner", multiple ? "--multiple-mode" : "--sync",
+						       "--allow-non-root",
 						       "--test-list", filename,
 						       testdatadir,
 						       dirname,
@@ -1822,6 +2099,7 @@ igt_main
 				struct execute_state state;
 				struct json_object *results, *tests;
 				const char *argv[] = { "runner", multiple ? "--multiple-mode" : "--sync",
+						       "--allow-non-root",
 						       "-t", "^abort-dynamic$",
 						       testdatadir,
 						       dirname,
@@ -1880,7 +2158,7 @@ igt_main
 	}
 
 	igt_fixture {
-		free_settings(settings);
+		clear_settings(settings);
 		free(settings);
 	}
 }

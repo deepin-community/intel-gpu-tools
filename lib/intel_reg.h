@@ -880,6 +880,43 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define VSYNC_EDP	0x6F014
 #define VSYNCSHIFT_EDP	0x6F028
 
+#define TRANS_VRR_CTL_A                0x60420
+#define TRANS_VRR_CTL_B                0x61420
+#define TRANS_VRR_CTL_C                0x62420
+#define TRANS_VRR_CTL_D                0x63420
+#define TRANS_VRR_VMAX_A               0x60424
+#define TRANS_VRR_VMAX_B               0x61424
+#define TRANS_VRR_VMAX_C               0x62424
+#define TRANS_VRR_VMAX_D               0x63424
+#define TRANS_VRR_VMIN_A               0x60434
+#define TRANS_VRR_VMIN_B               0x61434
+#define TRANS_VRR_VMIN_C               0x62434
+#define TRANS_VRR_VMIN_D               0x63434
+#define TRANS_VRR_VMAXSHIFT_A          0x60428
+#define TRANS_VRR_VMAXSHIFT_B          0x61428
+#define TRANS_VRR_VMAXSHIFT_C          0x62428
+#define TRANS_VRR_VMAXSHIFT_D          0x63428
+#define TRANS_VRR_STATUS_A             0x6042C
+#define TRANS_VRR_STATUS_B             0x6142C
+#define TRANS_VRR_STATUS_C             0x6242C
+#define TRANS_VRR_STATUS_D             0x6342C
+#define TRANS_VRR_VTOTAL_PREV_A        0x60480
+#define TRANS_VRR_VTOTAL_PREV_B        0x61480
+#define TRANS_VRR_VTOTAL_PREV_C        0x62480
+#define TRANS_VRR_VTOTAL_PREV_D        0x63480
+#define TRANS_VRR_FLIPLINE_A           0x60438
+#define TRANS_VRR_FLIPLINE_B           0x61438
+#define TRANS_VRR_FLIPLINE_C           0x62438
+#define TRANS_VRR_FLIPLINE_D           0x63438
+#define TRANS_VRR_STATUS2_A            0x6043C
+#define TRANS_VRR_STATUS2_B            0x6143C
+#define TRANS_VRR_STATUS2_C            0x6243C
+#define TRANS_VRR_STATUS2_D            0x6343C
+#define TRANS_PUSH_A                   0x60A70
+#define TRANS_PUSH_B                   0x61A70
+#define TRANS_PUSH_C                   0x62A70
+#define TRANS_PUSH_D                   0x63A70
+
 #define PP_STATUS	0x61200
 # define PP_ON					(1 << 31)
 /*
@@ -2257,6 +2294,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 #define PIPEAFRMCOUNT_G4X	0x70040
 #define PIPEAFLIPCOUNT_G4X	0x70044
+#define PIPEAFRMTMSMTP		0x70048
 /*
  * Computing GMCH M and N values.
  *
@@ -2330,6 +2368,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #define PIPEEDPCONF		0x7F008
 
+#define DSPAADDR_VLV		0x7017C /* vlv/chv */
+#define DSPBADDR_VLV		0x7117C /* vlv/chv */
+#define DSPCADDR_CHV		0x7417C /* chv */
 #define DSPACNTR		0x70180
 #define DSPBCNTR		0x71180
 #define DSPCCNTR		0x72180
@@ -2516,6 +2557,8 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define XY_MONO_SRC_BLT_WRITE_ALPHA	(1<<21)
 #define XY_MONO_SRC_BLT_WRITE_RGB	(1<<20)
 
+#define XY_FAST_COLOR_BLT		((0x2<<29)|(0x44<<22)|0xe)
+
 #define XY_FAST_COPY_BLT				((2<<29)|(0x42<<22)|0x8)
 /* dword 0 */
 #define   XY_FAST_COPY_SRC_TILING_LINEAR		(0 << 20)
@@ -2546,6 +2589,14 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define CTXT_PALETTE_SAVE_DISABLE	(1<<3)
 #define CTXT_PALETTE_RESTORE_DISABLE	(1<<2)
 
+#define MI_SET_APPID                    (0x0E << 23)
+#define APPID_CTXREST_INHIBIT           (1 << 9)
+#define APPID_CTXSAVE_INHIBIT           (1 << 8)
+#define APPTYPE(n)                      ((n) << 7)
+#define  DISPLAY_APPTYPE                (0)
+#define  TRANSCODE_APPTYPE              (1)
+#define APPID(n)                        ((n) & 0x7f)
+
 /* Dword 0 */
 #define MI_VERTEX_BUFFER		(0x17<<23)
 #define MI_VERTEX_BUFFER_IDX(x)		(x<<20)
@@ -2572,8 +2623,14 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #define MI_LOAD_SCAN_LINES_INCL		(0x12<<23)
 #define MI_LOAD_REGISTER_IMM		((0x22 << 23) | 1)
-#define MI_LOAD_REGISTER_MEM_GEN8	((0x29 << 23) | (4 - 2))
+#define MI_LOAD_REGISTER_REG		((0x2A << 23) | 1)
+#define MI_LOAD_REGISTER_MEM		(0x29 << 23)
+#define   MI_CS_MMIO_DST		(1 << 19)
+#define   MI_CS_MMIO_SRC		(1 << 18)
 #define   MI_MMIO_REMAP_ENABLE_GEN12	(1 << 17)
+#define   MI_WPARID_ENABLE_GEN12	(1 << 16)
+#define MI_STORE_REGISTER_MEM		(0x24 << 23)
+#define   MI_STORE_PREDICATE_ENABLE_GEN12 (1 << 21)
 
 /* Flush */
 #define MI_FLUSH			(0x04<<23)
@@ -2591,7 +2648,16 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define MI_NOOP_WRITE_ID		(1<<22)
 #define MI_NOOP_ID_MASK			(1<<22 - 1)
 
+/* ARB Check */
+#define MI_ARB_CHECK                    (0x5 << 23)
+
 #define STATE3D_COLOR_FACTOR	((0x3<<29)|(0x1d<<24)|(0x01<<16))
+
+/* Atomics */
+#define MI_ATOMIC			((0x2f << 23) | 1)
+#define   MI_ATOMIC_INLINE_DATA         (1 << 18)
+#define   MI_ATOMIC_INC                 (0x5 << 8)
+#define   MI_ATOMIC_ADD                 (0x7 << 8)
 
 /* Batch */
 #define MI_BATCH_BUFFER		((0x30 << 23) | 1)
@@ -2600,11 +2666,50 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define   MI_BATCH_PREDICATE       (1 << 15) /* HSW+ on RCS only*/
 #define MI_BATCH_BUFFER_END	(0xA << 23)
 #define MI_COND_BATCH_BUFFER_END	(0x36 << 23)
+#define   MAD_GT_IDD                    (0 << 12)
+#define   MAD_GT_OR_EQ_IDD              (1 << 12)
+#define   MAD_LT_IDD                    (2 << 12)
+#define   MAD_LT_OR_EQ_IDD              (3 << 12)
+#define   MAD_EQ_IDD                    (4 << 12)
+#define   MAD_NEQ_IDD                   (5 << 12)
 #define MI_DO_COMPARE                   (1 << 21)
 
 #define MI_BATCH_NON_SECURE		(1)
 #define MI_BATCH_NON_SECURE_I965	(1 << 8)
 #define MI_BATCH_NON_SECURE_HSW		(1<<13) /* Additional bit for RCS */
+
+/* Math */
+#define MI_INSTR(opcode, flags)         (((opcode) << 23) | (flags))
+#define MI_MATH(x)                      MI_INSTR(0x1a, (x) - 1)
+#define MI_MATH_INSTR(opcode, op1, op2) ((opcode) << 20 | (op1) << 10 | (op2))
+/* Opcodes for MI_MATH_INSTR */
+#define   MI_MATH_NOOP                  MI_MATH_INSTR(0x000, 0x0, 0x0)
+#define   MI_MATH_LOAD(op1, op2)        MI_MATH_INSTR(0x080, op1, op2)
+#define   MI_MATH_LOADINV(op1, op2)     MI_MATH_INSTR(0x480, op1, op2)
+#define   MI_MATH_LOAD0(op1)            MI_MATH_INSTR(0x081, op1)
+#define   MI_MATH_LOAD1(op1)            MI_MATH_INSTR(0x481, op1)
+#define   MI_MATH_ADD                   MI_MATH_INSTR(0x100, 0x0, 0x0)
+#define   MI_MATH_SUB                   MI_MATH_INSTR(0x101, 0x0, 0x0)
+#define   MI_MATH_AND                   MI_MATH_INSTR(0x102, 0x0, 0x0)
+#define   MI_MATH_OR                    MI_MATH_INSTR(0x103, 0x0, 0x0)
+#define   MI_MATH_XOR                   MI_MATH_INSTR(0x104, 0x0, 0x0)
+#define   MI_MATH_STORE(op1, op2)       MI_MATH_INSTR(0x180, op1, op2)
+#define   MI_MATH_STOREINV(op1, op2)    MI_MATH_INSTR(0x580, op1, op2)
+/* DG2+ */
+#define   MI_MATH_SHL                   MI_MATH_INSTR(0x105, 0x0, 0x0)
+#define   MI_MATH_SHR                   MI_MATH_INSTR(0x106, 0x0, 0x0)
+#define   MI_MATH_SAR                   MI_MATH_INSTR(0x107, 0x0, 0x0)
+
+/* Registers used as operands in MI_MATH_INSTR */
+#define   MI_MATH_REG(x)                (x)
+#define   MI_MATH_REG_SRCA              0x20
+#define   MI_MATH_REG_SRCB              0x21
+#define   MI_MATH_REG_ACCU              0x31
+#define   MI_MATH_REG_ZF                0x32
+#define   MI_MATH_REG_CF                0x33
+
+/* DG2+ */
+#define MI_SET_PREDICATE                MI_INSTR(0x1, 0)
 
 #define MAX_DISPLAY_PIPES	2
 
@@ -2761,6 +2866,8 @@ typedef enum {
 #define MCHBAR_RENDER_STANDBY	0x111B8
 #define RENDER_STANDBY_ENABLE	(1 << 30)
 
+#define ILK_TIMESTAMP_HI        0x70070
+#define IVB_TIMESTAMP_CTR       0x44070
 
 /* Ironlake */
 

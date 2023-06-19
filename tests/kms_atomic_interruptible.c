@@ -49,7 +49,6 @@ static int block_plane(igt_display_t *display, igt_output_t *output, enum plane_
 
 		if (test_type == test_legacy_modeset || test_type == test_atomic_modeset) {
 			igt_output_set_pipe(output, PIPE_NONE);
-			igt_plane_set_fb(plane, NULL);
 		}
 		igt_plane_set_fence_fd(plane, sw_sync_timeline_create_fence(timeline, 1));
 
@@ -97,16 +96,16 @@ static void run_plane_test(igt_display_t *display, enum pipe pipe, igt_output_t 
 	mode = igt_output_get_mode(output);
 
 	igt_create_fb(display->drm_fd, mode->hdisplay, mode->vdisplay,
-		      DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE, &fb);
+		      DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR, &fb);
 
 	switch (plane_type) {
 	case DRM_PLANE_TYPE_PRIMARY:
 		igt_create_fb(display->drm_fd, mode->hdisplay, mode->vdisplay,
-			      DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE, &fb2);
+			      DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR, &fb2);
 		break;
 	case DRM_PLANE_TYPE_CURSOR:
 		igt_create_fb(display->drm_fd, 64, 64,
-		      DRM_FORMAT_ARGB8888, LOCAL_DRM_FORMAT_MOD_NONE, &fb2);
+		      DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR, &fb2);
 		break;
 	}
 
@@ -350,5 +349,6 @@ igt_main
 	/* TODO: legacy gamma_set/get, object set/getprop, getcrtc, getconnector */
 	igt_fixture {
 		igt_display_fini(&display);
+		close(display.drm_fd);
 	}
 }

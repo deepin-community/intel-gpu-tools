@@ -29,8 +29,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/perf.h"
 #include "igt.h"
 #include "igt_device_scan.h"
@@ -52,6 +54,8 @@ struct hotunplug {
 	const char *failure;
 	bool need_healthcheck;
 	bool has_intel_perf;
+ 	char *snd_driver;
+	int chipset;
 };
 
 /* Helpers */
@@ -137,17 +141,32 @@ static void prepare(struct hotunplug *priv)
 static void driver_unbind(struct hotunplug *priv, const char *prefix,
 			  int timeout)
 {
+	/*
+	 * FIXME: on some devices, the audio driver (snd_hda_intel)
+	 * binds into the i915 driver. On such hardware, kernel warnings
+	 * and errors may happen if i915 is unbind/removed before removing
+	 * first the audio driver.
+	 * So, add a logic that unloads the audio driver before trying to
+	 * unbind i915 driver, reloading it when binding again.
+	 */
+	if (igt_audio_driver_unload(&priv->snd_driver)) {
+		igt_skip("Audio driver %s in use, skipping test\n",
+			 priv->snd_driver);
+	} else if (priv->snd_driver) {
+		igt_info("Unloaded audio driver %s\n", priv->snd_driver);
+	}
+
 	local_debug("%sunbinding the driver from the device\n", prefix);
 	priv->failure = "Driver unbind failure!";
 
 	igt_set_timeout(timeout, "Driver unbind timeout!");
 	igt_assert_f(igt_sysfs_set(priv->fd.sysfs_drv, "unbind",
 				   priv->dev_bus_addr),
-		     "Driver unbind failure!\n");
+		     "Driver unbind failure (%s)!\n", priv->dev_bus_addr);
 	igt_reset_timeout();
 
 	igt_assert_f(faccessat(priv->fd.sysfs_drv, priv->dev_bus_addr, F_OK, 0),
-		     "Unbound device still present\n");
+		     "Unbound device still present (%s)\n", priv->dev_bus_addr);
 }
 
 /* Re-bind the driver to the device */
@@ -159,12 +178,19 @@ static void driver_bind(struct hotunplug *priv, int timeout)
 	igt_set_timeout(timeout, "Driver re-bind timeout!");
 	igt_assert_f(igt_sysfs_set(priv->fd.sysfs_drv, "bind",
 				   priv->dev_bus_addr),
-		     "Driver re-bind failure\n!");
+		     "Driver re-bind failure (%s)!\n", priv->dev_bus_addr);
 	igt_reset_timeout();
 
 	igt_fail_on_f(faccessat(priv->fd.sysfs_drv, priv->dev_bus_addr,
 				F_OK, 0),
-		      "Rebound device not present!\n");
+		      "Rebound device not present (%s)!\n", priv->dev_bus_addr);
+
+	if (priv->snd_driver) {
+		igt_info("Realoading %s\n", priv->snd_driver);
+		igt_kmod_load(priv->snd_driver, NULL);
+		free(priv->snd_driver);
+		priv->snd_driver = NULL;
+	}
 }
 
 /* Remove (virtually unplug) the device from its bus */
@@ -172,6 +198,21 @@ static void device_unplug(struct hotunplug *priv, const char *prefix,
 			  int timeout)
 {
 	igt_require(priv->fd.sysfs_dev == -1);
+
+	/*
+	 * FIXME: on some devices, the audio driver (snd_hda_intel)
+	 * binds into the i915 driver. On such hardware, kernel warnings
+	 * and errors may happen if i915 is unbind/removed before removing
+	 * first the audio driver.
+	 * So, add a logic that unloads the audio driver before trying to
+	 * unbind i915 driver, reloading it when binding again.
+	 */
+	if (igt_audio_driver_unload(&priv->snd_driver)) {
+		igt_skip("Audio driver %s in use, skipping test\n",
+			 priv->snd_driver);
+	} else if (priv->snd_driver) {
+		igt_info("Unloaded audio driver %s\n", priv->snd_driver);
+	}
 
 	priv->fd.sysfs_dev = openat(priv->fd.sysfs_bus, priv->dev_bus_addr,
 				    O_DIRECTORY);
@@ -189,7 +230,7 @@ static void device_unplug(struct hotunplug *priv, const char *prefix,
 	igt_assert_eq(priv->fd.sysfs_dev, -1);
 
 	igt_assert_f(faccessat(priv->fd.sysfs_bus, priv->dev_bus_addr, F_OK, 0),
-		     "Unplugged device still present\n");
+		     "Unplugged device still present (%s)\n", priv->dev_bus_addr);
 }
 
 /* Re-discover the device by rescanning its bus */
@@ -205,7 +246,14 @@ static void bus_rescan(struct hotunplug *priv, int timeout)
 
 	igt_fail_on_f(faccessat(priv->fd.sysfs_bus, priv->dev_bus_addr,
 				F_OK, 0),
-		      "Fakely unplugged device not rediscovered!\n");
+		      "Fakely unplugged device not rediscovered (%s)!\n", priv->dev_bus_addr);
+
+	if (priv->snd_driver) {
+		igt_info("Realoading %s\n", priv->snd_driver);
+		igt_kmod_load(priv->snd_driver, NULL);
+		free(priv->snd_driver);
+		priv->snd_driver = NULL;
+	}
 }
 
 static void cleanup(struct hotunplug *priv)
@@ -258,6 +306,7 @@ static int local_i915_healthcheck(int i915, const char *prefix)
 		.buffer_count = 1,
 	};
 	const struct intel_execution_engine2 *engine;
+	const intel_ctx_t *ctx;
 	int fence = -1, err = 0, status = 1;
 
 	local_debug("%s%s\n", prefix, "running i915 GPU healthcheck");
@@ -269,7 +318,9 @@ static int local_i915_healthcheck(int i915, const char *prefix)
 	gem_write(i915, obj.handle, 0, &bbe, sizeof(bbe));
 
 	/* As soon as a fence is open, don't fail before closing it */
-	__for_each_physical_engine(i915, engine) {
+	ctx = intel_ctx_create_all_physical(i915);
+	for_each_ctx_engine(i915, ctx, engine) {
+		execbuf.rsvd1 = ctx->id;
 		execbuf.flags = engine->flags | I915_EXEC_FENCE_OUT;
 		err = __gem_execbuf_wr(i915, &execbuf);
 		if (igt_warn_on_f(err < 0, "__gem_execbuf_wr() returned %d\n",
@@ -283,6 +334,7 @@ static int local_i915_healthcheck(int i915, const char *prefix)
 			break;
 		}
 	}
+	intel_ctx_destroy(i915, ctx);
 	if (fence >= 0) {
 		status = sync_fence_wait(fence, -1);
 		if (igt_warn_on_f(status < 0, "sync_fence_wait() returned %d\n",
@@ -346,7 +398,7 @@ static void node_healthcheck(struct hotunplug *priv, unsigned flags)
 	if (closed)	/* store fd for cleanup if not dirty */
 		priv->fd.drm_hc = fd_drm;
 
-	if (is_i915_device(fd_drm)) {
+	if (priv->chipset == DRIVER_INTEL) {
 		/* don't report library failed asserts as healthcheck failure */
 		priv->failure = "Unrecoverable test failure";
 		if (local_i915_healthcheck(fd_drm, "") &&
@@ -411,7 +463,12 @@ static void pre_check(struct hotunplug *priv)
 
 static void recover(struct hotunplug *priv)
 {
+	bool late_close = priv->fd.drm >= 0;
+
 	cleanup(priv);
+
+	if (!priv->failure && late_close)
+		igt_ignore_warn(healthcheck(priv, false));
 
 	/* unbind the driver from a possibly hot rebound unhealthy device */
 	if (!faccessat(priv->fd.sysfs_drv, priv->dev_bus_addr, F_OK, 0) &&
@@ -573,6 +630,8 @@ igt_main
 		.failure	= NULL,
 		.need_healthcheck = true,
 		.has_intel_perf = false,
+		.snd_driver	= NULL,
+		.chipset	= DRIVER_ANY,
 	};
 
 	igt_fixture {
@@ -582,25 +641,12 @@ igt_main
 		igt_skip_on_f(fd_drm < 0, "No known DRM device found\n");
 
 		if (is_i915_device(fd_drm)) {
-			uint32_t devid = intel_get_drm_devid(fd_drm);
+			priv.chipset = DRIVER_INTEL;
 
 			gem_quiescent_gpu(fd_drm);
 			igt_require_gem(fd_drm);
 
 			priv.has_intel_perf = local_i915_perf_healthcheck(fd_drm);
-
-			/**
-			 * FIXME: Unbinding the i915 driver on some Haswell
-			 * platforms with Azalia audio results in a kernel WARN
-			 * on "i915 raw-wakerefs=1 wakelocks=1 on cleanup".  The
-			 * below CI friendly user level workaround prevents the
-			 * warning from appearing.  Drop this hack as soon as
-			 * this is fixed in the kernel.
-			 */
-			if (igt_warn_on_f(IS_HASWELL(devid) ||
-					  IS_BROADWELL(devid),
-			    "Manually enabling audio PM to work around a kernel WARN\n"))
-				igt_pm_enable_audio_runtime_pm();
 		}
 
 		/* Make sure subtests always reopen the same device */

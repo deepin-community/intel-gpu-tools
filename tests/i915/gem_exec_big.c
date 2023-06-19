@@ -46,6 +46,7 @@
 
 #include "drm.h"
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 
 IGT_TEST_DESCRIPTION("Run a large nop batch to stress test the error capture"
@@ -54,6 +55,7 @@ IGT_TEST_DESCRIPTION("Run a large nop batch to stress test the error capture"
 #define FORCE_PREAD_PWRITE 0
 
 static int use_64bit_relocs;
+static bool has_relocs;
 
 static void exec1(int fd, uint32_t handle, uint64_t reloc_ofs, unsigned flags, char *ptr)
 {
@@ -69,7 +71,7 @@ static void exec1(int fd, uint32_t handle, uint64_t reloc_ofs, unsigned flags, c
 	gem_reloc[0].presumed_offset = 0;
 
 	gem_exec[0].handle = handle;
-	gem_exec[0].relocation_count = 1;
+	gem_exec[0].relocation_count = has_relocs ? 1 : 0;
 	gem_exec[0].relocs_ptr = to_user_pointer(gem_reloc);
 	gem_exec[0].alignment = 0;
 	gem_exec[0].offset = 0;
@@ -96,8 +98,12 @@ static void exec1(int fd, uint32_t handle, uint64_t reloc_ofs, unsigned flags, c
 
 	gem_execbuf(fd, &execbuf);
 
-	igt_warn_on(gem_reloc[0].presumed_offset == -1);
 	gem_set_domain(fd, gem_exec[0].handle, I915_GEM_DOMAIN_WC, 0);
+
+	if (!has_relocs)
+		return;
+
+	igt_warn_on(gem_reloc[0].presumed_offset == -1);
 
 	if (use_64bit_relocs) {
 		uint64_t tmp;
@@ -133,11 +139,13 @@ static void execN(int fd, uint32_t handle, uint64_t batch_size, unsigned flags, 
 #define reloc_ofs(N, T) ((((N)+1) << 12) - 4*(1 + ((N) == ((T)-1))))
 	struct drm_i915_gem_execbuffer2 execbuf;
 	struct drm_i915_gem_exec_object2 gem_exec[1];
-	struct drm_i915_gem_relocation_entry *gem_reloc;
-	uint64_t n, nreloc = batch_size >> 12;
+	struct drm_i915_gem_relocation_entry *gem_reloc = NULL;
+	uint64_t n, nreloc = has_relocs ? batch_size >> 12 : 0;
 
-	gem_reloc = calloc(nreloc, sizeof(*gem_reloc));
-	igt_assert(gem_reloc);
+	if (has_relocs) {
+		gem_reloc = calloc(nreloc, sizeof(*gem_reloc));
+		igt_assert(gem_reloc);
+	}
 
 	for (n = 0; n < nreloc; n++) {
 		gem_reloc[n].offset = reloc_ofs(n, nreloc);
@@ -172,6 +180,10 @@ static void execN(int fd, uint32_t handle, uint64_t batch_size, unsigned flags, 
 	igt_permute_array(gem_reloc, nreloc, xchg_reloc);
 
 	gem_execbuf(fd, &execbuf);
+
+	if (!has_relocs)
+		return;
+
 	for (n = 0; n < nreloc; n++) {
 		if (igt_warn_on(gem_reloc[n].presumed_offset == -1))
 			break;
@@ -209,7 +221,7 @@ static void exhaustive(int fd)
 
 	max = 3 * gem_aperture_size(fd) / 4;
 	ggtt_max = 3 * gem_global_aperture_size(fd) / 4;
-	intel_require_memory(1, max, CHECK_RAM);
+	igt_require_memory(1, max, CHECK_RAM);
 
 	for (batch_size = 4096; batch_size <= max; ) {
 		uint32_t handle;
@@ -266,7 +278,7 @@ static void single(int i915)
 	uint32_t handle;
 	void *ptr;
 
-	batch_size = (intel_get_avail_ram_mb() / 2) << 20; /* XXX CI slack? */
+	batch_size = (igt_get_avail_ram_mb() / 2) << 20; /* XXX CI slack? */
 	limit = gem_aperture_size(i915) - (256 << 10); /* low pages reserved */
 	if (!gem_uses_full_ppgtt(i915))
 		limit = 3 * limit / 4;
@@ -277,7 +289,7 @@ static void single(int i915)
 		 batch_size >> 20,
 		 gem_uses_full_ppgtt(i915) ? "" : "shared ",
 		 gem_aperture_size(i915) >> 20);
-	intel_require_memory(1, batch_size, CHECK_RAM);
+	igt_require_memory(1, batch_size, CHECK_RAM);
 
 	handle = gem_create(i915, batch_size);
 	gem_write(i915, handle, 0, &bbe, sizeof(bbe));
@@ -304,6 +316,7 @@ igt_main
 		igt_require_gem(i915);
 
 		use_64bit_relocs = intel_gen(intel_get_drm_devid(i915)) >= 8;
+		has_relocs = gem_has_relocations(i915);
 	}
 
 	igt_subtest("single")

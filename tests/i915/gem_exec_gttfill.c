@@ -22,7 +22,9 @@
  */
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
+#include "igt_device_scan.h"
 #include "igt_rand.h"
 
 IGT_TEST_DESCRIPTION("Fill the GTT with batches.");
@@ -32,6 +34,7 @@ IGT_TEST_DESCRIPTION("Fill the GTT with batches.");
 struct batch {
 	uint32_t handle;
 	void *ptr;
+	uint64_t offset;
 };
 
 static void xchg_batch(void *array, unsigned int i, unsigned int j)
@@ -44,7 +47,7 @@ static void xchg_batch(void *array, unsigned int i, unsigned int j)
 	batches[j] = tmp;
 }
 
-static void submit(int fd, int gen,
+static void submit(int fd, uint64_t ahnd, unsigned int gen,
 		   struct drm_i915_gem_execbuffer2 *eb,
 		   struct drm_i915_gem_relocation_entry *reloc,
 		   struct batch *batches, unsigned int count)
@@ -55,7 +58,7 @@ static void submit(int fd, int gen,
 
 	memset(&obj, 0, sizeof(obj));
 	obj.relocs_ptr = to_user_pointer(reloc);
-	obj.relocation_count = 2;
+	obj.relocation_count = !ahnd ? 2 : 0;
 
 	memset(reloc, 0, 2*sizeof(*reloc));
 	reloc[0].offset = eb->batch_start_offset;
@@ -92,7 +95,17 @@ static void submit(int fd, int gen,
 		reloc[0].target_handle = obj.handle;
 		reloc[1].target_handle = obj.handle;
 
-		obj.offset = 0;
+		if (ahnd) {
+			uint32_t *delta_ptr = batches[i].ptr + reloc[0].delta;
+
+			*delta_ptr = batches[i].offset;
+			batch[1] = batches[i].offset + reloc[0].delta;
+			obj.flags = EXEC_OBJECT_PINNED;
+			obj.offset = batches[i].offset;
+			batch[3] = batches[i].offset;
+		} else {
+			obj.offset = 0;
+		}
 		reloc[0].presumed_offset = obj.offset;
 		reloc[1].presumed_offset = obj.offset;
 
@@ -105,7 +118,7 @@ static void submit(int fd, int gen,
 	gem_sync(fd, obj.handle);
 }
 
-static void fillgtt(int fd, unsigned ring, int timeout)
+static void fillgtt(int fd, const intel_ctx_t *ctx, unsigned ring, int timeout)
 {
 	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
 	struct drm_i915_gem_execbuffer2 execbuf;
@@ -117,6 +130,7 @@ static void fillgtt(int fd, unsigned ring, int timeout)
 	unsigned nengine;
 	unsigned count;
 	uint64_t size;
+	uint64_t ahnd;
 
 	shared = mmap(NULL, 4096, PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	igt_assert(shared != MAP_FAILED);
@@ -125,7 +139,7 @@ static void fillgtt(int fd, unsigned ring, int timeout)
 	if (ring == ALL_ENGINES) {
 		struct intel_execution_engine2 *e;
 
-		__for_each_physical_engine(fd, e) {
+		for_each_ctx_engine(fd, ctx, e) {
 			if (!gem_class_can_store_dword(fd, e->class))
 				continue;
 
@@ -145,7 +159,7 @@ static void fillgtt(int fd, unsigned ring, int timeout)
 	count = size / BATCH_SIZE + 1;
 	igt_debug("Using %'d batches to fill %'llu aperture on %d engines\n",
 		  count, (long long)size, nengine);
-	intel_require_memory(count, BATCH_SIZE, CHECK_RAM);
+	igt_require_memory(count, BATCH_SIZE, CHECK_RAM);
 	intel_detect_and_clear_missed_interrupts(fd);
 
 	igt_nsec_elapsed(&tv);
@@ -154,7 +168,9 @@ static void fillgtt(int fd, unsigned ring, int timeout)
 	execbuf.buffer_count = 1;
 	if (gen < 6)
 		execbuf.flags |= I915_EXEC_SECURE;
+	execbuf.rsvd1 = ctx->id;
 
+	ahnd = get_reloc_ahnd(fd, ctx->id);
 	batches = calloc(count, sizeof(*batches));
 	igt_assert(batches);
 	for (unsigned i = 0; i < count; i++) {
@@ -162,10 +178,12 @@ static void fillgtt(int fd, unsigned ring, int timeout)
 		batches[i].ptr =
 			gem_mmap__device_coherent(fd, batches[i].handle,
 						  0, BATCH_SIZE, PROT_WRITE);
+		batches[i].offset = get_offset(ahnd, batches[i].handle, BATCH_SIZE, 0);
+		batches[i].offset %= (1ull << 32) - BATCH_SIZE;
 	}
 
 	/* Flush all memory before we start the timer */
-	submit(fd, gen, &execbuf, reloc, batches, count);
+	submit(fd, ahnd, gen, &execbuf, reloc, batches, count);
 
 	igt_info("Setup %u batches in %.2fms\n",
 		 count, 1e-6 * igt_nsec_elapsed(&tv));
@@ -177,7 +195,7 @@ static void fillgtt(int fd, unsigned ring, int timeout)
 		execbuf.batch_start_offset = child*64;
 		execbuf.flags |= engines[child];
 		igt_until_timeout(timeout) {
-			submit(fd, gen, &execbuf, reloc, batches, count);
+			submit(fd, ahnd, gen, &execbuf, reloc, batches, count);
 			for (unsigned i = 0; i < count; i++) {
 				uint64_t offset, delta;
 
@@ -208,32 +226,67 @@ static void fillgtt(int fd, unsigned ring, int timeout)
 igt_main
 {
 	const struct intel_execution_engine2 *e;
-	int i915 = -1;
+	const intel_ctx_t *ctx;
+	int i915 = -1, gpu_count;
 
 	igt_fixture {
 		i915 = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(i915);
+		ctx = intel_ctx_create_all_physical(i915);
 		igt_fork_hang_detector(i915);
+		intel_allocator_multiprocess_start();
 	}
 
+	igt_describe("Checks if it can handle enough batches to fill gtt");
 	igt_subtest("basic") /* just enough to run a single pass */
-		fillgtt(i915, ALL_ENGINES, 1);
+		fillgtt(i915, ctx, ALL_ENGINES, 1);
 
+	igt_describe("Checks the correctness of handling enough batches "
+		     "to fill gtt for each engine");
 	igt_subtest_with_dynamic("engines") {
-		__for_each_physical_engine(i915, e) {
+		for_each_ctx_engine(i915, ctx, e) {
 			if (!gem_class_can_store_dword(i915, e->class))
 				continue;
 
 			igt_dynamic_f("%s", e->name)
-				fillgtt(i915, e->flags, 20);
+				fillgtt(i915, ctx, e->flags, 20);
 		}
 	}
 
-	igt_subtest("all")
-		fillgtt(i915, ALL_ENGINES, 20);
+	igt_describe("Stress test check behaviour/correctness of handling"
+		     " batches to fill gtt");
+	igt_subtest("all-engines")
+		fillgtt(i915, ctx, ALL_ENGINES, 20);
 
 	igt_fixture {
 		igt_stop_hang_detector();
+		intel_ctx_destroy(i915, ctx);
+		// prepare multigpu tests
+		gpu_count = igt_device_filter_count();
+	}
+
+	igt_subtest("multigpu-basic") { /* run on two or more discrete cards */
+		igt_require(gpu_count > 1);
+		igt_multi_fork(child, gpu_count) {
+			int g_fd;
+			// prepare
+			g_fd = __drm_open_driver_another(child, DRIVER_INTEL);
+			igt_assert(g_fd >= 0);
+			ctx = intel_ctx_create_all_physical(g_fd);
+			igt_fork_hang_detector(g_fd);
+			// subtest
+			fillgtt(g_fd, ctx, ALL_ENGINES, 1);
+			// release resources
+			igt_stop_hang_detector();
+			intel_ctx_destroy(g_fd, ctx);
+			close(g_fd);
+		}
+
+		igt_waitchildren();
+	}
+
+	igt_fixture {
+		intel_allocator_multiprocess_stop();
 		close(i915);
 	}
 }

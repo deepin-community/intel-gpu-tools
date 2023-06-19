@@ -250,16 +250,37 @@ find_intel_render_node(void)
 	return -1;
 }
 
+static void
+print_intel_devices(void)
+{
+	fprintf(stdout, "Available devices:\n");
+	for (int i = 0; i < 128; i++) {
+		if (read_device_param("card", i, "vendor") == 0x8086) {
+			uint32_t devid = read_device_param("card", i, "device");
+			const struct intel_device_info *devinfo =
+				intel_get_device_info(devid);
+			fprintf(stdout, "   %i: %s (0x%04hx)\n", i,
+				devinfo ? devinfo->codename : "unknwon",
+				devid);
+		}
+	}
+}
+
 static int
-open_render_node(uint32_t *devid)
+open_render_node(uint32_t *devid, int card)
 {
 	char *name;
 	int ret;
 	int fd;
+	int render;
 
-	int render = find_intel_render_node();
-	if (render < 0)
-		return -1;
+	if (card < 0) {
+		render = find_intel_render_node();
+		if (render < 0)
+			return -1;
+	} else {
+		render = 128 + card;
+	}
 
 	ret = asprintf(&name, "/dev/dri/renderD%u", render);
 	assert(ret != -1);
@@ -307,7 +328,7 @@ perf_ioctl(int fd, unsigned long request, void *arg)
 }
 
 static uint64_t
-get_device_timestamp_frequency(const struct intel_device_info *devinfo, int drm_fd)
+get_device_cs_timestamp_frequency(const struct intel_device_info *devinfo, int drm_fd)
 {
 	drm_i915_getparam_t gp;
 	int timestamp_frequency;
@@ -317,14 +338,45 @@ get_device_timestamp_frequency(const struct intel_device_info *devinfo, int drm_
 	if (perf_ioctl(drm_fd, DRM_IOCTL_I915_GETPARAM, &gp) == 0)
 		return timestamp_frequency;
 
-	if (devinfo->gen > 9) {
+	if (devinfo->graphics_ver > 9) {
 		fprintf(stderr, "Unable to query timestamp frequency from i915, please update kernel.\n");
 		return 0;
 	}
 
 	fprintf(stderr, "Warning: unable to query timestamp frequency from i915, guessing values...\n");
 
-	if (devinfo->gen <= 8)
+	if (devinfo->graphics_ver <= 8)
+		return 12500000;
+	if (devinfo->is_broxton)
+		return 19200000;
+	return 12000000;
+}
+
+static uint64_t
+get_device_oa_timestamp_frequency(const struct intel_device_info *devinfo, int drm_fd)
+{
+	drm_i915_getparam_t gp;
+	int timestamp_frequency;
+
+	gp.param = I915_PARAM_OA_TIMESTAMP_FREQUENCY;
+	gp.value = &timestamp_frequency;
+	if (perf_ioctl(drm_fd, DRM_IOCTL_I915_GETPARAM, &gp) == 0)
+		return timestamp_frequency;
+
+	gp.param = I915_PARAM_CS_TIMESTAMP_FREQUENCY;
+	gp.value = &timestamp_frequency;
+	if (perf_ioctl(drm_fd, DRM_IOCTL_I915_GETPARAM, &gp) == 0)
+		return timestamp_frequency;
+
+
+	if (devinfo->graphics_ver > 9) {
+		fprintf(stderr, "Unable to query timestamp frequency from i915, please update kernel.\n");
+		return 0;
+	}
+
+	fprintf(stderr, "Warning: unable to query timestamp frequency from i915, guessing values...\n");
+
+	if (devinfo->graphics_ver <= 8)
 		return 12500000;
 	if (devinfo->is_broxton)
 		return 19200000;
@@ -336,7 +388,8 @@ struct recording_context {
 	int perf_fd;
 
 	uint32_t devid;
-	uint64_t timestamp_frequency;
+	uint64_t oa_timestamp_frequency;
+	uint64_t cs_timestamp_frequency;
 
 	const struct intel_device_info *devinfo;
 
@@ -438,7 +491,7 @@ static bool
 write_header(FILE *output, struct recording_context *ctx)
 {
 	struct intel_perf_record_device_info info = {
-		.timestamp_frequency = ctx->timestamp_frequency,
+		.timestamp_frequency = ctx->oa_timestamp_frequency,
 		.device_id = ctx->perf->devinfo.devid,
 		.device_revision = ctx->perf->devinfo.revision,
 		.gt_min_frequency = ctx->perf->devinfo.gt_min_freq,
@@ -534,6 +587,17 @@ static uint64_t timespec_diff(struct timespec *begin,
 }
 
 static clock_t correlation_clock_id = CLOCK_MONOTONIC;
+
+static const char *
+get_correlation_clock_name(clock_t clock_id)
+{
+  switch (clock_id) {
+  case CLOCK_BOOTTIME:      return "bootime";
+  case CLOCK_MONOTONIC:     return "monotonic";
+  case CLOCK_MONOTONIC_RAW: return "monotonic_raw";
+  default:                  return "*unknown*";
+  }
+}
 
 static bool
 get_correlation_timestamps(struct intel_perf_record_timestamp_correlation *corr, int drm_fd)
@@ -722,6 +786,9 @@ usage(const char *name)
 		"Recording tool for i915-perf.\n"
 		"\n"
 		"     --help,               -h          Print this screen\n"
+		"     --device,             -d <value>  Device to use\n"
+		"                                       (value=list to list devices\n"
+		"                                        value=1 to use /dev/dri/card1)\n"
 		"     --correlation-period, -c <value>  Time period of timestamp correlation in seconds\n"
 		"                                       (default = 1.0)\n"
 		"     --perf-period,        -p <value>  Time period of i915-perf reports in seconds\n"
@@ -772,6 +839,7 @@ main(int argc, char *argv[])
 {
 	const struct option long_options[] = {
 		{"help",                       no_argument, 0, 'h'},
+		{"device",               required_argument, 0, 'd'},
 		{"correlation-period",   required_argument, 0, 'c'},
 		{"perf-period",          required_argument, 0, 'p'},
 		{"metric",               required_argument, 0, 'm'},
@@ -798,7 +866,7 @@ main(int argc, char *argv[])
 	struct timespec now;
 	uint64_t corr_period_ns, poll_time_ns;
 	uint32_t circular_size = 0;
-	int opt;
+	int opt, dev_node_id = -1;
 	bool list_counters = false;
 	FILE *output = NULL;
 	struct recording_context ctx = {
@@ -812,13 +880,19 @@ main(int argc, char *argv[])
 		.poll_period = 5 * 1000 * 1000,
 	};
 
-	while ((opt = getopt_long(argc, argv, "hc:p:m:Co:s:f:k:P:", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hc:d:p:m:Co:s:f:k:P:", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'h':
 			usage(argv[0]);
 			return EXIT_SUCCESS;
 		case 'c':
 			corr_period = atof(optarg);
+			break;
+		case 'd':
+			if (!strcmp(optarg, "list"))
+				dev_node_id = -2;
+			else
+				dev_node_id = atoi(optarg);
 			break;
 		case 'p':
 			perf_period = atof(optarg);
@@ -865,7 +939,12 @@ main(int argc, char *argv[])
 		}
 	}
 
-	ctx.drm_fd = open_render_node(&ctx.devid);
+	if (dev_node_id == -2) {
+		print_intel_devices();
+		return EXIT_SUCCESS;
+	}
+
+	ctx.drm_fd = open_render_node(&ctx.devid, dev_node_id);
 	if (ctx.drm_fd < 0) {
 		fprintf(stderr, "Unable to open device.\n");
 		return EXIT_FAILURE;
@@ -878,7 +957,7 @@ main(int argc, char *argv[])
 	}
 
 	fprintf(stdout, "Device name=%s gen=%i gt=%i id=0x%x\n",
-		ctx.devinfo->codename, ctx.devinfo->gen, ctx.devinfo->gt, ctx.devid);
+		ctx.devinfo->codename, ctx.devinfo->graphics_ver, ctx.devinfo->gt, ctx.devid);
 
 	ctx.topology = get_topology(ctx.drm_fd, &ctx.topology_size);
 	if (!ctx.topology) {
@@ -928,7 +1007,8 @@ main(int argc, char *argv[])
 
 	intel_perf_load_perf_configs(ctx.perf, ctx.drm_fd);
 
-	ctx.timestamp_frequency = get_device_timestamp_frequency(ctx.devinfo, ctx.drm_fd);
+	ctx.oa_timestamp_frequency = get_device_oa_timestamp_frequency(ctx.devinfo, ctx.drm_fd);
+	ctx.cs_timestamp_frequency = get_device_cs_timestamp_frequency(ctx.devinfo, ctx.drm_fd);
 
 	signal(SIGINT, sigint_handler);
 
@@ -1000,9 +1080,13 @@ main(int argc, char *argv[])
 		goto fail;
 	}
 
-	ctx.oa_exponent = oa_exponent_for_period(ctx.timestamp_frequency, perf_period);
-	fprintf(stdout, "Opening perf stream with metric_id=%"PRIu64" oa_exponent=%u\n",
-		ctx.metric_set->perf_oa_metrics_set, ctx.oa_exponent);
+	fprintf(stdout, "Using correlation clock: %s\n",
+		get_correlation_clock_name(correlation_clock_id));
+
+	ctx.oa_exponent = oa_exponent_for_period(ctx.oa_timestamp_frequency, perf_period);
+	fprintf(stdout, "Opening perf stream with metric_id=%"PRIu64" oa_exponent=%u oa_format=%u\n",
+		ctx.metric_set->perf_oa_metrics_set, ctx.oa_exponent,
+		ctx.metric_set->perf_oa_format);
 
 	ctx.perf_fd = perf_open(&ctx);
 	if (ctx.perf_fd < 0) {
@@ -1059,6 +1143,11 @@ main(int argc, char *argv[])
 	}
 
 	fprintf(stdout, "Exiting...\n");
+
+	if (!write_i915_perf_data(ctx.output_stream, ctx.perf_fd)) {
+		fprintf(stderr, "Failed to write i915-perf data: %s\n",
+			strerror(errno));
+	}
 
 	if (!write_correlation_timestamps(ctx.output_stream, ctx.drm_fd)) {
 		fprintf(stderr,

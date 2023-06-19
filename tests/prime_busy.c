@@ -24,6 +24,7 @@
 #include <sys/poll.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 
 IGT_TEST_DESCRIPTION("Basic check of polling for prime fences.");
@@ -39,113 +40,38 @@ static bool prime_busy(struct pollfd *pfd, bool excl)
 #define HANG 0x4
 #define POLL 0x8
 
-static void busy(int fd, unsigned ring, unsigned flags)
+static void busy(int fd, const intel_ctx_t *ctx, unsigned ring, unsigned flags)
 {
-	const int gen = intel_gen(intel_get_drm_devid(fd));
-	const uint32_t _bbe = MI_BATCH_BUFFER_END;
-	struct drm_i915_gem_exec_object2 obj[2];
-	struct pollfd pfd[2];
 #define SCRATCH 0
 #define BATCH 1
-	struct drm_i915_gem_relocation_entry store[1024+1];
-	struct drm_i915_gem_execbuffer2 execbuf;
-	unsigned size = ALIGN(ARRAY_SIZE(store)*16 + 4, 4096);
-	struct timespec tv;
-	uint32_t *batch, *bbe;
-	int i, count, timeout;
+	uint32_t handle = gem_create(fd, 4096);
+	struct pollfd pfd[2] = {};
+	uint64_t ahnd;
+	igt_spin_t *spin;
+	int timeout;
 
 	gem_quiescent_gpu(fd);
 
-	memset(&execbuf, 0, sizeof(execbuf));
-	execbuf.buffers_ptr = to_user_pointer(obj);
-	execbuf.buffer_count = 2;
-	execbuf.flags = ring;
-	if (gen < 6)
-		execbuf.flags |= I915_EXEC_SECURE;
-
-	memset(obj, 0, sizeof(obj));
-	obj[SCRATCH].handle = gem_create(fd, 4096);
-
-	obj[BATCH].handle = gem_create(fd, size);
-	obj[BATCH].offset = 1 << 20;
-	gem_write(fd, obj[BATCH].handle, 0, &_bbe, sizeof(_bbe));
-	igt_require(__gem_execbuf(fd, &execbuf) == 0); /* prebind the buffers */
-
-	obj[BATCH].relocs_ptr = to_user_pointer(store);
-	obj[BATCH].relocation_count = ARRAY_SIZE(store);
-	memset(store, 0, sizeof(store));
+	ahnd = get_reloc_ahnd(fd, ctx->id);
+	spin = igt_spin_new(fd,
+			    .ahnd = ahnd,
+			    .ctx = ctx, .engine = ring,
+			    .dependency = handle,
+			    .flags = (flags & HANG ? IGT_SPIN_NO_PREEMPTION : 0));
+	igt_spin_end(spin);
+	gem_sync(fd, spin->handle);
 
 	if (flags & BEFORE) {
-		memset(pfd, 0, sizeof(pfd));
-		pfd[SCRATCH].fd = prime_handle_to_fd(fd, obj[SCRATCH].handle);
-		pfd[BATCH].fd = prime_handle_to_fd(fd, obj[BATCH].handle);
+		pfd[SCRATCH].fd = prime_handle_to_fd(fd, spin->obj[SCRATCH].handle);
+		pfd[BATCH].fd = prime_handle_to_fd(fd, spin->obj[BATCH].handle);
 	}
 
-	batch = gem_mmap__wc(fd, obj[BATCH].handle, 0, size, PROT_WRITE);
-	gem_set_domain(fd, obj[BATCH].handle,
-			I915_GEM_DOMAIN_GTT, I915_GEM_DOMAIN_GTT);
-
-	i = 0;
-	for (count = 0; count < 1024; count++) {
-		uint64_t offset;
-
-		store[count].target_handle = obj[SCRATCH].handle;
-		store[count].presumed_offset = obj[SCRATCH].offset;
-		store[count].offset = sizeof(uint32_t) * (i + 1);
-		store[count].delta = sizeof(uint32_t) * count;
-		store[count].read_domains = I915_GEM_DOMAIN_RENDER;
-		store[count].write_domain = I915_GEM_DOMAIN_RENDER;
-
-		offset = store[count].presumed_offset + store[count].delta;
-
-		batch[i] = MI_STORE_DWORD_IMM | (gen < 6 ? 1 << 22 : 0);
-		if (gen >= 8) {
-			batch[++i] = offset;
-			batch[++i] = offset >> 32;
-		} else if (gen >= 4) {
-			batch[++i] = 0;
-			batch[++i] = offset;
-			store[count].offset += sizeof(uint32_t);
-		} else {
-			batch[i]--;
-			batch[++i] = offset;
-		}
-		batch[++i] = count;
-		i++;
-	}
-
-	bbe = &batch[i];
-	store[count].target_handle = obj[BATCH].handle; /* recurse */
-	store[count].presumed_offset = obj[BATCH].offset;
-	store[count].offset = sizeof(uint32_t) * (i + 1);
-	store[count].delta = 0;
-	store[count].read_domains = I915_GEM_DOMAIN_COMMAND;
-	store[count].write_domain = 0;
-	batch[i] = MI_BATCH_BUFFER_START;
-	if (gen >= 8) {
-		batch[i] |= 1 << 8 | 1;
-		batch[++i] = obj[BATCH].offset;
-		batch[++i] = obj[BATCH].offset >> 32;
-	} else if (gen >= 6) {
-		batch[i] |= 1 << 8;
-		batch[++i] = obj[BATCH].offset;
-	} else {
-		batch[i] |= 2 << 6;
-		batch[++i] = obj[BATCH].offset;
-		if (gen < 4) {
-			batch[i] |= 1;
-			store[count].delta = 1;
-		}
-	}
-	i++;
-
-	igt_assert(i < size/sizeof(*batch));
-	igt_require(__gem_execbuf(fd, &execbuf) == 0);
+	igt_spin_reset(spin);
+	gem_execbuf(fd, &spin->execbuf);
 
 	if (flags & AFTER) {
-		memset(pfd, 0, sizeof(pfd));
-		pfd[SCRATCH].fd = prime_handle_to_fd(fd, obj[SCRATCH].handle);
-		pfd[BATCH].fd = prime_handle_to_fd(fd, obj[BATCH].handle);
+		pfd[SCRATCH].fd = prime_handle_to_fd(fd, spin->obj[SCRATCH].handle);
+		pfd[BATCH].fd = prime_handle_to_fd(fd, spin->obj[BATCH].handle);
 	}
 
 	igt_assert(prime_busy(&pfd[SCRATCH], false));
@@ -156,8 +82,7 @@ static void busy(int fd, unsigned ring, unsigned flags)
 
 	timeout = 120;
 	if ((flags & HANG) == 0) {
-		*bbe = MI_BATCH_BUFFER_END;
-		__sync_synchronize();
+		igt_spin_end(spin);
 		timeout = 1;
 	}
 
@@ -166,26 +91,21 @@ static void busy(int fd, unsigned ring, unsigned flags)
 		pfd[BATCH].events = POLLOUT;
 		igt_assert(poll(pfd, 1, timeout * 1000) == 1);
 	} else {
-		memset(&tv, 0, sizeof(tv));
+		struct timespec tv = {};
 		while (prime_busy(&pfd[BATCH], true))
 			igt_assert(igt_seconds_elapsed(&tv) < timeout);
 	}
 	igt_assert(!prime_busy(&pfd[SCRATCH], true));
 
-	munmap(batch, size);
-	batch = gem_mmap__wc(fd, obj[SCRATCH].handle, 0, 4096, PROT_READ);
-	for (i = 0; i < 1024; i++)
-		igt_assert_eq_u32(batch[i], i);
-	munmap(batch, 4096);
-
-	gem_close(fd, obj[BATCH].handle);
-	gem_close(fd, obj[SCRATCH].handle);
+	igt_spin_free(fd, spin);
+	gem_close(fd, handle);
 
 	close(pfd[BATCH].fd);
 	close(pfd[SCRATCH].fd);
+	put_ahnd(ahnd);
 }
 
-static void test_mode(int fd, unsigned int flags)
+static void test_mode(int fd, const intel_ctx_t *ctx, unsigned int flags)
 {
 	const struct intel_execution_engine2 *e;
 	igt_hang_t hang = {};
@@ -193,17 +113,11 @@ static void test_mode(int fd, unsigned int flags)
 	if ((flags & HANG) == 0)
 		igt_fork_hang_detector(fd);
 	else
-		hang = igt_allow_hang(fd, 0, 0);
+		hang = igt_allow_hang(fd, ctx->id, 0);
 
-	__for_each_physical_engine(fd, e) {
-		if (!gem_class_can_store_dword(fd, e->class))
-			continue;
-
-		if (!gem_class_has_mutable_submission(fd, e->class))
-			continue;
-
+	for_each_ctx_engine(fd, ctx, e) {
 		igt_dynamic_f("%s", e->name)
-			busy(fd, e->flags, flags);
+			busy(fd, ctx, e->flags, flags);
 	}
 
 	if ((flags & HANG) == 0)
@@ -214,11 +128,13 @@ static void test_mode(int fd, unsigned int flags)
 
 igt_main
 {
+	const intel_ctx_t *ctx;
 	int fd = -1;
 
 	igt_fixture {
-		fd = drm_open_driver_master(DRIVER_INTEL);
+		fd = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(fd);
+		ctx = intel_ctx_create_all_physical(fd);
 	}
 
 	igt_subtest_group {
@@ -233,17 +149,19 @@ igt_main
 		};
 
 		igt_fixture
-			gem_require_mmap_wc(fd);
+			gem_require_mmap_device_coherent(fd);
 
 		for (const struct mode *m = modes; m->name; m++) {
 			igt_subtest_with_dynamic(m->name)
-				test_mode(fd, m->flags);
+				test_mode(fd, ctx, m->flags);
 
 			igt_subtest_with_dynamic_f("%s-wait", m->name)
-				test_mode(fd, m->flags | POLL);
+				test_mode(fd, ctx, m->flags | POLL);
 		}
 	}
 
-	igt_fixture
+	igt_fixture {
+		intel_ctx_destroy(fd, ctx);
 		close(fd);
+	}
 }

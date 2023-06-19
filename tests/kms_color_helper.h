@@ -27,7 +27,7 @@
 
 /*
  * This header is for code that is shared between kms_color.c and
- * kms_color_chamelium.c. Reusability elsewhere can be questionable.
+ * kms_chamelium_color.c. Reusability elsewhere can be questionable.
  */
 
 #include <math.h>
@@ -36,6 +36,7 @@
 #include "drm.h"
 #include "drmtest.h"
 #include "igt.h"
+#include "igt_edid.h"
 
 
 /* Internal */
@@ -48,7 +49,11 @@ typedef struct {
 	uint32_t devid;
 	igt_display_t display;
 	igt_pipe_crc_t *pipe_crc;
+	igt_output_t *output;
+	igt_plane_t *primary;
+	drmModeModeInfo *mode;
 
+	uint32_t drm_format;
 	uint32_t color_depth;
 	uint64_t degamma_lut_size;
 	uint64_t gamma_lut_size;
@@ -61,9 +66,11 @@ typedef struct {
 
 typedef struct {
 	int size;
-	double coeffs[];
+	color_t coeffs[];
 } gamma_lut_t;
 
+bool panel_supports_deep_color(int fd, char *output_name);
+uint64_t get_max_bpc(igt_output_t *output);
 void paint_gradient_rectangles(data_t *data,
 			       drmModeModeInfo *mode,
 			       color_t *colors,
@@ -103,8 +110,9 @@ int pipe_set_property_blob_id(igt_pipe_t *pipe,
 int pipe_set_property_blob(igt_pipe_t *pipe,
 			   enum igt_atomic_crtc_properties prop,
 			   void *ptr, size_t length);
-void invalid_gamma_lut_sizes(data_t *data);
-void invalid_degamma_lut_sizes(data_t *data);
-void invalid_ctm_matrix_sizes(data_t *data);
+void invalid_gamma_lut_sizes(data_t *data, enum pipe p);
+void invalid_degamma_lut_sizes(data_t *data, enum pipe p);
+void invalid_ctm_matrix_sizes(data_t *data, enum pipe p);
+
 #endif
 

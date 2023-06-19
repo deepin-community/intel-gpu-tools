@@ -31,6 +31,7 @@
 #endif
 #include <stdio.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <string.h>
@@ -322,10 +323,10 @@ void igt_fork_signal_helper(void)
 	 * and we send the signal at exactly the wrong time).
 	 */
 	signal(SIGCONT, sig_handler);
-	setpgrp(); /* define a new process group for the tests */
+	setpgid(0, 0); /* define a new process group for the tests */
 
 	igt_fork_helper(&signal_helper) {
-		setpgrp(); /* Escape from the test process group */
+		setpgid(0, 0); /* Escape from the test process group */
 
 		/* Pass along the test process group identifier,
 		 * negative pid => send signal to everyone in the group.
@@ -523,6 +524,13 @@ void igt_fork_hang_detector(int fd)
 
 void igt_stop_hang_detector(void)
 {
+	/*
+	 * Give the uevent time to arrive. No sleep at all misses about 20% of
+	 * hangs (at least, in the i915_hangman/detector test). A sleep of 1ms
+	 * seems to miss about 2%, 10ms loses <1%, so 100ms should be safe.
+	 */
+	usleep(100 * 1000);
+
 	igt_stop_helper(&hang_detector);
 }
 
@@ -690,7 +698,8 @@ static int autoresume_delay;
 static const char *suspend_state_name[] = {
 	[SUSPEND_STATE_FREEZE] = "freeze",
 	[SUSPEND_STATE_STANDBY] = "standby",
-	[SUSPEND_STATE_MEM] = "mem",
+	[SUSPEND_STATE_S3] = "mem", /* Forces Suspend-to-Ram (S3) */
+	[SUSPEND_STATE_MEM] = "mem", /* Respects system default */
 	[SUSPEND_STATE_DISK] = "disk",
 };
 
@@ -701,6 +710,12 @@ static const char *suspend_test_name[] = {
 	[SUSPEND_TEST_PLATFORM] = "platform",
 	[SUSPEND_TEST_PROCESSORS] = "processors",
 	[SUSPEND_TEST_CORE] = "core",
+};
+
+static const char *mem_sleep_name[] = {
+	[MEM_SLEEP_S2IDLE] = "s2idle",
+	[MEM_SLEEP_SHALLOW] = "shallow",
+	[MEM_SLEEP_DEEP] = "deep"
 };
 
 static enum igt_suspend_test get_suspend_test(int power_dir)
@@ -801,29 +816,87 @@ static void suspend_via_sysfs(int power_dir, enum igt_suspend_state state)
 				 suspend_state_name[state]));
 }
 
-static uint32_t get_supported_suspend_states(int power_dir)
+static bool is_state_supported(int power_dir, enum igt_suspend_state state)
 {
+	const char *str;
 	char *states;
-	char *state_name;
-	uint32_t state_mask;
 
 	igt_assert((states = igt_sysfs_get(power_dir, "state")));
-	state_mask = 0;
-	for (state_name = strtok(states, " "); state_name;
-	     state_name = strtok(NULL, " ")) {
-		enum igt_suspend_state state;
 
-		for (state = SUSPEND_STATE_FREEZE; state < SUSPEND_STATE_NUM;
-		     state++)
-			if (strcmp(state_name, suspend_state_name[state]) == 0)
-				break;
-		igt_assert(state < SUSPEND_STATE_NUM);
-		state_mask |= 1 << state;
-	}
+	str = strstr(states, suspend_state_name[state]);
+
+	if (!str)
+		igt_info("State %s not supported.\nSupported States: %s\n",
+			 suspend_state_name[state], states);
 
 	free(states);
+	return str;
+}
 
-	return state_mask;
+static int get_mem_sleep(void)
+{
+	char *mem_sleep_states;
+	char *mem_sleep_state;
+	enum igt_mem_sleep mem_sleep;
+	int power_dir;
+
+	igt_require((power_dir = open("/sys/power", O_RDONLY)) >= 0);
+
+	if (faccessat(power_dir, "mem_sleep", R_OK, 0))
+		return MEM_SLEEP_NONE;
+
+	igt_assert((mem_sleep_states = igt_sysfs_get(power_dir, "mem_sleep")));
+	for (mem_sleep_state = strtok(mem_sleep_states, " "); mem_sleep_state;
+	     mem_sleep_state = strtok(NULL, " ")) {
+		if (mem_sleep_state[0] == '[') {
+			mem_sleep_state[strlen(mem_sleep_state) - 1] = '\0';
+			mem_sleep_state++;
+			break;
+		}
+	}
+
+	if (!mem_sleep_state) {
+		free(mem_sleep_states);
+		return MEM_SLEEP_NONE;
+	}
+
+	for (mem_sleep = MEM_SLEEP_S2IDLE; mem_sleep < MEM_SLEEP_NUM; mem_sleep++) {
+		if (strcmp(mem_sleep_name[mem_sleep], mem_sleep_state) == 0)
+			break;
+	}
+
+	igt_assert_f(mem_sleep < MEM_SLEEP_NUM, "Invalid mem_sleep state\n");
+
+	free(mem_sleep_states);
+	close(power_dir);
+	return mem_sleep;
+}
+
+static void set_mem_sleep(int power_dir, enum igt_mem_sleep sleep)
+{
+	igt_assert(sleep < MEM_SLEEP_NUM);
+
+	igt_assert_eq(faccessat(power_dir, "mem_sleep", W_OK, 0), 0);
+
+	igt_assert(igt_sysfs_set(power_dir, "mem_sleep",
+				 mem_sleep_name[sleep]));
+}
+
+static bool is_mem_sleep_state_supported(int power_dir, enum igt_mem_sleep state)
+{
+	const char *str;
+	char *mem_sleep_states;
+
+	igt_assert((mem_sleep_states = igt_sysfs_get(power_dir, "mem_sleep")));
+
+	str = strstr(mem_sleep_states, mem_sleep_name[state]);
+
+	if (!str)
+		igt_info("mem_sleep state %s not supported.\nSupported mem_sleep states: %s\n",
+			 mem_sleep_name[state], mem_sleep_states);
+
+	free(mem_sleep_states);
+	return str;
 }
 
 /**
@@ -852,23 +925,37 @@ void igt_system_suspend_autoresume(enum igt_suspend_state state,
 {
 	int power_dir;
 	enum igt_suspend_test orig_test;
+	enum igt_mem_sleep orig_mem_sleep = MEM_SLEEP_NONE;
 
 	igt_require((power_dir = open("/sys/power", O_RDONLY)) >= 0);
-	igt_require(get_supported_suspend_states(power_dir) & (1 << state));
+	igt_require(is_state_supported(power_dir, state));
 	igt_require(test == SUSPEND_TEST_NONE ||
 		    faccessat(power_dir, "pm_test", R_OK | W_OK, 0) == 0);
 
 	igt_skip_on_f(state == SUSPEND_STATE_DISK &&
-		      !intel_get_total_swap_mb(),
+		      !igt_get_total_swap_mb(),
 		      "Suspend to disk requires swap space.\n");
 
 	orig_test = get_suspend_test(power_dir);
+
+	if (state == SUSPEND_STATE_S3) {
+		orig_mem_sleep = get_mem_sleep();
+		igt_skip_on_f(!is_mem_sleep_state_supported(power_dir, MEM_SLEEP_DEEP),
+			      "S3 not supported in this system.\n");
+		set_mem_sleep(power_dir, MEM_SLEEP_DEEP);
+		igt_skip_on_f(get_mem_sleep() != MEM_SLEEP_DEEP,
+			      "S3 not possible in this system.\n");
+	}
+
 	set_suspend_test(power_dir, test);
 
 	if (test == SUSPEND_TEST_NONE)
 		suspend_via_rtcwake(state);
 	else
 		suspend_via_sysfs(power_dir, state);
+
+	if (orig_mem_sleep)
+		set_mem_sleep(power_dir, orig_mem_sleep);
 
 	set_suspend_test(power_dir, orig_test);
 	close(power_dir);
@@ -972,7 +1059,7 @@ void igt_drop_root(void)
  * Waits for a key press when run interactively and when the corresponding debug
  * var is set in the --interactive-debug=$var variable. Multiple keys
  * can be specified as a comma-separated list or alternatively "all" if a wait
- * should happen for all cases.
+ * should happen for all cases. Calling this function with "all" will assert.
  *
  * When not connected to a terminal interactive_debug is ignored
  * and execution immediately continues.
@@ -993,6 +1080,9 @@ void igt_debug_wait_for_keypress(const char *var)
 	if (!igt_interactive_debug)
 		return;
 
+	if (strstr(var, "all"))
+		igt_assert_f(false, "Bug in test: Do not call igt_debug_wait_for_keypress with \"all\"\n");
+
 	if (!strstr(igt_interactive_debug, var) &&
 	    !strstr(igt_interactive_debug, "all"))
 		return;
@@ -1008,7 +1098,7 @@ void igt_debug_wait_for_keypress(const char *var)
 }
 
 /**
- * igt_debug_manual_check:
+ * igt_debug_interactive_mode_check:
  * @var: var lookup to to enable this wait
  * @expected: message to be printed as expected behaviour before wait for keys Y/n
  *
@@ -1028,7 +1118,7 @@ void igt_debug_wait_for_keypress(const char *var)
  *
  * Force test fail when N/n is pressed.
  */
-void igt_debug_manual_check(const char *var, const char *expected)
+void igt_debug_interactive_mode_check(const char *var, const char *expected)
 {
 	struct termios oldt, newt;
 	char key;
@@ -1400,6 +1490,297 @@ igt_lsof(const char *dpath)
 	free(sanitized);
 }
 
+static void pulseaudio_unload_module(proc_t *proc_info)
+{
+	struct igt_helper_process pa_proc = {};
+	char xdg_dir[PATH_MAX];
+	const char *homedir;
+	struct passwd *pw;
+
+	igt_fork_helper(&pa_proc) {
+		pw = getpwuid(proc_info->euid);
+		homedir = pw->pw_dir;
+		snprintf(xdg_dir, sizeof(xdg_dir), "/run/user/%d", proc_info->euid);
+
+		igt_info("Request pulseaudio to stop using audio device\n");
+
+		setgid(proc_info->egid);
+		setuid(proc_info->euid);
+		clearenv();
+		setenv("HOME", homedir, 1);
+		setenv("XDG_RUNTIME_DIR",xdg_dir, 1);
+
+		system("for i in $(pacmd list-sources|grep module:|cut -d : -f 2); do pactl unload-module $i; done");
+	}
+	igt_wait_helper(&pa_proc);
+}
+
+static int pipewire_pulse_pid = 0;
+static int pipewire_pw_reserve_pid = 0;
+static struct igt_helper_process pw_reserve_proc = {};
+
+static void pipewire_reserve_wait(void)
+{
+	char xdg_dir[PATH_MAX];
+	const char *homedir;
+	struct passwd *pw;
+	proc_t *proc_info;
+	PROCTAB *proc;
+
+	igt_fork_helper(&pw_reserve_proc) {
+		igt_info("Preventing pipewire-pulse to use the audio drivers\n");
+
+		proc = openproc(PROC_FILLCOM | PROC_FILLSTAT | PROC_FILLARG);
+		igt_assert(proc != NULL);
+
+		while ((proc_info = readproc(proc, NULL))) {
+			if (pipewire_pulse_pid == proc_info->tid)
+				break;
+			freeproc(proc_info);
+		}
+		closeproc(proc);
+
+		/* Sanity check: if it can't find the process, it means it has gone */
+		if (pipewire_pulse_pid != proc_info->tid)
+			exit(0);
+
+		pw = getpwuid(proc_info->euid);
+		homedir = pw->pw_dir;
+		snprintf(xdg_dir, sizeof(xdg_dir), "/run/user/%d", proc_info->euid);
+		setgid(proc_info->egid);
+		setuid(proc_info->euid);
+		clearenv();
+		setenv("HOME", homedir, 1);
+		setenv("XDG_RUNTIME_DIR",xdg_dir, 1);
+		freeproc(proc_info);
+
+		/*
+		 * pw-reserve will run in background. It will only exit when
+		 * igt_kill_children() is called later on. So, it shouldn't
+		 * call igt_waitchildren(). Instead, just exit with the return
+		 * code from pw-reserve.
+		 */
+		exit(system("pw-reserve -n Audio0 -r"));
+	}
+}
+
+/* Maximum time waiting for pw-reserve to start running */
+#define PIPEWIRE_RESERVE_MAX_TIME 1000 /* milisseconds */
+
+int pipewire_pulse_start_reserve(void)
+{
+	bool is_pw_reserve_running = false;
+	proc_t *proc_info;
+	int attempts = 0;
+	PROCTAB *proc;
+
+	if (!pipewire_pulse_pid)
+		return 0;
+
+	pipewire_reserve_wait();
+
+	/*
+	 * Note: using pw-reserve to stop using audio only works with
+	 * pipewire version 0.3.50 or upper.
+	 */
+	for (attempts = 0; attempts < PIPEWIRE_RESERVE_MAX_TIME; attempts++) {
+		usleep(1000);
+		proc = openproc(PROC_FILLCOM | PROC_FILLSTAT | PROC_FILLARG);
+		igt_assert(proc != NULL);
+
+		while ((proc_info = readproc(proc, NULL))) {
+			if (!strcmp(proc_info->cmd, "pw-reserve")) {
+				is_pw_reserve_running = true;
+				pipewire_pw_reserve_pid = proc_info->tid;
+				freeproc(proc_info);
+				break;
+			}
+			freeproc(proc_info);
+		}
+		closeproc(proc);
+		if (is_pw_reserve_running)
+			break;
+	}
+	if (!is_pw_reserve_running) {
+		igt_warn("Failed to remove audio drivers from pipewire\n");
+		return 1;
+	}
+	/* Let's grant some time for pw_reserve to notify pipewire via D-BUS */
+	usleep(50000);
+
+	/*
+	 * pw-reserve is running, and should have stopped using the audio
+	 * drivers. We can now remove the driver.
+	 */
+
+	return 0;
+}
+
+void pipewire_pulse_stop_reserve(void)
+{
+	if (!pipewire_pulse_pid)
+		return;
+
+	igt_stop_helper(&pw_reserve_proc);
+}
+
+/**
+ * __igt_lsof_audio_and_kill_proc() - check if a given process is using an
+ *	audio device. If so, stop or prevent them to use such devices.
+ *
+ * @proc_info: process struct, as returned by readproc()
+ * @proc_path: path of the process under procfs
+ * @pipewire_pulse_pid: PID of pipewire-pulse process
+ *
+ * No processes can be using an audio device by the time it gets removed.
+ * This function checks if a process is using an audio device from /dev/snd.
+ * If so, it will check:
+ * 	- if the process is pulseaudio, it can't be killed, as systemd will
+ * 	  respawn it. So, instead, send a request for it to stop bind the
+ * 	  audio devices.
+ *	- if the process is pipewire-pulse, it can't be killed, as systemd will
+ *	  respawn it. So, instead, the caller should call pw-reserve, remove
+ *	  the kernel driver and then stop pw-reserve. On such case, this
+ *	  function returns the PID of pipewire-pulse, but won't touch it.
+ * If the check fails, it means that the process can simply be killed.
+ */
+static int
+__igt_lsof_audio_and_kill_proc(proc_t *proc_info, char *proc_path)
+{
+	const char *audio_dev = "/dev/snd/";
+	char path[PATH_MAX * 2];
+	struct dirent *d;
+	struct stat st;
+	char *fd_lnk;
+	int fail = 0;
+	ssize_t read;
+	DIR *dp;
+
+	/*
+	 * Terminating pipewire-pulse require an special procedure, which
+	 * is only available at version 0.3.50 and upper. Just trying to
+	 * kill pipewire will start a race between IGT and systemd. If IGT
+	 * wins, the audio driver will be unloaded before systemd tries to
+	 * reload it, but if systemd wins, the audio device will be re-opened
+	 * and used before IGT has a chance to remove the audio driver.
+	 * Pipewire version 0.3.50 should bring a standard way:
+	 *
+	 * 1) start a thread running:
+	 *	 pw-reserve -n Audio0 -r
+	 * 2) unload/unbind the the audio driver(s);
+	 * 3) stop the pw-reserve thread.
+	 */
+	if (!strcmp(proc_info->cmd, "pipewire-pulse")) {
+		igt_info("process %d (%s) is using audio device. Should be requested to stop using them.\n",
+			 proc_info->tid, proc_info->cmd);
+		pipewire_pulse_pid = proc_info->tid;
+		return 0;
+	}
+	/*
+	 * pipewire-pulse itself doesn't hook into a /dev/snd device. Instead,
+	 * the actual binding happens at the Pipewire Session Manager, e.g.
+	 * either wireplumber or pipewire media-session.
+	 *
+	 * Just killing such processes won't produce any effect, as systemd
+	 * will respawn them. So, just ignore here, they'll honor pw-reserve,
+	 * when the time comes.
+	 */
+	if (!strcmp(proc_info->cmd, "pipewire-media-session"))
+		return 0;
+	if (!strcmp(proc_info->cmd, "wireplumber"))
+		return 0;
+
+	dp = opendir(proc_path);
+	if (!dp && errno == ENOENT)
+		return 0;
+	igt_assert(dp);
+
+	while ((d = readdir(dp))) {
+		if (*d->d_name == '.')
+			continue;
+
+		memset(path, 0, sizeof(path));
+		snprintf(path, sizeof(path), "%s/%s", proc_path, d->d_name);
+
+		if (lstat(path, &st) == -1)
+			continue;
+
+		fd_lnk = malloc(st.st_size + 1);
+
+		igt_assert((read = readlink(path, fd_lnk, st.st_size + 1)));
+		fd_lnk[read] = '\0';
+
+		if (strncmp(audio_dev, fd_lnk, strlen(audio_dev))) {
+			free(fd_lnk);
+			continue;
+		}
+
+		free(fd_lnk);
+
+		/*
+		 * In order to avoid racing against pa/systemd, ensure that
+		 * pulseaudio will close all audio files. This should be
+		 * enough to unbind audio modules and won't cause race issues
+		 * with systemd trying to reload it.
+		 */
+		if (!strcmp(proc_info->cmd, "pulseaudio")) {
+			pulseaudio_unload_module(proc_info);
+			break;
+		}
+
+		/* For all other processes, just kill them */
+		igt_info("process %d (%s) is using audio device. Should be terminated.\n",
+				proc_info->tid, proc_info->cmd);
+
+		if (kill(proc_info->tid, SIGTERM) < 0) {
+			igt_info("Fail to terminate %s (pid: %d) with SIGTERM\n",
+				proc_info->cmd, proc_info->tid);
+			if (kill(proc_info->tid, SIGABRT) < 0) {
+				fail++;
+				igt_info("Fail to terminate %s (pid: %d) with SIGABRT\n",
+					proc_info->cmd, proc_info->tid);
+			}
+		}
+
+		break;
+	}
+
+	closedir(dp);
+	return fail;
+}
+
+/*
+ * This function identifies each process running on the machine that is
+ * opening an audio device and tries to stop it.
+ *
+ * Special care should be taken with pipewire and pipewire-pulse, as those
+ * daemons are respanned if they got killed.
+ */
+int
+igt_lsof_kill_audio_processes(void)
+{
+	char path[PATH_MAX];
+	proc_t *proc_info;
+	PROCTAB *proc;
+	int fail = 0;
+
+	proc = openproc(PROC_FILLCOM | PROC_FILLSTAT | PROC_FILLARG);
+	igt_assert(proc != NULL);
+	pipewire_pulse_pid = 0;
+
+	while ((proc_info = readproc(proc, NULL))) {
+		if (snprintf(path, sizeof(path), "/proc/%d/fd", proc_info->tid) < 1)
+			fail++;
+		else
+			fail += __igt_lsof_audio_and_kill_proc(proc_info, path);
+
+		freeproc(proc_info);
+	}
+	closeproc(proc);
+
+	return fail;
+}
+
 static struct igt_siglatency {
 	timer_t timer;
 	struct timespec target;
@@ -1526,4 +1907,15 @@ uint64_t vfs_file_max(void)
 		}
 	}
 	return max;
+}
+
+void *igt_memdup(const void *ptr, size_t len)
+{
+	void *dup;
+
+	dup = malloc(len);
+	if (dup)
+		memcpy(dup, ptr, len);
+
+	return dup;
 }

@@ -36,6 +36,7 @@
 #include "i915/gem.h"
 #include "i915/gem_context.h"
 #include "i915/gem_engine_topology.h"
+#include "intel_allocator.h"
 #include "igt_debugfs.h"
 #include "igt_dummyload.h"
 #include "igt_sysfs.h"
@@ -132,13 +133,12 @@ static void set_unbannable(int i915, uint32_t ctx)
 	gem_context_set_param(i915, &p);
 }
 
-static uint32_t create_context(int i915, unsigned int class, unsigned int inst, int prio)
+static const intel_ctx_t *
+create_ctx(int i915, unsigned int class, unsigned int inst, int prio)
 {
-	uint32_t ctx;
-
-	ctx = gem_context_create_for_engine(i915, class, inst);
-	set_unbannable(i915, ctx);
-	gem_context_set_priority(i915, ctx, prio);
+	const intel_ctx_t *ctx = intel_ctx_create_for_engine(i915, class, inst);
+	set_unbannable(i915, ctx->id);
+	gem_context_set_priority(i915, ctx->id, prio);
 
 	return ctx;
 }
@@ -149,23 +149,27 @@ static uint64_t __test_timeout(int i915, int engine, unsigned int timeout)
 	struct timespec ts = {};
 	igt_spin_t *spin[2];
 	uint64_t elapsed;
-	uint32_t ctx[2];
+	const intel_ctx_t *ctx[2];
+	uint64_t ahnd[2];
 
 	igt_assert(igt_sysfs_scanf(engine, "class", "%u", &class) == 1);
 	igt_assert(igt_sysfs_scanf(engine, "instance", "%u", &inst) == 1);
 
 	set_heartbeat(engine, timeout);
 
-	ctx[0] = create_context(i915, class, inst, 1023);
-	spin[0] = igt_spin_new(i915, ctx[0],
+	ctx[0] = create_ctx(i915, class, inst, 1023);
+	ahnd[0] = get_reloc_ahnd(i915, ctx[0]->id);
+	spin[0] = igt_spin_new(i915, .ahnd = ahnd[0], .ctx = ctx[0],
 			       .flags = (IGT_SPIN_NO_PREEMPTION |
 					 IGT_SPIN_POLL_RUN |
 					 IGT_SPIN_FENCE_OUT));
 	igt_spin_busywait_until_started(spin[0]);
 
-	ctx[1] = create_context(i915, class, inst, -1023);
+	ctx[1] = create_ctx(i915, class, inst, -1023);
+	ahnd[1] = get_reloc_ahnd(i915, ctx[1]->id);
 	igt_nsec_elapsed(&ts);
-	spin[1] = igt_spin_new(i915, ctx[1], .flags = IGT_SPIN_POLL_RUN);
+	spin[1] = igt_spin_new(i915, .ahnd = ahnd[1], .ctx = ctx[1],
+				.flags = IGT_SPIN_POLL_RUN);
 	igt_spin_busywait_until_started(spin[1]);
 	elapsed = igt_nsec_elapsed(&ts);
 
@@ -176,8 +180,10 @@ static uint64_t __test_timeout(int i915, int engine, unsigned int timeout)
 
 	igt_spin_free(i915, spin[0]);
 
-	gem_context_destroy(i915, ctx[1]);
-	gem_context_destroy(i915, ctx[0]);
+	intel_ctx_destroy(i915, ctx[1]);
+	intel_ctx_destroy(i915, ctx[0]);
+	put_ahnd(ahnd[1]);
+	put_ahnd(ahnd[0]);
 	gem_quiescent_gpu(i915);
 
 	return elapsed;
@@ -292,18 +298,20 @@ static void client(int i915, int engine, int *ctl, int duration, int expect)
 {
 	unsigned int class, inst;
 	unsigned long count = 0;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 
 	igt_assert(igt_sysfs_scanf(engine, "class", "%u", &class) == 1);
 	igt_assert(igt_sysfs_scanf(engine, "instance", "%u", &inst) == 1);
 
-	ctx = create_context(i915, class, inst, 0);
+	ctx = create_ctx(i915, class, inst, 0);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
 
 	while (!READ_ONCE(*ctl)) {
 		unsigned int elapsed;
 		igt_spin_t *spin;
 
-		spin = igt_spin_new(i915, ctx,
+		spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 				    .flags = (IGT_SPIN_NO_PREEMPTION |
 					      IGT_SPIN_POLL_RUN |
 					      IGT_SPIN_FENCE_OUT));
@@ -331,7 +339,8 @@ static void client(int i915, int engine, int *ctl, int duration, int expect)
 		count++;
 	}
 
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
+	put_ahnd(ahnd);
 	igt_info("%s client completed %lu spins\n",
 		 expect < 0 ? "Bad" : "Good", count);
 }
@@ -364,18 +373,22 @@ static void __test_mixed(int i915, int engine,
 
 	set_heartbeat(engine, heartbeat);
 
-	igt_fork(child, 1) /* good client */
+	igt_fork(child, 1) /* good client */ {
+		intel_allocator_init();
 		client(i915, engine, shared, good, 1);
-	igt_fork(child, 1) /* bad client */
+	}
+	igt_fork(child, 1) /* bad client */ {
+		intel_allocator_init();
 		client(i915, engine, shared, bad, -EIO);
+	}
 
 	old = signal(SIGALRM, sighandler);
 	sleep(duration);
-	signal(SIGALRM, old);
 
 	*shared = true;
 	igt_waitchildren();
 	munmap(shared, 4096);
+	signal(SIGALRM, old);
 
 	gem_quiescent_gpu(i915);
 	set_heartbeat(engine, saved);
@@ -414,7 +427,8 @@ static void test_off(int i915, int engine)
 	unsigned int class, inst;
 	unsigned int saved;
 	igt_spin_t *spin;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 
 	/*
 	 * Some other clients request that there is never any interruption
@@ -433,9 +447,10 @@ static void test_off(int i915, int engine)
 
 	set_heartbeat(engine, 0);
 
-	ctx = create_context(i915, class, inst, 0);
+	ctx = create_ctx(i915, class, inst, 0);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
 
-	spin = igt_spin_new(i915, ctx,
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 			    .flags = (IGT_SPIN_POLL_RUN |
 				      IGT_SPIN_NO_PREEMPTION |
 				      IGT_SPIN_FENCE_OUT));
@@ -455,6 +470,8 @@ static void test_off(int i915, int engine)
 
 	gem_quiescent_gpu(i915);
 	set_heartbeat(engine, saved);
+	intel_ctx_destroy(i915, ctx);
+	put_ahnd(ahnd);
 }
 
 igt_main

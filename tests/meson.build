@@ -7,8 +7,9 @@ test_progs = [
 	'core_setmaster_vs_auth',
 	'debugfs_test',
 	'dmabuf',
+	'dmabuf_sync_file',
 	'device_reset',
-	'drm_import_export',
+	'drm_buddy',
 	'drm_mm',
 	'drm_read',
 	'fbdev',
@@ -19,37 +20,26 @@ test_progs = [
 	'kms_atomic',
 	'kms_atomic_interruptible',
 	'kms_atomic_transition',
-	'kms_big_fb',
-	'kms_big_joiner' ,
-	'kms_busy',
-	'kms_ccs',
+	'kms_bw',
 	'kms_concurrent',
 	'kms_content_protection',
 	'kms_cursor_crc',
 	'kms_cursor_edge_walk',
 	'kms_cursor_legacy',
+	'kms_dither',
+	'kms_display_modes',
 	'kms_dp_aux_dev',
-	'kms_dp_dsc',
 	'kms_dp_tiled_display',
-	'kms_draw_crc',
-	'kms_fbcon_fbt',
-	'kms_fence_pin_leak',
 	'kms_flip',
 	'kms_flip_event_leak',
-	'kms_flip_scaled_crc',
-	'kms_flip_tiling',
 	'kms_force_connector_basic',
-	'kms_frontbuffer_tracking',
 	'kms_getfb',
 	'kms_hdmi_inject',
 	'kms_hdr',
-	'kms_invalid_dotclock',
+	'kms_invalid_mode',
 	'kms_lease',
-	'kms_legacy_colorkey',
-	'kms_mmap_write_crc',
 	'kms_multipipe_modeset',
 	'kms_panel_fitting',
-	'kms_pipe_b_c_ivb',
 	'kms_pipe_crc_basic',
 	'kms_plane',
 	'kms_plane_alpha_blend',
@@ -60,12 +50,9 @@ test_progs = [
 	'kms_prime',
 	'kms_prop_blob',
 	'kms_properties',
-	'kms_psr',
-	'kms_psr2_su',
-	'kms_psr2_sf',
-	'kms_pwrite_crc',
 	'kms_rmfb',
 	'kms_rotation_crc',
+	'kms_scaling_modes',
 	'kms_selftest',
 	'kms_sequence',
 	'kms_setmode',
@@ -92,17 +79,6 @@ test_progs = [
 	'syncobj_timeline',
 	'template',
 	'tools_test',
-	'v3d_get_bo_offset',
-	'v3d_get_param',
-	'v3d_mmap',
-	'vc4_create_bo',
-	'vc4_dmabuf_poll',
-	'vc4_label_bo',
-	'vc4_lookup_fail',
-	'vc4_purgeable_bo',
-	'vc4_tiling',
-	'vc4_wait_bo',
-	'vc4_wait_seqno',
 	'vgem_basic',
 	'vgem_slow',
 ]
@@ -120,19 +96,18 @@ i915_progs = [
 	'gem_blits',
 	'gem_busy',
 	'gem_caching',
+	'gem_ccs',
 	'gem_close',
 	'gem_close_race',
 	'gem_concurrent_blit',
 	'gem_cs_tlb',
 	'gem_ctx_bad_destroy',
-	'gem_ctx_clone',
 	'gem_ctx_create',
 	'gem_ctx_engines',
 	'gem_ctx_exec',
 	'gem_ctx_isolation',
 	'gem_ctx_param',
 	'gem_ctx_persistence',
-	'gem_ctx_ringsize',
 	'gem_ctx_shared',
 	'gem_ctx_switch',
 	'gem_evict_alignment',
@@ -173,6 +148,8 @@ i915_progs = [
 	'gem_gtt_speed',
 	'gem_huc_copy',
 	'gem_linear_blits',
+	'gem_lmem_evict',
+	'gem_lmem_swapping',
 	'gem_lut_handle',
 	'gem_madvise',
 	'gem_media_fill',
@@ -187,6 +164,7 @@ i915_progs = [
 	'gem_pread_after_blit',
 	'gem_pwrite',
 	'gem_pwrite_snooped',
+	'gem_pxp',
 	'gem_read_read_speed',
 	'gem_readwrite',
 	'gem_reg_read',
@@ -224,8 +202,10 @@ i915_progs = [
 	'i915_fb_tiling',
 	'i915_getparams_basic',
 	'i915_hangman',
+	'i915_hwmon',
 	'i915_module_load',
 	'i915_pciid',
+	'i915_pipe_stress',
 	'i915_pm_backlight',
 	'i915_pm_lpsp',
 	'i915_pm_rpm',
@@ -235,11 +215,44 @@ i915_progs = [
 	'i915_query',
 	'i915_selftest',
 	'i915_suspend',
+	'kms_big_fb',
+	'kms_big_joiner' ,
+	'kms_busy',
+	'kms_ccs',
+	'kms_cdclk',
+	'kms_draw_crc',
+	'kms_dsc',
+	'kms_fbcon_fbt',
+	'kms_fence_pin_leak',
+	'kms_flip_scaled_crc',
+	'kms_flip_tiling',
+	'kms_frontbuffer_tracking',
+	'kms_legacy_colorkey',
+	'kms_mmap_write_crc',
+	'kms_pipe_b_c_ivb',
+	'kms_psr',
+	'kms_psr2_su',
+	'kms_psr2_sf',
+	'kms_psr_stress_test',
+	'kms_pwrite_crc',
 	'sysfs_clients',
 	'sysfs_defaults',
 	'sysfs_heartbeat_interval',
 	'sysfs_preempt_timeout',
 	'sysfs_timeslice_duration',
+]
+
+msm_progs = [
+	'msm_mapping',
+	'msm_recovery',
+	'msm_submit'
+]
+
+chamelium_progs = [
+	'kms_chamelium_audio',
+	'kms_chamelium_edid',
+	'kms_chamelium_frames',
+	'kms_chamelium_hpd',
 ]
 
 test_deps = [ igt_deps ]
@@ -252,13 +265,6 @@ if libdrm_nouveau.found()
 		'nouveau_crc',
 	]
 	test_deps += libdrm_nouveau
-endif
-
-if chamelium.found()
-	test_progs += [
-		'kms_chamelium',
-	]
-	test_deps += chamelium
 endif
 
 test_executables = []
@@ -282,6 +288,37 @@ foreach prog : i915_progs
 		   install : true)
 	test_list += prog
 endforeach
+
+foreach prog : msm_progs
+	test_executables += executable(prog, join_paths('msm', prog + '.c'),
+				       dependencies : test_deps,
+				       install_dir : libexecdir,
+				       install_rpath : libexecdir_rpathdir,
+				       install : true)
+	test_list += prog
+endforeach
+
+if chamelium.found()
+	foreach prog : chamelium_progs
+		test_executables += executable(prog,
+				 [join_paths('chamelium', prog + '.c'),
+					join_paths('chamelium', 'kms_chamelium_helper.c')],
+				 dependencies : test_deps,
+				 install_dir : libexecdir,
+				 install_rpath : libexecdir_rpathdir,
+				 install : true)
+		test_list += prog
+	endforeach
+	test_deps += chamelium
+endif
+
+test_executables += executable('drm_fdinfo',
+	   join_paths('i915', 'drm_fdinfo.c'),
+	   dependencies : test_deps + [ lib_igt_drm_fdinfo ],
+	   install_dir : libexecdir,
+	   install_rpath : libexecdir_rpathdir,
+	   install : true)
+test_list += 'drm_fdinfo'
 
 test_executables += executable('dumb_buffer', 'dumb_buffer.c',
 	   dependencies : test_deps + [ libatomic ],
@@ -337,6 +374,14 @@ test_executables += executable('gem_mmap_offset',
 	   install : true)
 test_list += 'gem_mmap_offset'
 
+test_executables += executable('i915_pm_freq_mult',
+	   join_paths('i915', 'i915_pm_freq_mult.c'),
+	   dependencies : test_deps + [ lib_igt_perf ],
+	   install_dir : libexecdir,
+	   install_rpath : libexecdir_rpathdir,
+	   install : true)
+test_list += 'i915_pm_freq_mult'
+
 test_executables += executable('i915_pm_rc6_residency',
 	   join_paths('i915', 'i915_pm_rc6_residency.c'),
 	   dependencies : test_deps + [ lib_igt_perf ],
@@ -384,13 +429,13 @@ test_executables += executable('kms_color',
 test_list += 'kms_color'
 
 if chamelium.found()
-       test_executables += executable('kms_color_chamelium',
-                             [ 'kms_color_chamelium.c', 'kms_color_helper.c' ],
+       test_executables += executable('kms_chamelium_color',
+                             [ 'chamelium/kms_chamelium_color.c', 'kms_color_helper.c' ],
                              dependencies : test_deps + [ chamelium ],
                              install_dir : libexecdir,
                              install_rpath : libexecdir_rpathdir,
                              install : true)
-       test_list += 'kms_color_chamelium'
+       test_list += 'kms_chamelium_color'
 endif
 
 test_executables += executable('sw_sync', 'sw_sync.c',
@@ -401,6 +446,10 @@ test_executables += executable('sw_sync', 'sw_sync.c',
 test_list += 'sw_sync'
 
 subdir('amdgpu')
+
+subdir('v3d')
+
+subdir('vc4')
 
 gen_testlist = find_program('generate_testlist.sh')
 test_list_target = custom_target('testlist',

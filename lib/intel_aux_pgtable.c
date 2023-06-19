@@ -34,6 +34,7 @@
 #define AUX_FORMAT_YCRCB	0x03
 #define AUX_FORMAT_P010		0x07
 #define AUX_FORMAT_P016		0x08
+#define AUX_FORMAT_AYUV		0x09
 #define AUX_FORMAT_ARGB_8B	0x0A
 #define AUX_FORMAT_NV12_21	0x0F
 
@@ -94,7 +95,7 @@ pgt_table_count(int address_bits, struct intel_buf **bufs, int buf_count)
 		/* We require bufs to be sorted. */
 		igt_assert(i == 0 ||
 			   buf->addr.offset >= bufs[i - 1]->addr.offset +
-				intel_buf_bo_size(bufs[i - 1]));
+				intel_buf_size(bufs[i - 1]));
 		start = ALIGN_DOWN(buf->addr.offset, 1UL << address_bits);
 
 		/* Avoid double counting for overlapping aligned bufs. */
@@ -262,7 +263,8 @@ static uint64_t pgt_get_l1_flags(const struct intel_buf *buf, int surface_idx)
 	} entry = {
 		.e = {
 			.valid = 1,
-			.tile_mode = buf->tiling == I915_TILING_Y ? 1 : 0,
+			.tile_mode = buf->tiling == I915_TILING_Y ? 1 :
+				(buf->tiling == I915_TILING_4 ? 2 : 0),
 		}
 	};
 
@@ -273,7 +275,8 @@ static uint64_t pgt_get_l1_flags(const struct intel_buf *buf, int surface_idx)
 	 */
 	igt_assert(buf->tiling == I915_TILING_Y ||
 		   buf->tiling == I915_TILING_Yf ||
-		   buf->tiling == I915_TILING_Ys);
+		   buf->tiling == I915_TILING_Ys ||
+		   buf->tiling == I915_TILING_4);
 
 	entry.e.ycr = surface_idx > 0;
 
@@ -303,6 +306,10 @@ static uint64_t pgt_get_l1_flags(const struct intel_buf *buf, int surface_idx)
 		switch (buf->bpp) {
 		case 16:
 			entry.e.format = AUX_FORMAT_YCRCB;
+			entry.e.depth = DEPTH_VAL_RESERVED;
+			break;
+		case 32:
+			entry.e.format = AUX_FORMAT_AYUV;
 			entry.e.depth = DEPTH_VAL_RESERVED;
 			break;
 		default:
@@ -637,11 +644,11 @@ gen12_emit_aux_pgtable_state(struct intel_bb *ibb, uint32_t state, bool render)
 	if (!state)
 		return;
 
-	intel_bb_out(ibb, MI_LOAD_REGISTER_MEM_GEN8 | MI_MMIO_REMAP_ENABLE_GEN12);
+	intel_bb_out(ibb, MI_LOAD_REGISTER_MEM | MI_MMIO_REMAP_ENABLE_GEN12 | 2);
 	intel_bb_out(ibb, table_base_reg);
 	intel_bb_emit_reloc(ibb, ibb->handle, 0, 0, state, ibb->batch_offset);
 
-	intel_bb_out(ibb, MI_LOAD_REGISTER_MEM_GEN8 | MI_MMIO_REMAP_ENABLE_GEN12);
+	intel_bb_out(ibb, MI_LOAD_REGISTER_MEM | MI_MMIO_REMAP_ENABLE_GEN12 | 2);
 	intel_bb_out(ibb, table_base_reg + 4);
 	intel_bb_emit_reloc(ibb, ibb->handle, 0, 0, state + 4, ibb->batch_offset);
 }

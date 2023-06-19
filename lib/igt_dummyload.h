@@ -31,6 +31,30 @@
 #include "igt_core.h"
 #include "igt_list.h"
 #include "i915_drm.h"
+#include "intel_ctx.h"
+
+
+/**
+ * igt_spin_factory_t:
+ * @ctx_id: GEM context handle
+ * @ctx: intel_ctx_t context wrapper
+ * @dependency: GEM object to depend on
+ * @engine: Flags describing the engine to execute on
+ * @flags: Set of IGT_SPIN_* flags
+ * @fence: In-fence to wait on
+ *
+ * A factory struct which contains creation parameters for an igt_spin_t.
+ */
+typedef struct igt_spin_factory {
+	uint32_t ctx_id;
+	const intel_ctx_t *ctx;
+	uint32_t dependency;
+	uint64_t dependency_size;
+	unsigned int engine;
+	unsigned int flags;
+	int fence;
+	uint64_t ahnd;
+} igt_spin_factory_t;
 
 typedef struct igt_spin {
 	struct igt_list_head link;
@@ -57,15 +81,10 @@ typedef struct igt_spin {
 
 	unsigned int flags;
 #define SPIN_CLFLUSH (1 << 0)
+
+	struct igt_spin_factory opts;
 } igt_spin_t;
 
-struct igt_spin_factory {
-	uint32_t ctx;
-	uint32_t dependency;
-	unsigned int engine;
-	unsigned int flags;
-	int fence;
-};
 
 #define IGT_SPIN_FENCE_IN      (1 << 0)
 #define IGT_SPIN_FENCE_SUBMIT  (1 << 1)
@@ -78,14 +97,14 @@ struct igt_spin_factory {
 #define IGT_SPIN_SOFTDEP       (1 << 8)
 
 igt_spin_t *
-__igt_spin_factory(int fd, const struct igt_spin_factory *opts);
+__igt_spin_factory(int fd, const igt_spin_factory_t *opts);
 igt_spin_t *
-igt_spin_factory(int fd, const struct igt_spin_factory *opts);
+igt_spin_factory(int fd, const igt_spin_factory_t *opts);
 
 #define __igt_spin_new(fd, ...) \
-	__igt_spin_factory(fd, &((struct igt_spin_factory){__VA_ARGS__}))
+	__igt_spin_factory(fd, &((igt_spin_factory_t){__VA_ARGS__}))
 #define igt_spin_new(fd, ...) \
-	igt_spin_factory(fd, &((struct igt_spin_factory){__VA_ARGS__}))
+	igt_spin_factory(fd, &((igt_spin_factory_t){__VA_ARGS__}))
 
 void igt_spin_set_timeout(igt_spin_t *spin, int64_t ns);
 void igt_spin_reset(igt_spin_t *spin);

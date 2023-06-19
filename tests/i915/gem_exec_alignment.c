@@ -42,7 +42,9 @@
 
 #include "drm.h"
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
+#include "igt_types.h"
 
 IGT_TEST_DESCRIPTION("Exercises the basic execbuffer using object alignments");
 
@@ -165,13 +167,13 @@ naughty_child(int i915, int link, uint32_t shared, unsigned int flags)
 	if (!gem_uses_full_ppgtt(i915))
 		gtt_size /= 2; /* We have to *share* our GTT! */
 
-	ram_size = min(intel_get_total_ram_mb(), 4096);
+	ram_size = min_t(uint64_t, igt_get_total_ram_mb(), 4096);
 	ram_size *= 1024 * 1024;
 
 	count = min(gtt_size, ram_size) / 16384;
 	if (count > file_max()) /* vfs cap */
 		count = file_max();
-	intel_require_memory(count, 4096, CHECK_RAM);
+	igt_require_memory(count, 4096, CHECK_RAM);
 
 	flags = 0;
 	if ((gtt_size - 1) >> 32)
@@ -375,13 +377,13 @@ setup_many(int i915, unsigned long *out)
 	if (!gem_uses_full_ppgtt(i915))
 		gtt_size /= 2; /* We have to *share* our GTT! */
 
-	ram_size = min(intel_get_total_ram_mb(), 4096);
+	ram_size = min_t(uint64_t, igt_get_total_ram_mb(), 4096);
 	ram_size *= 1024 * 1024;
 
 	count = min(gtt_size, ram_size) / 16384;
 	if (count > file_max()) /* vfs cap */
 		count = file_max();
-	intel_require_memory(count, 4096, CHECK_RAM);
+	igt_require_memory(count, 4096, CHECK_RAM);
 
 	obj = calloc(sizeof(*obj), count);
 	igt_assert(obj);
@@ -524,11 +526,12 @@ static void single(int fd)
 
 igt_main
 {
-	int fd = -1;
+	igt_fd_t(fd);
 
 	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(fd);
+		igt_require(gem_allows_obj_alignment(fd));
 	}
 
 	igt_subtest("single") /* basic! */

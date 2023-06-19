@@ -71,7 +71,7 @@ static void create_crc_colors(data_t *data,
 				    data->mode->hdisplay,
 				    data->mode->vdisplay,
 				    DRM_FORMAT_XRGB8888,
-				    LOCAL_DRM_FORMAT_MOD_NONE,
+				    DRM_FORMAT_MOD_LINEAR,
 				    colors[i].r, colors[i].g, colors[i].b,
 				    &colors[i].fb);
 
@@ -122,7 +122,8 @@ static void test_ctx_flip_detection(data_t *data)
 	int start = -1, frame, start_color = -1, i;
 	bool found_skip = false;
 
-	pipe_crc = igt_pipe_crc_new(data->drm_fd, data->pipe, "auto");
+	pipe_crc = igt_pipe_crc_new(data->drm_fd, data->pipe,
+				    IGT_PIPE_CRC_SOURCE_AUTO);
 
 	create_crc_colors(data, colors, n_colors, pipe_crc);
 
@@ -232,7 +233,7 @@ static void test_ctx_flip_skip_current_frame(data_t *data)
 	const int n_colors = ARRAY_SIZE(colors);
 	const int n_crcs = 30;
 
-	pipe_crc = igt_pipe_crc_new(fd, data->pipe, "auto");
+	pipe_crc = igt_pipe_crc_new(fd, data->pipe, IGT_PIPE_CRC_SOURCE_AUTO);
 	create_crc_colors(data, colors, n_colors, pipe_crc);
 
 	set_crc_flip_threshold(data, 5);
@@ -264,7 +265,7 @@ static void test_ctx_flip_threshold_reset_after_capture(data_t *data)
 	igt_pipe_crc_t *pipe_crc;
 	const int fd = data->drm_fd;
 
-	pipe_crc = igt_pipe_crc_new(fd, data->pipe, "auto");
+	pipe_crc = igt_pipe_crc_new(fd, data->pipe, IGT_PIPE_CRC_SOURCE_AUTO);
 
 	set_crc_flip_threshold(data, 5);
 	igt_pipe_crc_start(pipe_crc);
@@ -356,7 +357,7 @@ igt_main
 					    data.mode->hdisplay,
 					    data.mode->vdisplay,
 					    DRM_FORMAT_XRGB8888,
-					    LOCAL_DRM_FORMAT_MOD_NONE,
+					    DRM_FORMAT_MOD_LINEAR,
 					    0.0, 0.0, 0.0,
 					    &data.default_fb);
 			igt_plane_set_fb(data.primary, &data.default_fb);

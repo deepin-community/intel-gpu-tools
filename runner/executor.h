@@ -13,7 +13,6 @@ struct execute_state
 	 * > 0 : Timeout in use, time left.
 	 */
 	double time_left;
-	double resuming;
 	bool dry;
 };
 
@@ -22,6 +21,7 @@ enum {
 	_F_OUT,
 	_F_ERR,
 	_F_DMESG,
+	_F_SOCKET,
 	_F_LAST,
 };
 

@@ -56,23 +56,28 @@
  * engines.
  */
 
+static int reset_query_once = -1;
+
 static bool has_gpu_reset(int fd)
 {
-	static int once = -1;
-	if (once < 0) {
-		struct drm_i915_getparam gp;
-		int val = 0;
+	if (reset_query_once < 0) {
+		reset_query_once = gem_gpu_reset_type(fd);
 
-		memset(&gp, 0, sizeof(gp));
-		gp.param = 35; /* HAS_GPU_RESET */
-		gp.value = &val;
-
-		if (ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp))
-			once = intel_gen(intel_get_drm_devid(fd)) >= 5;
-		else
-			once = val > 0;
+		/* Very old kernels did not support the query */
+		if (reset_query_once == -1)
+			reset_query_once =
+			      (intel_gen(intel_get_drm_devid(fd)) >= 5) ? 1 : 0;
 	}
-	return once;
+
+	return reset_query_once > 0;
+}
+
+static bool has_engine_reset(int fd)
+{
+	if (reset_query_once < 0)
+		has_gpu_reset(fd);
+
+	return reset_query_once > 1;
 }
 
 static void eat_error_state(int dev)
@@ -117,12 +122,12 @@ static void eat_error_state(int dev)
  * to be done under hang injection.
  * Default: false
  */
-void igt_require_hang_ring(int fd, int ring)
+void igt_require_hang_ring(int fd, uint32_t ctx, int ring)
 {
 	if (!igt_check_boolean_env_var("IGT_HANG", true))
 		igt_skip("hang injection disabled by user [IGT_HANG=0]\n");
 
-	gem_require_ring(fd, ring);
+        igt_require(gem_context_has_engine(fd, ctx, ring));
 	gem_context_require_bannable(fd);
 	if (!igt_check_boolean_env_var("IGT_HANG_WITHOUT_RESET", false))
 		igt_require(has_gpu_reset(fd));
@@ -176,7 +181,11 @@ igt_hang_t igt_allow_hang(int fd, unsigned ctx, unsigned flags)
 		igt_skip("hang injection disabled by user [IGT_HANG=0]\n");
 	gem_context_require_bannable(fd);
 
-	allow_reset = 1;
+	if (flags & HANG_WANT_ENGINE_RESET)
+		allow_reset = 2;
+	else
+		allow_reset = 1;
+
 	if ((flags & HANG_ALLOW_CAPTURE) == 0) {
 		param.param = I915_CONTEXT_PARAM_NO_ERROR_CAPTURE;
 		param.value = 1;
@@ -187,10 +196,15 @@ igt_hang_t igt_allow_hang(int fd, unsigned ctx, unsigned flags)
 		__gem_context_set_param(fd, &param);
 		allow_reset = INT_MAX; /* any reset method */
 	}
+
 	igt_require(igt_params_set(fd, "reset", "%d", allow_reset));
+	reset_query_once = -1;  /* Re-query after changing param */
 
 	if (!igt_check_boolean_env_var("IGT_HANG_WITHOUT_RESET", false))
 		igt_require(has_gpu_reset(fd));
+
+	if (flags & HANG_WANT_ENGINE_RESET)
+		igt_require(has_engine_reset(fd));
 
 	ban = context_get_ban(fd, ctx);
 	if ((flags & HANG_ALLOW_BAN) == 0)
@@ -269,13 +283,14 @@ static bool has_ctx_exec(int fd, unsigned ring, uint32_t ctx)
  * Returns:
  * Structure with helper internal state for igt_post_hang_ring().
  */
-igt_hang_t igt_hang_ctx(int fd, uint32_t ctx, int ring, unsigned flags)
+static igt_hang_t __igt_hang_ctx(int fd, uint64_t ahnd, uint32_t ctx, int ring,
+				 unsigned flags)
 {
 	struct drm_i915_gem_context_param param;
 	igt_spin_t *spin;
 	unsigned ban;
 
-	igt_require_hang_ring(fd, ring);
+	igt_require_hang_ring(fd, ctx, ring);
 
 	/* check if non-default ctx submission is allowed */
 	igt_require(ctx == 0 || has_ctx_exec(fd, ring, ctx));
@@ -298,11 +313,23 @@ igt_hang_t igt_hang_ctx(int fd, uint32_t ctx, int ring, unsigned flags)
 		context_set_ban(fd, ctx, 0);
 
 	spin = __igt_spin_new(fd,
-			      .ctx = ctx,
+			      .ahnd = ahnd,
+			      .ctx_id = ctx,
 			      .engine = ring,
 			      .flags = IGT_SPIN_NO_PREEMPTION);
 
 	return (igt_hang_t){ spin, ctx, ban, flags };
+}
+
+igt_hang_t igt_hang_ctx(int fd, uint32_t ctx, int ring, unsigned flags)
+{
+	return __igt_hang_ctx(fd, 0, ctx, ring, flags);
+}
+
+igt_hang_t igt_hang_ctx_with_ahnd(int fd, uint64_t ahnd, uint32_t ctx, int ring,
+				  unsigned flags)
+{
+	return __igt_hang_ctx(fd, ahnd, ctx, ring, flags);
 }
 
 /**
@@ -321,6 +348,12 @@ igt_hang_t igt_hang_ring(int fd, int ring)
 {
 	return igt_hang_ctx(fd, 0, ring, 0);
 }
+
+igt_hang_t igt_hang_ring_with_ahnd(int fd, int ring, uint64_t ahnd)
+{
+	return igt_hang_ctx_with_ahnd(fd, ahnd, 0, ring, 0);
+}
+
 
 /**
  * igt_post_hang_ring:
@@ -552,18 +585,18 @@ bool gem_class_can_store_dword(int fd, int class)
 {
 	uint16_t devid = intel_get_drm_devid(fd);
 	const struct intel_device_info *info = intel_get_device_info(devid);
-	const int gen = ffs(info->gen);
+	const int ver = info->graphics_ver;
 
-	if (info->gen == 0) /* unknown, assume it just works */
+	if (ver == 0) /* unknown, assume it just works */
 		return true;
 
-	if (gen <= 2) /* requires physical addresses */
+	if (ver <= 2) /* requires physical addresses */
 		return false;
 
-	if (gen == 3 && (info->is_grantsdale || info->is_alviso))
+	if (ver == 3 && (info->is_grantsdale || info->is_alviso))
 		return false; /* only supports physical addresses */
 
-	if (gen == 6 && class == I915_ENGINE_CLASS_VIDEO)
+	if (ver == 6 && class == I915_ENGINE_CLASS_VIDEO)
 		return false; /* broken, unbelievably broken */
 
 	if (info->is_broadwater)
@@ -583,7 +616,6 @@ const struct intel_execution_engine2 intel_execution_engines2[] = {
 	{ "bcs0", I915_ENGINE_CLASS_COPY, 0, I915_EXEC_BLT },
 	{ "vcs0", I915_ENGINE_CLASS_VIDEO, 0, I915_EXEC_BSD | I915_EXEC_BSD_RING1 },
 	{ "vcs1", I915_ENGINE_CLASS_VIDEO, 1, I915_EXEC_BSD | I915_EXEC_BSD_RING2 },
-	{ "vcs2", I915_ENGINE_CLASS_VIDEO, 2, -1 },
 	{ "vecs0", I915_ENGINE_CLASS_VIDEO_ENHANCE, 0, I915_EXEC_VEBOX },
 	{ }
 };

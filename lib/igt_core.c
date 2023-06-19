@@ -43,7 +43,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 #include <sys/syscall.h>
 #endif
 #include <pthread.h>
@@ -58,7 +58,9 @@
 #include <glib.h>
 
 #include "drmtest.h"
+#include "i915/gem_create.h"
 #include "intel_allocator.h"
+#include "intel_batchbuffer.h"
 #include "intel_chipset.h"
 #include "intel_io.h"
 #include "igt_debugfs.h"
@@ -74,6 +76,7 @@
 #include "igt_list.h"
 #include "igt_device_scan.h"
 #include "igt_thread.h"
+#include "runnercomms.h"
 
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
@@ -307,6 +310,12 @@ int num_test_children;
 int test_children_sz;
 bool test_child;
 
+/* fork dynamic support state */
+pid_t *test_multi_fork_children;
+int num_test_multi_fork_children;
+int test_multi_fork_children_sz;
+bool test_multi_fork_child;
+
 /* For allocator purposes */
 pid_t child_pid  = -1;
 __thread pid_t child_tid  = -1;
@@ -339,6 +348,8 @@ static struct {
 	uint8_t start, end;
 } log_buffer;
 static pthread_mutex_t log_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define LOG_PREFIX_SIZE 32
+char log_prefix[LOG_PREFIX_SIZE] = { 0 };
 
 GKeyFile *igt_key_file;
 
@@ -348,6 +359,67 @@ char *igt_rc_device;
 static bool stderr_needs_sentinel = false;
 
 static int _igt_dynamic_tests_executed = -1;
+
+static void print_backtrace(void)
+{
+	unw_cursor_t cursor;
+	unw_context_t uc;
+	int stack_num = 0;
+
+	Dwfl_Callbacks cbs = {
+		.find_elf = dwfl_linux_proc_find_elf,
+		.find_debuginfo = dwfl_standard_find_debuginfo,
+	};
+
+	Dwfl *dwfl = dwfl_begin(&cbs);
+
+	if (dwfl_linux_proc_report(dwfl, getpid())) {
+		dwfl_end(dwfl);
+		dwfl = NULL;
+	} else
+		dwfl_report_end(dwfl, NULL, NULL);
+
+	igt_info("Stack trace:\n");
+
+	unw_getcontext(&uc);
+	unw_init_local(&cursor, &uc);
+	while (unw_step(&cursor) > 0) {
+		char name[255];
+		unw_word_t off, ip;
+		Dwfl_Module *mod = NULL;
+
+		unw_get_reg(&cursor, UNW_REG_IP, &ip);
+
+		if (dwfl)
+			mod = dwfl_addrmodule(dwfl, ip);
+
+		if (mod) {
+			const char *src, *dwfl_name;
+			Dwfl_Line *line;
+			int lineno;
+			GElf_Sym sym;
+
+			line = dwfl_module_getsrc(mod, ip);
+			dwfl_name = dwfl_module_addrsym(mod, ip, &sym, NULL);
+
+			if (line && dwfl_name) {
+				src = dwfl_lineinfo(line, NULL, &lineno, NULL, NULL, NULL);
+				igt_info("  #%d %s:%d %s()\n", stack_num++, src, lineno, dwfl_name);
+				continue;
+			}
+		}
+
+		if (unw_get_proc_name(&cursor, name, 255, &off) < 0)
+			igt_info("  #%d [<unknown>+0x%x]\n", stack_num++,
+				 (unsigned int) ip);
+		else
+			igt_info("  #%d [%s+0x%x]\n", stack_num++, name,
+				 (unsigned int) off);
+	}
+
+	if (dwfl)
+		dwfl_end(dwfl);
+}
 
 __attribute__((format(printf, 2, 3)))
 static void internal_assert(bool cond, const char *format, ...)
@@ -359,6 +431,8 @@ static void internal_assert(bool cond, const char *format, ...)
 		vfprintf(stderr, format, ap);
 		va_end(ap);
 		fprintf(stderr, "please refer to lib/igt_core documentation\n");
+
+		print_backtrace();
 
 		assert(0);
 	}
@@ -391,6 +465,109 @@ static void _igt_log_buffer_reset(void)
 	pthread_mutex_unlock(&log_buffer_mutex);
 }
 
+static void _log_to_runner_split(int stream, const char *str)
+{
+	size_t limit = 4096;
+	size_t len;
+	char *buf = NULL;
+
+	len = strlen(str);
+
+	while (len > limit) {
+		if (!buf)
+			buf = malloc(limit + 1);
+
+		strncpy(buf, str, limit);
+		buf[limit] = '\0';
+
+		send_to_runner(runnerpacket_log(stream, buf));
+
+		str += limit;
+		len -= limit;
+	}
+
+	send_to_runner(runnerpacket_log(stream, str));
+	free(buf);
+}
+
+__attribute__((format(printf, 2, 3)))
+static void _log_line_fprintf(FILE* stream, const char *format, ...)
+{
+	va_list ap;
+	char *str;
+
+	va_start(ap, format);
+
+	if (runner_connected()) {
+		vasprintf(&str, format, ap);
+		_log_to_runner_split(fileno(stream), str);
+		free(str);
+	} else {
+		vfprintf(stream, format, ap);
+	}
+}
+
+enum _subtest_type {
+      _SUBTEST_TYPE_NORMAL,
+      _SUBTEST_TYPE_DYNAMIC,
+};
+
+static void _subtest_result_message(enum _subtest_type subtest_type,
+				    const char *name,
+				    const char *result,
+				    double timeelapsed)
+{
+	char timestr[32];
+
+	snprintf(timestr, sizeof(timestr), "%.3f", timeelapsed);
+
+	if (runner_connected()) {
+		if (subtest_type == _SUBTEST_TYPE_NORMAL)
+			send_to_runner(runnerpacket_subtest_result(name, result, timestr, NULL));
+		else
+			send_to_runner(runnerpacket_dynamic_subtest_result(name, result, timestr, NULL));
+
+		return;
+	}
+
+	printf("%s%s %s: %s (%ss)%s\n",
+	       (!__igt_plain_output) ? "\x1b[1m" : "",
+	       subtest_type == _SUBTEST_TYPE_NORMAL ? "Subtest" : "Dynamic subtest",
+	       name,
+	       result,
+	       timestr,
+	       (!__igt_plain_output) ? "\x1b[0m" : "");
+	fflush(stdout);
+	if (stderr_needs_sentinel)
+		fprintf(stderr, "%s %s: %s (%ss)\n",
+			subtest_type == _SUBTEST_TYPE_NORMAL ? "Subtest" : "Dynamic subtest",
+			name,
+			result,
+			timestr);
+}
+
+static void _subtest_starting_message(enum _subtest_type subtest_type,
+				      const char *name)
+{
+	if (runner_connected()) {
+		if (subtest_type == _SUBTEST_TYPE_NORMAL)
+			send_to_runner(runnerpacket_subtest_start(name));
+		else
+			send_to_runner(runnerpacket_dynamic_subtest_start(name));
+
+		return;
+	}
+
+	igt_info("Starting %s: %s\n",
+		 subtest_type == _SUBTEST_TYPE_NORMAL ? "subtest" : "dynamic subtest",
+		 name);
+	fflush(stdout);
+	if (stderr_needs_sentinel)
+		fprintf(stderr, "Starting %s: %s\n",
+			subtest_type == _SUBTEST_TYPE_NORMAL ? "subtest" : "dynamic subtest",
+			name);
+}
+
 static void _igt_log_buffer_dump(void)
 {
 	uint8_t i;
@@ -413,31 +590,31 @@ static void _igt_log_buffer_dump(void)
 	}
 
 	if (in_dynamic_subtest)
-		fprintf(stderr, "Dynamic subtest %s failed.\n", in_dynamic_subtest);
+		_log_line_fprintf(stderr, "Dynamic subtest %s failed.\n", in_dynamic_subtest);
 	else if (in_subtest)
-		fprintf(stderr, "Subtest %s failed.\n", in_subtest);
+		_log_line_fprintf(stderr, "Subtest %s failed.\n", in_subtest);
 	else
-		fprintf(stderr, "Test %s failed.\n", command_str);
+		_log_line_fprintf(stderr, "Test %s failed.\n", command_str);
 
 	if (log_buffer.start == log_buffer.end) {
-		fprintf(stderr, "No log.\n");
+		_log_line_fprintf(stderr, "No log.\n");
 		return;
 	}
 
 	pthread_mutex_lock(&log_buffer_mutex);
-	fprintf(stderr, "**** DEBUG ****\n");
+	_log_line_fprintf(stderr, "**** DEBUG ****\n");
 
 	i = log_buffer.start;
 	do {
 		char *last_line = log_buffer.entries[i];
-		fprintf(stderr, "%s", last_line);
+		_log_line_fprintf(stderr, "%s", last_line);
 		i++;
 	} while (i != log_buffer.start && i != log_buffer.end);
 
 	/* reset the buffer */
 	log_buffer.start = log_buffer.end = 0;
 
-	fprintf(stderr, "****  END  ****\n");
+	_log_line_fprintf(stderr, "****  END  ****\n");
 	pthread_mutex_unlock(&log_buffer_mutex);
 }
 
@@ -557,6 +734,12 @@ uint64_t igt_nsec_elapsed(struct timespec *start)
 
 	return ((now.tv_nsec - start->tv_nsec) +
 		(uint64_t)NSEC_PER_SEC*(now.tv_sec - start->tv_sec));
+}
+
+void __igt_assert_in_outer_scope(void)
+{
+	internal_assert(!in_subtest,
+			"must only be called outside of a subtest\n");
 }
 
 bool __igt_fixture(void)
@@ -692,9 +875,19 @@ static void print_version(void)
 
 	uname(&uts);
 
-	igt_info("IGT-Version: %s-%s (%s) (%s: %s %s)\n", PACKAGE_VERSION,
-		 IGT_GIT_SHA1, TARGET_CPU_PLATFORM,
-		 uts.sysname, uts.release, uts.machine);
+	if (runner_connected()) {
+		char versionstr[256];
+
+		snprintf(versionstr, sizeof(versionstr),
+			 "IGT-Version: %s-%s (%s) (%s: %s %s)\n", PACKAGE_VERSION,
+			 IGT_GIT_SHA1, TARGET_CPU_PLATFORM,
+			 uts.sysname, uts.release, uts.machine);
+		send_to_runner(runnerpacket_versionstring(versionstr));
+	} else {
+		igt_info("IGT-Version: %s-%s (%s) (%s: %s %s)\n", PACKAGE_VERSION,
+			 IGT_GIT_SHA1, TARGET_CPU_PLATFORM,
+			 uts.sysname, uts.release, uts.machine);
+	}
 }
 
 static void print_usage(const char *help_str, bool output_on_stderr)
@@ -865,6 +1058,11 @@ static void common_init_env(void)
 	env = getenv("IGT_DEVICE");
 	if (env) {
 		igt_rc_device = strdup(env);
+	}
+
+	env = getenv("IGT_RUNNER_SOCKET_FD");
+	if (env) {
+		set_runner_socket(atoi(env));
 	}
 }
 
@@ -1258,24 +1456,15 @@ bool __igt_run_subtest(const char *subtest_name, const char *file, const int lin
 
 
 	if (skip_subtests_henceforth) {
-		printf("%sSubtest %s: %s%s\n",
-		       (!__igt_plain_output) ? "\x1b[1m" : "", subtest_name,
-		       skip_subtests_henceforth == SKIP ?
-		       "SKIP" : "FAIL", (!__igt_plain_output) ? "\x1b[0m" : "");
-		fflush(stdout);
-		if (stderr_needs_sentinel)
-			fprintf(stderr, "Subtest %s: %s\n", subtest_name,
-				skip_subtests_henceforth == SKIP ?
-				"SKIP" : "FAIL");
+		_subtest_result_message(_SUBTEST_TYPE_NORMAL, subtest_name,
+					skip_subtests_henceforth == SKIP ? "SKIP" : "FAIL",
+					0.0);
 		return false;
 	}
 
 	igt_kmsg(KMSG_INFO "%s: starting subtest %s\n",
 		 command_str, subtest_name);
-	igt_info("Starting subtest: %s\n", subtest_name);
-	fflush(stdout);
-	if (stderr_needs_sentinel)
-		fprintf(stderr, "Starting subtest: %s\n", subtest_name);
+	_subtest_starting_message(_SUBTEST_TYPE_NORMAL, subtest_name);
 
 	_igt_log_buffer_reset();
 	igt_thread_clear_fail_state();
@@ -1303,10 +1492,7 @@ bool __igt_run_dynamic_subtest(const char *dynamic_subtest_name)
 
 	igt_kmsg(KMSG_INFO "%s: starting dynamic subtest %s\n",
 		 command_str, dynamic_subtest_name);
-	igt_info("Starting dynamic subtest: %s\n", dynamic_subtest_name);
-	fflush(stdout);
-	if (stderr_needs_sentinel)
-		fprintf(stderr, "Starting dynamic subtest: %s\n", dynamic_subtest_name);
+	_subtest_starting_message(_SUBTEST_TYPE_DYNAMIC, dynamic_subtest_name);
 
 	_igt_log_buffer_reset();
 	igt_thread_clear_fail_state();
@@ -1382,27 +1568,32 @@ bool __igt_enter_dynamic_container(void)
 	return true;
 }
 
+static void kill_and_wait(pid_t *pids, int size, int signum)
+{
+	for (int c = 0; c < size; c++) {
+		if (pids[c] > 0) {
+			kill(pids[c], signum);
+			waitpid(pids[c], NULL, 0); /* don't leave zombies! */
+		}
+	}
+}
+
 __noreturn static void exit_subtest(const char *result)
 {
 	struct timespec now;
-	const char *subtest_text = in_dynamic_subtest ? "Dynamic subtest" : "Subtest";
 	const char **subtest_name = in_dynamic_subtest ? &in_dynamic_subtest : &in_subtest;
 	struct timespec *thentime = in_dynamic_subtest ? &dynamic_subtest_time : &subtest_time;
 	jmp_buf *jmptarget = in_dynamic_subtest ? &igt_dynamic_jmpbuf : &igt_subtest_jmpbuf;
 
 	igt_gettime(&now);
 
-	igt_info("%s%s %s: %s (%.3fs)%s\n",
-		 (!__igt_plain_output) ? "\x1b[1m" : "",
-		 subtest_text, *subtest_name, result,
-		 igt_time_elapsed(thentime, &now),
-		 (!__igt_plain_output) ? "\x1b[0m" : "");
-	fflush(stdout);
-	if (stderr_needs_sentinel)
-		fprintf(stderr, "%s %s: %s (%.3fs)\n",
-			subtest_text, *subtest_name,
-			result, igt_time_elapsed(thentime, &now));
+	if (test_multi_fork_child)
+		__igt_plain_output = true;
 
+	_subtest_result_message(in_dynamic_subtest ? _SUBTEST_TYPE_DYNAMIC : _SUBTEST_TYPE_NORMAL,
+				*subtest_name,
+				result,
+				igt_time_elapsed(thentime, &now));
 	igt_terminate_spins();
 
 	/* If the subtest aborted, it may have left children behind */
@@ -1413,6 +1604,10 @@ __noreturn static void exit_subtest(const char *result)
 		}
 	}
 	num_test_children = 0;
+	if (!test_multi_fork_child && num_test_multi_fork_children > 0)
+		kill_and_wait(test_multi_fork_children, num_test_multi_fork_children, SIGKILL);
+
+	num_test_multi_fork_children = 0;
 
 	/*
 	 * When test completes - mostly in fail state it can leave allocated
@@ -1426,15 +1621,18 @@ __noreturn static void exit_subtest(const char *result)
 	 * remnants from previous allocator run (if any).
 	 */
 	intel_allocator_init();
+	intel_bb_reinit_allocator();
+	gem_pool_init();
 
 	if (!in_dynamic_subtest)
 		_igt_dynamic_tests_executed = -1;
 
 	/*
 	 * Don't keep the above text in the log if exiting a dynamic
-	 * subsubtest, the subtest would print it again otherwise
+	 * subsubtest, the subtest would print it again otherwise.
+	 * Also don't keep it if called from multi_fork.
 	 */
-	if (in_dynamic_subtest)
+	if (in_dynamic_subtest || test_multi_fork_child)
 		_igt_log_buffer_reset();
 
 	*subtest_name = NULL;
@@ -1463,15 +1661,32 @@ void igt_skip(const char *f, ...)
 
 	internal_assert(!test_child,
 			"skips are not allowed in forks\n");
+	internal_assert(!test_multi_fork_child,
+			"skips are not allowed in multi_fork\n");
 
 	if (!igt_only_list_subtests()) {
 		va_start(args, f);
-		vprintf(f, args);
+		if (runner_connected()) {
+			char *str;
+
+			vasprintf(&str, f, args);
+			send_to_runner(runnerpacket_log(STDOUT_FILENO, str));
+			free(str);
+		} else {
+			vprintf(f, args);
+		}
 		va_end(args);
 	}
 
 	if (in_subtest) {
-		/* Doing the same even if inside a dynamic subtest */
+		if (in_dynamic_subtest) {
+			/*
+			 * Don't count skipping dynamic subtests, for
+			 * the purposes of getting the result of the
+			 * containing subtest.
+			 */
+			_igt_dynamic_tests_executed--;
+		}
 		exit_subtest("SKIP");
 	} else if (test_with_subtests) {
 		skip_subtests_henceforth = SKIP;
@@ -1604,11 +1819,14 @@ void igt_fail(int exitcode)
 
 	_igt_log_buffer_dump();
 
+	if (test_multi_fork_child)
+		exit(exitcode);
+
 	if (in_subtest) {
 		exit_subtest("FAIL");
 	} else {
 		internal_assert(igt_can_fail(), "failing test is only allowed"
-				" in fixtures, subtests and igt_simple_main");
+				" in fixtures, subtests and igt_simple_main\n");
 
 		if (in_fixture) {
 			skip_subtests_henceforth = FAIL;
@@ -1675,7 +1893,7 @@ void igt_describe_f(const char *fmt, ...)
 
 	internal_assert(!in_subtest || _igt_dynamic_tests_executed < 0,
 			"documenting dynamic subsubtests is impossible,"
-			" document the subtest instead.");
+			" document the subtest instead.\n");
 
 	if (!describe_subtests)
 		return;
@@ -1747,7 +1965,10 @@ static bool running_under_gdb(void)
 
 static void __write_stderr(const char *str, size_t len)
 {
-	igt_ignore_warn(write(STDERR_FILENO, str, len));
+	if (runner_connected())
+		log_to_runner_sig_safe(str, len);
+	else
+		igt_ignore_warn(write(STDERR_FILENO, str, len));
 }
 
 static void write_stderr(const char *str)
@@ -1755,73 +1976,15 @@ static void write_stderr(const char *str)
 	__write_stderr(str, strlen(str));
 }
 
-static void print_backtrace(void)
-{
-	unw_cursor_t cursor;
-	unw_context_t uc;
-	int stack_num = 0;
-
-	Dwfl_Callbacks cbs = {
-		.find_elf = dwfl_linux_proc_find_elf,
-		.find_debuginfo = dwfl_standard_find_debuginfo,
-	};
-
-	Dwfl *dwfl = dwfl_begin(&cbs);
-
-	if (dwfl_linux_proc_report(dwfl, getpid())) {
-		dwfl_end(dwfl);
-		dwfl = NULL;
-	} else
-		dwfl_report_end(dwfl, NULL, NULL);
-
-	igt_info("Stack trace:\n");
-
-	unw_getcontext(&uc);
-	unw_init_local(&cursor, &uc);
-	while (unw_step(&cursor) > 0) {
-		char name[255];
-		unw_word_t off, ip;
-		Dwfl_Module *mod = NULL;
-
-		unw_get_reg(&cursor, UNW_REG_IP, &ip);
-
-		if (dwfl)
-			mod = dwfl_addrmodule(dwfl, ip);
-
-		if (mod) {
-			const char *src, *dwfl_name;
-			Dwfl_Line *line;
-			int lineno;
-			GElf_Sym sym;
-
-			line = dwfl_module_getsrc(mod, ip);
-			dwfl_name = dwfl_module_addrsym(mod, ip, &sym, NULL);
-
-			if (line && dwfl_name) {
-				src = dwfl_lineinfo(line, NULL, &lineno, NULL, NULL, NULL);
-				igt_info("  #%d %s:%d %s()\n", stack_num++, src, lineno, dwfl_name);
-				continue;
-			}
-		}
-
-		if (unw_get_proc_name(&cursor, name, 255, &off) < 0)
-			igt_info("  #%d [<unknown>+0x%x]\n", stack_num++,
-				 (unsigned int) ip);
-		else
-			igt_info("  #%d [%s+0x%x]\n", stack_num++, name,
-				 (unsigned int) off);
-	}
-
-	if (dwfl)
-		dwfl_end(dwfl);
-}
-
 static const char hex[] = "0123456789abcdef";
 
 static void
 xputch(int c)
 {
-	igt_ignore_warn(write(STDERR_FILENO, (const void *) &c, 1));
+	if (runner_connected())
+		log_to_runner_sig_safe((const void *) &c, 1);
+	else
+		igt_ignore_warn(write(STDERR_FILENO, (const void *) &c, 1));
 }
 
 static int
@@ -2017,11 +2180,16 @@ void __igt_fail_assert(const char *domain, const char *file, const int line,
 	igt_fail(IGT_EXIT_FAILURE);
 }
 
-static void kill_children(void)
+void igt_kill_children(int signal)
 {
 	for (int c = 0; c < num_test_children; c++) {
 		if (test_children[c] > 0)
-			kill(test_children[c], SIGKILL);
+			kill(test_children[c], signal);
+	}
+
+	for (int c = 0; c < num_test_multi_fork_children; c++) {
+		if (test_multi_fork_children[c] > 0)
+			kill(test_multi_fork_children[c], signal);
 	}
 }
 
@@ -2049,7 +2217,7 @@ void __igt_abort(const char *domain, const char *file, const int line,
 	}
 
 	/* just try our best, we are aborting the execution anyway */
-	kill_children();
+	igt_kill_children(SIGKILL);
 
 	print_backtrace();
 
@@ -2108,13 +2276,17 @@ void igt_exit(void)
 			igt_exitcode = IGT_EXIT_SKIP;
 	}
 
-	if (command_str)
-		igt_kmsg(KMSG_INFO "%s: exiting, ret=%d\n",
-			 command_str, igt_exitcode);
-	igt_debug("Exiting with status code %d\n", igt_exitcode);
+	if (!test_multi_fork_child) {
+		/* parent will do the yelling */
+		if (command_str)
+			igt_kmsg(KMSG_INFO "%s: exiting, ret=%d\n",
+				 command_str, igt_exitcode);
+		igt_debug("Exiting with status code %d\n", igt_exitcode);
+	}
 
-	kill_children();
+	igt_kill_children(SIGKILL);
 	assert(!num_test_children);
+	assert(!num_test_multi_fork_children);
 
 	assert(waitpid(-1, &tmp, WNOHANG) == -1 && errno == ECHILD);
 
@@ -2135,8 +2307,13 @@ void igt_exit(void)
 				result = "FAIL";
 		}
 
-		printf("%s (%.3fs)\n",
-		       result, igt_time_elapsed(&subtest_time, &now));
+		if (test_multi_fork_child) /* parent will do the yelling */
+			_log_line_fprintf(stdout, "dyn_child pid:%d (%.3fs) ends with err=%d\n",
+					  getpid(), igt_time_elapsed(&subtest_time, &now),
+					  igt_exitcode);
+		else
+			_log_line_fprintf(stdout, "%s (%.3fs)\n",
+					  result, igt_time_elapsed(&subtest_time, &now));
 	}
 
 	exit(igt_exitcode);
@@ -2335,6 +2512,64 @@ bool __igt_fork(void)
 
 }
 
+static void dyn_children_exit_handler(int sig)
+{
+	int status;
+
+	/* The exit handler can be called from a fatal signal, so play safe */
+	while (num_test_multi_fork_children-- && wait(&status))
+		;
+}
+
+bool __igt_multi_fork(void)
+{
+	internal_assert(!test_with_subtests || in_subtest,
+			"multi-forking is only allowed in subtests or igt_simple_main\n");
+	internal_assert(!test_child,
+			"multi-forking is not allowed from already forked children\n");
+	internal_assert(!test_multi_fork_child,
+			"multi-forking is not allowed from already multi-forked children\n");
+
+	if (!num_test_multi_fork_children)
+		igt_install_exit_handler(dyn_children_exit_handler);
+
+	if (num_test_multi_fork_children >= test_multi_fork_children_sz) {
+		if (!test_multi_fork_children_sz)
+			test_multi_fork_children_sz = 4;
+		else
+			test_multi_fork_children_sz *= 2;
+
+		test_multi_fork_children = realloc(test_multi_fork_children,
+					sizeof(pid_t)*test_multi_fork_children_sz);
+		igt_assert(test_multi_fork_children);
+	}
+
+	/* ensure any buffers are flushed before fork */
+	fflush(NULL);
+
+	switch (test_multi_fork_children[num_test_multi_fork_children++] = fork()) {
+	case -1:
+		num_test_multi_fork_children--; /* so we won't kill(-1) during cleanup */
+		igt_assert(0);
+	case 0:
+		test_multi_fork_child = true;
+		snprintf(log_prefix, LOG_PREFIX_SIZE, "<g:%d> ", num_test_multi_fork_children - 1);
+		num_test_multi_fork_children = 0; /* only parent should care */
+		pthread_mutex_init(&print_mutex, NULL);
+		child_pid = getpid(); /* for allocator */
+		child_tid = -1; /* for allocator */
+		exit_handler_count = 0;
+		reset_helper_process_list();
+		oom_adjust_for_doom();
+		igt_unshare_spins();
+
+		return true;
+	default:
+		return false;
+	}
+
+}
+
 int __igt_waitchildren(void)
 {
 	int err = 0;
@@ -2379,7 +2614,7 @@ int __igt_waitchildren(void)
 				err = 256;
 			}
 
-			kill_children();
+			igt_kill_children(SIGKILL);
 		}
 
 		count++;
@@ -2404,16 +2639,87 @@ int __igt_waitchildren(void)
  */
 void igt_waitchildren(void)
 {
-	int err = __igt_waitchildren();
+	int err;
+
+	if (num_test_multi_fork_children)
+		err = __igt_multi_wait();
+	else
+		err = __igt_waitchildren();
+
 	if (err)
 		igt_fail(err);
+}
+
+int __igt_multi_wait(void)
+{
+	int err = 0;
+	int count;
+	bool was_killed = false;
+
+	assert(!test_multi_fork_child);
+	count = 0;
+	while (count < num_test_multi_fork_children) {
+		int status = -1;
+		int last = 0;
+		pid_t pid;
+		int c;
+
+		pid = wait(&status);
+		if (pid == -1) {
+			if (errno == EINTR)
+				continue;
+
+			igt_debug("wait(multi_fork children running:%d) failed with %m\n",
+				  num_test_multi_fork_children - count);
+			return IGT_EXIT_FAILURE;
+		}
+
+		for (c = 0; c < num_test_multi_fork_children; c++)
+			if (pid == test_multi_fork_children[c])
+				break;
+		if (c == num_test_multi_fork_children)
+			continue;
+
+		if (status != 0) {
+			if (WIFEXITED(status)) {
+				printf("dynamic child %i pid:%d failed with exit status %i\n",
+				       c, pid, WEXITSTATUS(status));
+				last = WEXITSTATUS(status);
+				test_multi_fork_children[c] = -1;
+			} else if (WIFSIGNALED(status)) {
+				printf("dynamic child %i pid:%d died with signal %i, %s\n",
+				       c, pid, WTERMSIG(status),
+				       strsignal(WTERMSIG(status)));
+				last = 128 + WTERMSIG(status);
+				test_multi_fork_children[c] = -1;
+			} else {
+				printf("Unhandled failure [%d] in dynamic child %i pid:%d\n",
+				       status, c, pid);
+				last = 256;
+			}
+
+			/* we don't want to overwrite error with skip */
+			if (err == 0 || err == IGT_EXIT_SKIP)
+				err = last;
+			if (err && err != IGT_EXIT_SKIP && !was_killed) {
+				igt_kill_children(SIGKILL); // if non-skip happen
+				was_killed = true;
+			}
+		}
+
+		count++;
+	}
+
+	num_test_multi_fork_children = 0;
+
+	return err;
 }
 
 static void igt_alarm_killchildren(int signal)
 {
 	igt_info("Timed out waiting for children\n");
 
-	kill_children();
+	igt_kill_children(SIGKILL);
 }
 
 /**
@@ -2438,7 +2744,10 @@ void igt_waitchildren_timeout(int seconds, const char *reason)
 
 	alarm(seconds);
 
-	ret = __igt_waitchildren();
+	if (num_test_multi_fork_children)
+		ret = __igt_multi_wait();
+	else
+		ret = __igt_waitchildren();
 	igt_reset_timeout();
 	if (ret)
 		igt_fail(ret);
@@ -2768,11 +3077,10 @@ void igt_vlog(const char *domain, enum igt_log_level level, const char *format, 
 	program_name = command_str;
 #endif
 
-
 	if (igt_thread_is_main()) {
-		thread_id = strdup("");
+		thread_id = strdup(log_prefix);
 	} else {
-		if (asprintf(&thread_id, "[thread:%d] ", gettid()) == -1)
+		if (asprintf(&thread_id, "%s[thread:%d] ", log_prefix, gettid()) == -1)
 			thread_id = NULL;
 	}
 
@@ -2830,11 +3138,9 @@ void igt_vlog(const char *domain, enum igt_log_level level, const char *format, 
 	/* prepend all except information messages with process, domain and log
 	 * level information */
 	if (level != IGT_LOG_INFO) {
-		fwrite(formatted_line, sizeof(char), strlen(formatted_line),
-		       file);
+		_log_line_fprintf(file, "%s", formatted_line);
 	} else {
-		fwrite(thread_id, sizeof(char), strlen(thread_id), file);
-		fwrite(line, sizeof(char), strlen(line), file);
+		_log_line_fprintf(file, "%s%s", thread_id, line);
 	}
 
 	pthread_mutex_unlock(&print_mutex);
@@ -2918,8 +3224,7 @@ FILE *__igt_fopen_data(const char* igt_srcdir, const char* igt_datadir,
 	}
 
 	if (!fp)
-		igt_critical("Could not open data file \"%s\": %s", filename,
-			     strerror(errno));
+		igt_critical("Could not open data file \"%s\": %m\n", filename);
 
 	return fp;
 }
@@ -3060,4 +3365,24 @@ err:
 	close(nullfd);
 
 	return -1;
+}
+
+/* IGT wrappers around libpciaccess init/cleanup functions */
+
+static void pci_system_exit_handler(int sig)
+{
+	pci_system_cleanup();
+}
+
+static void __pci_system_init(void)
+{
+	if (!igt_warn_on_f(pci_system_init(), "Could not initialize libpciaccess global data\n"))
+		igt_install_exit_handler(pci_system_exit_handler);
+}
+
+int igt_pci_system_init(void)
+{
+	static pthread_once_t once_control = PTHREAD_ONCE_INIT;
+
+	return pthread_once(&once_control, __pci_system_init);
 }

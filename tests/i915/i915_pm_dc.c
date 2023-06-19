@@ -31,8 +31,11 @@
 #include "igt_kmod.h"
 #include "igt_psr.h"
 #include "igt_sysfs.h"
+#include "igt_device.h"
+#include "igt_device_scan.h"
 #include "limits.h"
 #include "time.h"
+#include "igt_pm.h"
 
 /* DC State Flags */
 #define CHECK_DC5	(1 << 0)
@@ -40,6 +43,14 @@
 #define CHECK_DC3CO	(1 << 2)
 
 #define PWR_DOMAIN_INFO "i915_power_domain_info"
+#define RPM_STATUS "i915_runtime_pm_status"
+#define KMS_HELPER "/sys/module/drm_kms_helper/parameters/"
+#define KMS_POLL_DISABLE 0
+#define DC9_RESETS_DC_COUNTERS(devid) (!(IS_DG1(devid) || IS_DG2(devid)))
+
+IGT_TEST_DESCRIPTION("Tests to validate display power DC states.");
+
+bool kms_poll_saved_state;
 
 typedef struct {
 	double r, g, b;
@@ -50,7 +61,7 @@ typedef struct {
 	int msr_fd;
 	int debugfs_fd;
 	uint32_t devid;
-	char *pwr_dmn_info;
+	char *debugfs_dump;
 	igt_display_t display;
 	struct igt_fb fb_white, fb_rgb, fb_rgr;
 	enum psr_mode op_psr_mode;
@@ -61,6 +72,15 @@ typedef struct {
 
 static bool dc_state_wait_entry(int drm_fd, int dc_flag, int prev_dc_count);
 static void check_dc_counter(data_t *data, int dc_flag, uint32_t prev_dc_count);
+
+static bool is_dgfx(data_t *data)
+{
+	char buf[4096];
+
+	igt_debugfs_simple_read(data->debugfs_fd, "i915_capabilities",
+				buf, sizeof(buf));
+	return strstr(buf, "is_dgfx: yes");
+}
 
 static void setup_output(data_t *data)
 {
@@ -144,7 +164,7 @@ static void setup_primary(data_t *data)
 	igt_create_color_fb(data->drm_fd,
 			    data->mode->hdisplay, data->mode->vdisplay,
 			    DRM_FORMAT_XRGB8888,
-			    LOCAL_I915_FORMAT_MOD_X_TILED,
+			    I915_FORMAT_MOD_X_TILED,
 			    1.0, 1.0, 1.0,
 			    &data->fb_white);
 	igt_plane_set_fb(primary, &data->fb_white);
@@ -159,7 +179,7 @@ static void create_color_fb(data_t *data, igt_fb_t *fb, color_t *fb_color)
 			      data->mode->hdisplay,
 			      data->mode->vdisplay,
 			      DRM_FORMAT_XRGB8888,
-			      LOCAL_DRM_FORMAT_MOD_NONE,
+			      DRM_FORMAT_MOD_LINEAR,
 			      fb);
 	igt_assert(fb_id);
 	paint_rectangles(data, data->mode, fb_color, fb);
@@ -209,15 +229,21 @@ static bool dc_state_wait_entry(int debugfs_fd, int dc_flag, int prev_dc_count)
 			prev_dc_count, 3000, 100);
 }
 
+static const char *dc_state_name(int dc_flag)
+{
+	if (dc_flag & CHECK_DC3CO)
+		return "DC3CO";
+	else if (dc_flag & CHECK_DC5)
+		return "DC5";
+	else
+		return "DC6";
+}
+
 static void check_dc_counter(data_t *data, int dc_flag, uint32_t prev_dc_count)
 {
-	char tmp[64];
-
-	snprintf(tmp, sizeof(tmp), "%s", dc_flag & CHECK_DC3CO ? "DC3CO" :
-		(dc_flag & CHECK_DC5 ? "DC5" : "DC6"));
 	igt_assert_f(dc_state_wait_entry(data->debugfs_fd, dc_flag, prev_dc_count),
-		     "%s state is not achieved\n%s:\n%s\n", tmp, PWR_DOMAIN_INFO,
-		     data->pwr_dmn_info = igt_sysfs_get(data->debugfs_fd, PWR_DOMAIN_INFO));
+		     "%s state is not achieved\n%s:\n%s\n", dc_state_name(dc_flag), PWR_DOMAIN_INFO,
+		     data->debugfs_dump = igt_sysfs_get(data->debugfs_fd, PWR_DOMAIN_INFO));
 }
 
 static void setup_videoplayback(data_t *data)
@@ -263,7 +289,8 @@ static void check_dc3co_with_videoplayback_like_load(data_t *data)
 		usleep(delay);
 	}
 
-	check_dc_counter(data, CHECK_DC3CO, dc3co_prev_cnt);
+	igt_require_f(dc_state_wait_entry(data->debugfs_fd,
+		      CHECK_DC3CO, dc3co_prev_cnt), "dc3co-vpb-simulation not enabled\n");
 }
 
 static void require_dc_counter(int debugfs_fd, int dc_flag)
@@ -337,7 +364,7 @@ static void cleanup_dc_dpms(data_t *data)
 static void setup_dc_dpms(data_t *data)
 {
 	if (IS_BROXTON(data->devid) || IS_GEMINILAKE(data->devid) ||
-	    AT_LEAST_GEN(data->devid, 11)) {
+	    intel_display_ver(data->devid) >= 11) {
 		igt_disable_runtime_pm();
 		data->runtime_suspend_disabled = true;
 	} else {
@@ -393,50 +420,86 @@ static bool support_dc6(int debugfs_fd)
 	return strstr(buf, "DC5 -> DC6 count");
 }
 
-static bool check_dc9(uint32_t debugfs_fd, int prev_dc, bool dc6_supported, int seconds)
+static int read_runtime_suspended_time(int drm_fd)
 {
-	/*
-	 * since we do not have DC9 counter,
-	 * so we rely on dc5/dc6 counter reset to check if display engine was in DC9.
-	 */
-	return igt_wait(dc6_supported ? read_dc_counter(debugfs_fd, CHECK_DC6) <
-			prev_dc : read_dc_counter(debugfs_fd, CHECK_DC5) <
-			prev_dc, seconds, 100);
+	struct pci_device *i915;
+	int ret;
+
+	i915 = igt_device_get_pci_device(drm_fd);
+	ret = igt_pm_get_runtime_suspended_time(i915);
+	igt_assert_lte(0, ret);
+
+	return ret;
 }
 
-static void setup_dc9_dpms(data_t *data, int prev_dc, bool dc6_supported)
+static bool dc9_wait_entry(data_t *data, int dc_target, int prev_dc, int prev_rpm, int msecs)
 {
-	setup_dc_dpms(data);
-	dpms_off(data);
-	igt_skip_on_f(!(igt_wait(dc6_supported ? read_dc_counter(data->debugfs_fd, CHECK_DC6) >
-				prev_dc : read_dc_counter(data->debugfs_fd, CHECK_DC5) >
+	/*
+	 * Runtime suspended residency should increment once DC9 is achieved;
+	 * this condition is valid for all platforms.
+	 * However, resetting of dc5/dc6 counter to check if display engine was in DC9;
+	 * this condition at present can be skipped for dg1 and dg2 platforms.
+	 */
+	return igt_wait((read_runtime_suspended_time(data->drm_fd) > prev_rpm) &&
+			(!DC9_RESETS_DC_COUNTERS(data->devid) ||
+			(read_dc_counter(data->debugfs_fd, dc_target) < prev_dc)), msecs, 1000);
+}
+
+static void check_dc9(data_t *data, int dc_target, int prev_dc, int prev_rpm)
+{
+	igt_assert_f(dc9_wait_entry(data, dc_target, prev_dc, prev_rpm, 3000),
+			"DC9 state is not achieved\n%s:\n%s\n", RPM_STATUS,
+			data->debugfs_dump = igt_sysfs_get(data->debugfs_fd, RPM_STATUS));
+}
+
+static void setup_dc9_dpms(data_t *data, int dc_target)
+{
+	int prev_dc = 0, prev_rpm, sysfs_fd;
+
+	igt_require((sysfs_fd = open(KMS_HELPER, O_RDONLY)) >= 0);
+	kms_poll_saved_state = igt_sysfs_get_boolean(sysfs_fd, "poll");
+	igt_sysfs_set_boolean(sysfs_fd, "poll", KMS_POLL_DISABLE);
+	close(sysfs_fd);
+	if (DC9_RESETS_DC_COUNTERS(data->devid)) {
+		prev_dc = read_dc_counter(data->debugfs_fd, dc_target);
+		setup_dc_dpms(data);
+		dpms_off(data);
+		igt_skip_on_f(!(igt_wait(read_dc_counter(data->debugfs_fd, dc_target) >
 				prev_dc, 3000, 100)), "Unable to enters shallow DC states\n");
+		prev_dc = read_dc_counter(data->debugfs_fd, dc_target);
+		dpms_on(data);
+		cleanup_dc_dpms(data);
+	}
+	prev_rpm = read_runtime_suspended_time(data->drm_fd);
+	dpms_off(data);
+	check_dc9(data, dc_target, prev_dc, prev_rpm);
 	dpms_on(data);
-	cleanup_dc_dpms(data);
 }
 
 static void test_dc9_dpms(data_t *data)
 {
-	bool dc6_supported;
+	int dc_target;
 
 	require_dc_counter(data->debugfs_fd, CHECK_DC5);
-	dc6_supported = support_dc6(data->debugfs_fd);
-	setup_dc9_dpms(data, dc6_supported ? read_dc_counter(data->debugfs_fd, CHECK_DC6) :
-			read_dc_counter(data->debugfs_fd, CHECK_DC5), dc6_supported);
-	dpms_off(data);
-	igt_assert_f(check_dc9(data->debugfs_fd, dc6_supported ?
-				read_dc_counter(data->debugfs_fd, CHECK_DC6) :
-				read_dc_counter(data->debugfs_fd, CHECK_DC5),
-				dc6_supported, 3000), "Not in DC9\n");
-	dpms_on(data);
+	dc_target = support_dc6(data->debugfs_fd) ? CHECK_DC6 : CHECK_DC5;
+	setup_dc9_dpms(data, dc_target);
 }
 
-IGT_TEST_DESCRIPTION("These tests validate Display Power DC states");
-int main(int argc, char *argv[])
+static void kms_poll_state_restore(int sig)
+{
+	int sysfs_fd;
+
+	sysfs_fd = open(KMS_HELPER, O_RDONLY);
+	if (sysfs_fd >= 0) {
+		igt_sysfs_set_boolean(sysfs_fd, "poll", kms_poll_saved_state);
+		close(sysfs_fd);
+	}
+}
+
+igt_main
 {
 	data_t data = {};
 
-	igt_subtest_init(argc, argv);
 	igt_fixture {
 		data.drm_fd = drm_open_driver_master(DRIVER_INTEL);
 		data.debugfs_fd = igt_debugfs_dir(data.drm_fd);
@@ -453,6 +516,7 @@ int main(int argc, char *argv[])
 		data.msr_fd = open("/dev/cpu/0/msr", O_RDONLY);
 		igt_assert_f(data.msr_fd >= 0,
 			     "Can't open /dev/cpu/0/msr.\n");
+		igt_install_exit_handler(kms_poll_state_restore);
 	}
 
 	igt_describe("In this test we make sure that system enters DC3CO "
@@ -498,16 +562,18 @@ int main(int argc, char *argv[])
 
 	igt_describe("This test validates display engine entry to DC9 state");
 	igt_subtest("dc9-dpms") {
-		igt_require_f(igt_pm_pc8_plus_residencies_enabled(data.msr_fd),
-				"PC8+ residencies not supported\n");
+		if (!(is_dgfx(&data)))
+			igt_require_f(igt_pm_pc8_plus_residencies_enabled(data.msr_fd),
+				      "PC8+ residencies not supported\n");
 		test_dc9_dpms(&data);
 	}
 
 	igt_fixture {
-		free(data.pwr_dmn_info);
+		free(data.debugfs_dump);
 		close(data.debugfs_fd);
 		close(data.msr_fd);
 		display_fini(&data);
+		close(data.drm_fd);
 	}
 
 	igt_exit();

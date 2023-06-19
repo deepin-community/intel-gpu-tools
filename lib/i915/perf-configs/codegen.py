@@ -1,3 +1,4 @@
+import re
 import xml.etree.ElementTree as et
 
 class Codegen:
@@ -94,8 +95,8 @@ class Set:
             counter = Counter(self, xml_counter)
             self.counters.append(counter)
             self.counter_vars["$" + counter.get('symbol_name')] = counter
-            self.max_funcs[counter.get('symbol_name')] = counter.max_sym
-            self.read_funcs[counter.get('symbol_name')] = counter.read_sym
+            self.max_funcs["$" + counter.get('symbol_name')] = counter.max_sym
+            self.read_funcs["$" + counter.get('symbol_name')] = counter.read_sym
 
         for counter in self.counters:
             counter.compute_hashes()
@@ -122,6 +123,51 @@ class Set:
     def find(self, path):
         return self.xml.find(path)
 
+
+hw_vars_mapping = {
+    "$EuCoresTotalCount": { 'c': "perf->devinfo.n_eus", 'desc': "The total number of execution units" },
+    "$EuSlicesTotalCount": { 'c': "perf->devinfo.n_eu_slices" },
+    "$EuSubslicesTotalCount": { 'c': "perf->devinfo.n_eu_sub_slices" },
+    "$EuDualSubslicesTotalCount": { 'c': "perf->devinfo.n_eu_sub_slices" },
+    "$EuDualSubslicesSlice0123Count": { 'c': "perf->devinfo.n_eu_sub_slices_half_slices" },
+    "$EuThreadsCount": { 'c': "perf->devinfo.eu_threads_count" },
+
+    "$VectorEngineTotalCount": { 'c': "perf->devinfo.n_eus", 'desc': "The total number of execution units" },
+    "$VectorEnginePerXeCoreCount": { 'c': "perf->devinfo.n_eu_sub_slices" },
+    "$VectorEngineThreadsCount": { 'c': "perf->devinfo.eu_threads_count" },
+
+    "$SliceMask": { 'c': "perf->devinfo.slice_mask" },
+    "$SliceTotalCount": { 'c': "perf->devinfo.n_eu_slices" },
+
+    "$SubsliceMask": { 'c': "perf->devinfo.subslice_mask" },
+    "$DualSubsliceMask": { 'c': "perf->devinfo.subslice_mask" },
+
+    "$GtSliceMask": { 'c': "perf->devinfo.slice_mask" },
+    "$GtSubsliceMask": { 'c': "perf->devinfo.subslice_mask" },
+    "$GtDualSubsliceMask": { 'c': "perf->devinfo.subslice_mask" },
+
+    "$GtXeCoreMask": { 'c': "perf->devinfo.slice_mask" },
+    "$XeCoreMask": { 'c': "perf->devinfo.slice_mask" },
+    "$XeCoreTotalCount": { 'c': 'perf->devinfo.n_eu_sub_slices' },
+
+    "$GpuTimestampFrequency": { 'c': "perf->devinfo.timestamp_frequency" },
+    "$GpuMinFrequency": { 'c': "perf->devinfo.gt_min_freq" },
+    "$GpuMaxFrequency": { 'c': "perf->devinfo.gt_max_freq" },
+    "$SkuRevisionId": { 'c': "perf->devinfo.revision" },
+    "$QueryMode": { 'c': "perf->devinfo.query_mode" },
+}
+
+def is_hw_var(name):
+    m = re.search('\$GtSlice([0-9]+)XeCore([0-9]+)$', name)
+    if m:
+        return True
+    m = re.search('\$GtSlice([0-9]+)$', name)
+    if m:
+        return True
+    m = re.search('\$GtSlice([0-9]+)DualSubslice([0-9]+)$', name)
+    if m:
+        return True
+    return name in hw_vars_mapping
 
 class Gen:
     def __init__(self, filename, c):
@@ -150,28 +196,24 @@ class Gen:
         self.ops["<<"]       = (2, self.emit_lshft)
         self.ops[">>"]       = (2, self.emit_rshft)
         self.ops["AND"]      = (2, self.emit_and)
+        self.ops["UGTE"]     = (2, self.emit_ugte)
+        self.ops["UGT"]      = (2, self.emit_ugt)
+        self.ops["ULTE"]     = (2, self.emit_ulte)
+        self.ops["ULT"]      = (2, self.emit_ult)
 
         self.exp_ops = {}
         #                 (n operands, splicer)
         self.exp_ops["AND"]  = (2, self.splice_bitwise_and)
         self.exp_ops["UGTE"] = (2, self.splice_ugte)
+        self.exp_ops["UGT"]  = (2, self.splice_ugt)
+        self.exp_ops["ULTE"] = (2, self.splice_ulte)
         self.exp_ops["ULT"]  = (2, self.splice_ult)
         self.exp_ops["&&"]   = (2, self.splice_logical_and)
+        self.exp_ops["<<"]   = (2, self.splice_lshft)
+        self.exp_ops[">>"]   = (2, self.splice_rshft)
+        self.exp_ops["UMUL"] = (2, self.splice_uml)
 
-        self.hw_vars = {
-            "$EuCoresTotalCount": { 'c': "perf->devinfo.n_eus", 'desc': "The total number of execution units" },
-            "$EuSlicesTotalCount": { 'c': "perf->devinfo.n_eu_slices" },
-            "$EuSubslicesTotalCount": { 'c': "perf->devinfo.n_eu_sub_slices" },
-            "$EuThreadsCount": { 'c': "perf->devinfo.eu_threads_count" },
-            "$SliceMask": { 'c': "perf->devinfo.slice_mask" },
-            "$DualSubsliceMask": { 'c': "perf->devinfo.subslice_mask" },
-            "$SubsliceMask": { 'c': "perf->devinfo.subslice_mask" },
-            "$GpuTimestampFrequency": { 'c': "perf->devinfo.timestamp_frequency" },
-            "$GpuMinFrequency": { 'c': "perf->devinfo.gt_min_freq" },
-            "$GpuMaxFrequency": { 'c': "perf->devinfo.gt_max_freq" },
-            "$SkuRevisionId": { 'c': "perf->devinfo.revision" },
-            "$QueryMode": { 'c': "perf->devinfo.query_mode" },
-        }
+        self.hw_vars = hw_vars_mapping
 
     def emit_fadd(self, tmp_id, args):
         self.c("double tmp{0} = {1} + {2};".format(tmp_id, args[1], args[0]))
@@ -238,6 +280,22 @@ class Gen:
         self.c("uint64_t tmp{0} = {1} & {2};".format(tmp_id, args[1], args[0]))
         return tmp_id + 1
 
+    def emit_ulte(self, tmp_id, args):
+        self.c("uint64_t tmp{0} = {1} <= {2};".format(tmp_id, args[1], args[0]))
+        return tmp_id + 1
+
+    def emit_ult(self, tmp_id, args):
+        self.c("uint64_t tmp{0} = {1} < {2};".format(tmp_id, args[1], args[0]))
+        return tmp_id + 1
+
+    def emit_ugte(self, tmp_id, args):
+        self.c("uint64_t tmp{0} = {1} >= {2};".format(tmp_id, args[1], args[0]))
+        return tmp_id + 1
+
+    def emit_ugt(self, tmp_id, args):
+        self.c("uint64_t tmp{0} = {1} > {2};".format(tmp_id, args[1], args[0]))
+        return tmp_id + 1
+
     def brkt(self, subexp):
         if " " in subexp:
             return "(" + subexp + ")"
@@ -250,11 +308,42 @@ class Gen:
     def splice_logical_and(self, args):
         return self.brkt(args[1]) + " && " + self.brkt(args[0])
 
+    def splice_ulte(self, args):
+        return self.brkt(args[1]) + " <= " + self.brkt(args[0])
+
     def splice_ult(self, args):
         return self.brkt(args[1]) + " < " + self.brkt(args[0])
 
     def splice_ugte(self, args):
         return self.brkt(args[1]) + " >= " + self.brkt(args[0])
+
+    def splice_ugt(self, args):
+        return self.brkt(args[1]) + " > " + self.brkt(args[0])
+
+    def splice_lshft(self, args):
+        return '(' + self.brkt(args[1]) + " << " + self.brkt(args[0]) + ')'
+
+    def splice_rshft(self, args):
+        return '(' + self.brkt(args[1]) + " >> " + self.brkt(args[0]) + ')'
+
+    def splice_uml(self, args):
+        return self.brkt(args[1]) + " * " + self.brkt(args[0])
+
+    def resolve_variable(self, name, set):
+        if name in self.hw_vars:
+            return self.hw_vars[name]['c']
+        if name in set.counter_vars:
+            return set.read_funcs[name] + "(perf, metric_set, accumulator)"
+        m = re.search('\$GtSlice([0-9]+)$', name)
+        if m:
+            return 'intel_perf_devinfo_slice_available(&perf->devinfo, {0})'.format(m.group(1))
+        m = re.search('\$GtSlice([0-9]+)DualSubslice([0-9]+)$', name)
+        if m:
+            return 'intel_perf_devinfo_subslice_available(&perf->devinfo, {0}, {1})'.format(m.group(1), m.group(2))
+        m = re.search('\$GtSlice([0-9]+)XeCore([0-9]+)$', name)
+        if m:
+            return 'intel_perf_devinfo_subslice_available(&perf->devinfo, {0}, {1})'.format(m.group(1), m.group(2))
+        return None
 
     def output_rpn_equation_code(self, set, counter, equation):
         self.c("/* RPN equation: " + equation + " */")
@@ -272,13 +361,10 @@ class Gen:
                 for i in range(0, argc):
                     operand = stack.pop()
                     if operand[0] == "$":
-                        if operand in self.hw_vars:
-                            operand = self.hw_vars[operand]['c']
-                        elif operand in set.counter_vars:
-                            reference = set.counter_vars[operand]
-                            operand = set.read_funcs[operand[1:]] + "(perf, metric_set, accumulator)"
-                        else:
+                        resolved_variable = self.resolve_variable(operand, set)
+                        if resolved_variable == None:
                             raise Exception("Failed to resolve variable " + operand + " in equation " + equation + " for " + set.name + " :: " + counter.get('name'));
+                        operand = resolved_variable
                     args.append(operand)
 
                 tmp_id = callback(tmp_id, args)
@@ -293,10 +379,11 @@ class Gen:
 
         value = stack[-1]
 
-        if value in self.hw_vars:
-            value = self.hw_vars[value]['c']
-        if value in set.counter_vars:
-            value = set.read_funcs[value[1:]] + "(perf, metric_set, accumulator)"
+        if value[0] == "$":
+            resolved_variable = self.resolve_variable(value, set)
+            if resolved_variable == None:
+                raise Exception("Failed to resolve variable " + value + " in expression " + expression + " for " + set.name + " :: " + counter_name)
+            value = resolved_variable
 
         self.c("\nreturn " + value + ";")
 
@@ -313,10 +400,10 @@ class Gen:
                 for i in range(0, argc):
                     operand = stack.pop()
                     if operand[0] == "$":
-                        if operand in self.hw_vars:
-                            operand = self.hw_vars[operand]['c']
-                        else:
+                        resolved_variable = self.resolve_variable(operand, set)
+                        if resolved_variable == None:
                             raise Exception("Failed to resolve variable " + operand + " in expression " + expression + " for " + set.name + " :: " + counter_name)
+                        operand = resolved_variable
                     args.append(operand)
 
                 subexp = callback(args)
@@ -328,7 +415,15 @@ class Gen:
                     counter_name + ".\nThis is probably due to some unhandled RPN operation, in the expression \"" +
                     expression + "\"")
 
-        return stack[-1]
+        value = stack[-1]
+
+        if value[0] == "$":
+            resolved_variable = self.resolve_variable(value, set)
+            if resolved_variable == None:
+                raise Exception("Failed to resolve variable " + value + " in expression " + expression + " for " + set.name + " :: " + counter_name)
+            value = resolved_variable
+
+        return value
 
     def output_availability(self, set, availability, counter_name):
         expression = self.splice_rpn_expression(set, counter_name, availability)

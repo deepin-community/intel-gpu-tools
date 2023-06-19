@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include "i915/gem_submission.h"
 
 /**
  * SECTION:intel_allocator
@@ -132,6 +133,7 @@ struct intel_allocator {
 	int fd;
 	uint8_t type;
 	enum allocator_strategy strategy;
+	uint64_t default_alignment;
 	_Atomic(int32_t) refcount;
 	pthread_mutex_t mutex;
 
@@ -144,13 +146,13 @@ struct intel_allocator {
 			  uint64_t size, uint64_t alignment,
 			  enum allocator_strategy strategy);
 	bool (*is_allocated)(struct intel_allocator *ial, uint32_t handle,
-			     uint64_t size, uint64_t alignment);
+			     uint64_t size, uint64_t offset);
 	bool (*reserve)(struct intel_allocator *ial,
-			uint32_t handle, uint64_t start, uint64_t size);
+			uint32_t handle, uint64_t start, uint64_t end);
 	bool (*unreserve)(struct intel_allocator *ial,
-			  uint32_t handle, uint64_t start, uint64_t size);
+			  uint32_t handle, uint64_t start, uint64_t end);
 	bool (*is_reserved)(struct intel_allocator *ial,
-			    uint64_t start, uint64_t size);
+			    uint64_t start, uint64_t end);
 	bool (*free)(struct intel_allocator *ial, uint32_t handle);
 
 	void (*destroy)(struct intel_allocator *ial);
@@ -170,12 +172,14 @@ uint64_t intel_allocator_open(int fd, uint32_t ctx, uint8_t allocator_type);
 uint64_t intel_allocator_open_full(int fd, uint32_t ctx,
 				   uint64_t start, uint64_t end,
 				   uint8_t allocator_type,
-				   enum allocator_strategy strategy);
+				   enum allocator_strategy strategy,
+				   uint64_t default_alignment);
 uint64_t intel_allocator_open_vm(int fd, uint32_t vm, uint8_t allocator_type);
 uint64_t intel_allocator_open_vm_full(int fd, uint32_t vm,
 				      uint64_t start, uint64_t end,
 				      uint8_t allocator_type,
-				      enum allocator_strategy strategy);
+				      enum allocator_strategy strategy,
+				      uint64_t default_alignment);
 
 uint64_t intel_allocator_open_vm_as(uint64_t allocator_handle, uint32_t new_vm);
 bool intel_allocator_close(uint64_t allocator_handle);
@@ -209,8 +213,7 @@ void intel_allocator_print(uint64_t allocator_handle);
 #define ALLOC_INVALID_ADDRESS (-1ull)
 #define INTEL_ALLOCATOR_NONE   0
 #define INTEL_ALLOCATOR_RELOC  1
-#define INTEL_ALLOCATOR_RANDOM 2
-#define INTEL_ALLOCATOR_SIMPLE 3
+#define INTEL_ALLOCATOR_SIMPLE 2
 
 #define GEN8_GTT_ADDRESS_WIDTH 48
 
@@ -227,5 +230,61 @@ static inline uint64_t CANONICAL(uint64_t offset)
 }
 
 #define DECANONICAL(offset) (offset & ((1ull << GEN8_GTT_ADDRESS_WIDTH) - 1))
+
+static inline uint64_t get_simple_ahnd(int fd, uint32_t ctx)
+{
+	bool do_relocs = gem_has_relocations(fd);
+
+	return do_relocs ? 0 : intel_allocator_open(fd, ctx, INTEL_ALLOCATOR_SIMPLE);
+}
+
+static inline uint64_t get_simple_l2h_ahnd(int fd, uint32_t ctx)
+{
+	bool do_relocs = gem_has_relocations(fd);
+
+	return do_relocs ? 0 : intel_allocator_open_full(fd, ctx, 0, 0,
+							 INTEL_ALLOCATOR_SIMPLE,
+							 ALLOC_STRATEGY_LOW_TO_HIGH,
+							 0);
+}
+
+static inline uint64_t get_simple_h2l_ahnd(int fd, uint32_t ctx)
+{
+	bool do_relocs = gem_has_relocations(fd);
+
+	return do_relocs ? 0 : intel_allocator_open_full(fd, ctx, 0, 0,
+							 INTEL_ALLOCATOR_SIMPLE,
+							 ALLOC_STRATEGY_HIGH_TO_LOW,
+							 0);
+}
+
+static inline uint64_t get_reloc_ahnd(int fd, uint32_t ctx)
+{
+	bool do_relocs = gem_has_relocations(fd);
+
+	return do_relocs ? 0 : intel_allocator_open(fd, ctx, INTEL_ALLOCATOR_RELOC);
+}
+
+static inline bool put_ahnd(uint64_t ahnd)
+{
+	return !ahnd || intel_allocator_close(ahnd);
+}
+
+static inline uint64_t get_offset(uint64_t ahnd, uint32_t handle,
+				  uint64_t size, uint64_t alignment)
+{
+	if (!ahnd)
+		return 0;
+
+	return intel_allocator_alloc(ahnd, handle, size, alignment);
+}
+
+static inline bool put_offset(uint64_t ahnd, uint32_t handle)
+{
+	if (!ahnd)
+		return 0;
+
+	return intel_allocator_free(ahnd, handle);
+}
 
 #endif

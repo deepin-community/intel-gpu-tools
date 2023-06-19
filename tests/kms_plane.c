@@ -39,6 +39,9 @@
  */
 #define LUT_MASK 0xf800
 
+/* restricted pipe count */
+#define CRTC_RESTRICT_CNT 2
+
 typedef struct {
 	float red;
 	float green;
@@ -58,7 +61,10 @@ typedef struct {
 	int num_colors;
 	uint32_t crop;
 	bool extended;
+	unsigned int flags;
 } data_t;
+
+static bool all_pipes;
 
 static color_t red   = { 1.0f, 0.0f, 0.0f };
 static color_t green = { 0.0f, 1.0f, 0.0f };
@@ -69,7 +75,10 @@ static color_t blue  = { 0.0f, 0.0f, 1.0f };
  */
 static void test_init(data_t *data, enum pipe pipe)
 {
-	data->pipe_crc = igt_pipe_crc_new(data->drm_fd, pipe, INTEL_PIPE_CRC_SOURCE_AUTO);
+	igt_require(data->display.pipes[pipe].n_planes > 0);
+	data->pipe_crc = igt_pipe_crc_new(data->drm_fd, pipe,
+					  IGT_PIPE_CRC_SOURCE_AUTO);
+	igt_display_reset(&data->display);
 }
 
 static void test_fini(data_t *data)
@@ -101,7 +110,7 @@ create_fb_for_mode(data_t *data, drmModeModeInfo *mode,
 	fb_id = igt_create_fb(data->drm_fd,
 			      mode->hdisplay, mode->vdisplay,
 			      DRM_FORMAT_XRGB8888,
-			      LOCAL_DRM_FORMAT_MOD_NONE,
+			      DRM_FORMAT_MOD_LINEAR,
 			      fb);
 	igt_assert_fd(fb_id);
 
@@ -147,7 +156,7 @@ test_grab_crc(data_t *data, igt_output_t *output, enum pipe pipe,
 		igt_assert_fd(igt_create_color_fb(data->drm_fd,
 						  mode->hdisplay, mode->vdisplay,
 						  DRM_FORMAT_XRGB8888,
-						  LOCAL_DRM_FORMAT_MOD_NONE,
+						  DRM_FORMAT_MOD_LINEAR,
 						  fb_color->red, fb_color->green, fb_color->blue,
 						  &fb));
 	}
@@ -216,10 +225,13 @@ test_plane_position_with_output(data_t *data,
 	create_fb_for_mode(data, mode, &green, &rect, 1, &primary_fb);
 	igt_plane_set_fb(primary, &primary_fb);
 
+	if (!igt_plane_has_format_mod(sprite, DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR))
+		return;
+
 	igt_create_color_fb(data->drm_fd,
 			    64, 64, /* width, height */
 			    DRM_FORMAT_XRGB8888,
-			    LOCAL_DRM_FORMAT_MOD_NONE,
+			    DRM_FORMAT_MOD_LINEAR,
 			    0.0, 1.0, 0.0,
 			    &sprite_fb);
 	igt_plane_set_fb(sprite, &sprite_fb);
@@ -251,11 +263,15 @@ test_plane_position_with_output(data_t *data,
 	igt_plane_set_fb(sprite, NULL);
 
 	/* reset the constraint on the pipe */
-	igt_output_set_pipe(output, PIPE_ANY);
+	igt_output_set_pipe(output, PIPE_NONE);
+	igt_display_commit2(&data->display, data->display.is_atomic ? COMMIT_ATOMIC : COMMIT_LEGACY);
+
+	igt_remove_fb(data->drm_fd, &primary_fb);
+	igt_remove_fb(data->drm_fd, &sprite_fb);
 }
 
 static void
-test_plane_position(data_t *data, enum pipe pipe, unsigned int flags)
+test_plane_position(data_t *data, enum pipe pipe)
 {
 	int n_planes = data->display.pipes[pipe].n_planes;
 	igt_output_t *output;
@@ -265,12 +281,12 @@ test_plane_position(data_t *data, enum pipe pipe, unsigned int flags)
 	igt_require(output);
 
 	test_init(data, pipe);
-	test_grab_crc(data, output, pipe, &green, flags, &reference_crc);
+	test_grab_crc(data, output, pipe, &green, data->flags, &reference_crc);
 
 	for (int plane = 1; plane < n_planes; plane++)
 		test_plane_position_with_output(data, pipe, plane,
 						output, &reference_crc,
-						flags);
+						data->flags);
 
 	test_fini(data);
 }
@@ -288,7 +304,7 @@ test_plane_position(data_t *data, enum pipe pipe, unsigned int flags)
  *     (vdisplay, hdisplay) we do get the same CRC than the full blue fb.
  */
 static void
-create_fb_for_mode__panning(data_t *data, drmModeModeInfo *mode,
+create_fb_for_mode_panning(data_t *data, drmModeModeInfo *mode,
 			    struct igt_fb *fb /* out */)
 {
 	unsigned int fb_id;
@@ -297,7 +313,7 @@ create_fb_for_mode__panning(data_t *data, drmModeModeInfo *mode,
 	fb_id = igt_create_fb(data->drm_fd,
 			      mode->hdisplay * 2, mode->vdisplay * 2,
 			      DRM_FORMAT_XRGB8888,
-			      LOCAL_DRM_FORMAT_MOD_NONE,
+			      DRM_FORMAT_MOD_LINEAR,
 			      fb);
 	igt_assert(fb_id);
 
@@ -326,15 +342,15 @@ test_plane_panning_with_output(data_t *data,
 	drmModeModeInfo *mode;
 	igt_crc_t crc;
 
-	igt_info("Testing connector %s using pipe %s\n",
-		 igt_output_name(output), kmstest_pipe_name(pipe));
-
 	igt_output_set_pipe(output, pipe);
 
 	mode = igt_output_get_mode(output);
 	primary = igt_output_get_plane(output, 0);
 
-	create_fb_for_mode__panning(data, mode, &primary_fb);
+	igt_info("Testing connector %s using pipe %s, mode %s\n",
+		 igt_output_name(output), kmstest_pipe_name(pipe), mode->name);
+
+	create_fb_for_mode_panning(data, mode, &primary_fb);
 	igt_plane_set_fb(primary, &primary_fb);
 
 	if (flags & TEST_PANNING_TOP_LEFT)
@@ -355,13 +371,18 @@ test_plane_panning_with_output(data_t *data,
 	igt_plane_set_fb(primary, NULL);
 
 	/* reset states to neutral values, assumed by other tests */
-	igt_output_set_pipe(output, PIPE_ANY);
+	igt_output_set_pipe(output, PIPE_NONE);
 	igt_fb_set_position(&primary_fb, primary, 0, 0);
+	igt_display_commit2(&data->display, data->display.is_atomic ? COMMIT_ATOMIC : COMMIT_LEGACY);
+
+	igt_remove_fb(data->drm_fd, &primary_fb);
 }
 
 static void
-test_plane_panning(data_t *data, enum pipe pipe, unsigned int flags)
+test_plane_panning(data_t *data, enum pipe pipe)
 {
+	bool mode_found = false;
+	uint64_t mem_size = 0;
 	igt_output_t *output;
 	igt_crc_t ref_crc;
 
@@ -370,12 +391,35 @@ test_plane_panning(data_t *data, enum pipe pipe, unsigned int flags)
 
 	test_init(data, pipe);
 
-	if (flags & TEST_PANNING_TOP_LEFT)
-		test_grab_crc(data, output, pipe, &red, flags, &ref_crc);
-	else
-		test_grab_crc(data, output, pipe, &blue, flags, &ref_crc);
+	if (is_i915_device(data->drm_fd)) {
+		for_each_memory_region(r, data->drm_fd)
+			if (r->ci.memory_class == I915_MEMORY_CLASS_DEVICE)
+				mem_size = r->cpu_size;
 
-	test_plane_panning_with_output(data, pipe, output, &ref_crc, flags);
+	}
+
+	for_each_connector_mode(output) {
+		drmModeModeInfo *m = &output->config.connector->modes[j__];
+		uint32_t fb_size = m->hdisplay * m->vdisplay * 4;
+
+		/* test allocates 2 double-dim fbs, add one more, to be safe */
+		if (mem_size && 3 * 4 * fb_size > mem_size) {
+			igt_debug("Skipping mode %s due to low memory\n", m->name);
+			continue;
+		}
+
+		igt_output_override_mode(output, m);
+		mode_found = true;
+		break;
+	}
+	igt_require(mode_found);
+
+	if (data->flags & TEST_PANNING_TOP_LEFT)
+		test_grab_crc(data, output, pipe, &red, data->flags, &ref_crc);
+	else
+		test_grab_crc(data, output, pipe, &blue, data->flags, &ref_crc);
+
+	test_plane_panning_with_output(data, pipe, output, &ref_crc, data->flags);
 
 	test_fini(data);
 }
@@ -461,12 +505,19 @@ static void draw_entire_color_array(data_t *data, cairo_t *cr, uint32_t format,
 	const int color_amount = ARRAY_SIZE(colors_extended);
 	const int x = format == DRM_FORMAT_XRGB8888 ? 0 : data->crop;
 
+	if (format != DRM_FORMAT_XRGB8888) {
+		cairo_rectangle(cr, data->crop, data->crop,
+				fb->width - data->crop * 2,
+				fb->height - data->crop * 2);
+	}
+
+
 	for (int n = 0; n < color_amount; n++) {
 		int y = (fb->height - x * 2) * n / color_amount + x;
 
 		igt_paint_color(cr, x, y,
 				fb->width - x * 2,
-				(fb->height - x * 2) / color_amount,
+				(fb->height - x * 2) / color_amount + 1,
 				colors_extended[n].red,
 				colors_extended[n].green,
 				colors_extended[n].blue);
@@ -555,7 +606,7 @@ static void capture_crc(data_t *data, unsigned int vblank, igt_crc_t *crc)
 		      crc->frame, vblank);
 }
 
-static void capture_format_crcs_packed(data_t *data, enum pipe pipe,
+static void capture_format_crcs_single(data_t *data, enum pipe pipe,
 				       igt_plane_t *plane,
 				       uint32_t format, uint64_t modifier,
 				       int width, int height,
@@ -577,13 +628,13 @@ static void capture_format_crcs_packed(data_t *data, enum pipe pipe,
 	igt_pipe_crc_get_current(data->drm_fd, data->pipe_crc, &crc[0]);
 }
 
-static void capture_format_crcs_planar(data_t *data, enum pipe pipe,
-				       igt_plane_t *plane,
-				       uint32_t format, uint64_t modifier,
-				       int width, int height,
-				       enum igt_color_encoding encoding,
-				       enum igt_color_range range,
-				       igt_crc_t crc[], struct igt_fb *fb)
+static void capture_format_crcs_multiple(data_t *data, enum pipe pipe,
+					 igt_plane_t *plane,
+					 uint32_t format, uint64_t modifier,
+					 int width, int height,
+					 enum igt_color_encoding encoding,
+					 enum igt_color_range range,
+					 igt_crc_t crc[], struct igt_fb *fb)
 {
 	unsigned int vblank[ARRAY_SIZE(colors_extended)];
 	struct drm_event_vblank ev;
@@ -700,6 +751,11 @@ restart_round:
 	capture_crc(data, vblank[i - 1], &crc[i - 1]);
 }
 
+static bool use_multiple_colors(data_t *data, uint32_t format)
+{
+	return data->extended || igt_format_is_yuv_semiplanar(format);
+}
+
 static bool test_format_plane_colors(data_t *data, enum pipe pipe,
 				     igt_plane_t *plane,
 				     uint32_t format, uint64_t modifier,
@@ -714,17 +770,17 @@ static bool test_format_plane_colors(data_t *data, enum pipe pipe,
 	int crc_mismatch_count = 0;
 	bool result = true;
 	int i, total_crcs = 1;
-	bool planar = igt_format_is_yuv_semiplanar(format);
 
-	if (planar) {
-		capture_format_crcs_planar(data, pipe, plane, format, modifier,
-					   width, height, encoding, range, crc,
-					   fb);
+	if (use_multiple_colors(data, format)) {
+		capture_format_crcs_multiple(data, pipe, plane, format, modifier,
+					     width, height, encoding, range, crc,
+					     fb);
 		total_crcs = data->num_colors;
-	} else
-		capture_format_crcs_packed(data, pipe, plane, format, modifier,
+	} else {
+		capture_format_crcs_single(data, pipe, plane, format, modifier,
 					   width, height, encoding, range, crc,
 					   fb);
+	}
 
 	for (i = 0; i < total_crcs; i++) {
 		if (!igt_check_crc_equal(&crc[i], &ref_crc[i])) {
@@ -749,8 +805,8 @@ static bool test_format_plane_rgb(data_t *data, enum pipe pipe,
 				  igt_crc_t ref_crc[],
 				  struct igt_fb *fb)
 {
-	igt_info("Testing format " IGT_FORMAT_FMT " / modifier 0x%" PRIx64 " on %s.%u\n",
-		 IGT_FORMAT_ARGS(format), modifier,
+	igt_info("Testing format " IGT_FORMAT_FMT " / modifier " IGT_MODIFIER_FMT " on %s.%u\n",
+		 IGT_FORMAT_ARGS(format), IGT_MODIFIER_ARGS(modifier),
 		 kmstest_pipe_name(pipe), plane->index);
 
 	return test_format_plane_colors(data, pipe, plane,
@@ -787,8 +843,8 @@ static bool test_format_plane_yuv(data_t *data, enum pipe pipe,
 						     igt_color_range_to_str(r)))
 				continue;
 
-			igt_info("Testing format " IGT_FORMAT_FMT " / modifier 0x%" PRIx64 " (%s, %s) on %s.%u\n",
-				 IGT_FORMAT_ARGS(format), modifier,
+			igt_info("Testing format " IGT_FORMAT_FMT " / modifier " IGT_MODIFIER_FMT " (%s, %s) on %s.%u\n",
+				 IGT_FORMAT_ARGS(format), IGT_MODIFIER_ARGS(modifier),
 				 igt_color_encoding_to_str(e),
 				 igt_color_range_to_str(r),
 				 kmstest_pipe_name(pipe), plane->index);
@@ -814,9 +870,11 @@ static bool test_format_plane_yuv(data_t *data, enum pipe pipe,
 	return result;
 }
 
-enum crc_set { PACKED_CRC_SET,
-	       PLANAR_CRC_SET,
-	       MAX_CRC_SET };
+enum crc_set {
+	SINGLE_CRC_SET,
+	MULTIPLE_CRC_SET,
+	MAX_CRC_SET,
+};
 
 struct format_mod {
 	uint64_t modifier;
@@ -849,7 +907,7 @@ static bool test_format_plane(data_t *data, enum pipe pipe,
 		width = mode->hdisplay;
 		height = mode->vdisplay;
 		ref.format = DRM_FORMAT_XRGB8888;
-		ref.modifier = DRM_FORMAT_MOD_NONE;
+		ref.modifier = DRM_FORMAT_MOD_LINEAR;
 	} else {
 		if (!plane->drm_plane) {
 			igt_debug("Only legacy cursor ioctl supported, skipping cursor plane\n");
@@ -858,7 +916,7 @@ static bool test_format_plane(data_t *data, enum pipe pipe,
 		do_or_die(drmGetCap(data->drm_fd, DRM_CAP_CURSOR_WIDTH, &width));
 		do_or_die(drmGetCap(data->drm_fd, DRM_CAP_CURSOR_HEIGHT, &height));
 		ref.format = DRM_FORMAT_ARGB8888;
-		ref.modifier = DRM_FORMAT_MOD_NONE;
+		ref.modifier = DRM_FORMAT_MOD_LINEAR;
 	}
 
 	igt_debug("Testing connector %s on %s plane %s.%u\n",
@@ -867,8 +925,8 @@ static bool test_format_plane(data_t *data, enum pipe pipe,
 
 	igt_pipe_crc_start(data->pipe_crc);
 
-	igt_info("Testing format " IGT_FORMAT_FMT " / modifier 0x%" PRIx64 " on %s.%u\n",
-		 IGT_FORMAT_ARGS(ref.format), ref.modifier,
+	igt_info("Testing format " IGT_FORMAT_FMT " / modifier " IGT_MODIFIER_FMT " on %s.%u\n",
+		 IGT_FORMAT_ARGS(ref.format), IGT_MODIFIER_ARGS(ref.modifier),
 		 kmstest_pipe_name(pipe), plane->index);
 
 	if (data->display.is_atomic) {
@@ -894,22 +952,22 @@ static bool test_format_plane(data_t *data, enum pipe pipe,
 		igt_remove_fb(data->drm_fd, &test_fb);
 	}
 
-	capture_format_crcs_packed(data, pipe, plane, ref.format, ref.modifier,
+	capture_format_crcs_single(data, pipe, plane, ref.format, ref.modifier,
 				   width, height, IGT_COLOR_YCBCR_BT709,
 				   IGT_COLOR_YCBCR_LIMITED_RANGE,
-				   ref_crc[PACKED_CRC_SET], &fb);
+				   ref_crc[SINGLE_CRC_SET], &fb);
 
-	capture_format_crcs_planar(data, pipe, plane, ref.format, ref.modifier,
-				   width, height, IGT_COLOR_YCBCR_BT709,
-				   IGT_COLOR_YCBCR_LIMITED_RANGE,
-				   ref_crc[PLANAR_CRC_SET], &fb);
+	capture_format_crcs_multiple(data, pipe, plane, ref.format, ref.modifier,
+				     width, height, IGT_COLOR_YCBCR_BT709,
+				     IGT_COLOR_YCBCR_LIMITED_RANGE,
+				     ref_crc[MULTIPLE_CRC_SET], &fb);
 
 	/*
 	 * Make sure we have some difference between the colors. This
 	 * at least avoids claiming success when everything is just
 	 * black all the time (eg. if the plane is never even on).
 	 */
-	igt_require(num_unique_crcs(ref_crc[PLANAR_CRC_SET], data->num_colors) > 1);
+	igt_require(num_unique_crcs(ref_crc[MULTIPLE_CRC_SET], data->num_colors) > 1);
 
 	for (int i = 0; i < plane->format_mod_count; i++) {
 		struct format_mod f = {
@@ -929,8 +987,8 @@ static bool test_format_plane(data_t *data, enum pipe pipe,
 			};
 
 			if (igt_vec_index(&tested_formats, &rf) >= 0) {
-				igt_info("Skipping format " IGT_FORMAT_FMT " / modifier 0x%" PRIx64 " on %s.%u\n",
-					 IGT_FORMAT_ARGS(f.format), f.modifier,
+				igt_info("Skipping format " IGT_FORMAT_FMT " / modifier " IGT_MODIFIER_FMT " on %s.%u\n",
+					 IGT_FORMAT_ARGS(f.format), IGT_MODIFIER_ARGS(f.modifier),
 					 kmstest_pipe_name(pipe), plane->index);
 				continue;
 			}
@@ -946,8 +1004,8 @@ static bool test_format_plane(data_t *data, enum pipe pipe,
 				continue;
 		}
 
-		crcset = ref_crc[(igt_format_is_yuv_semiplanar(f.format)
-				 ? PLANAR_CRC_SET : PACKED_CRC_SET)];
+		crcset = ref_crc[use_multiple_colors(data, f.format) ?
+				 MULTIPLE_CRC_SET : SINGLE_CRC_SET];
 
 		if (igt_format_is_yuv(f.format))
 			result &= test_format_plane_yuv(data, pipe, plane,
@@ -977,6 +1035,16 @@ static bool test_format_plane(data_t *data, enum pipe pipe,
 static bool skip_plane(data_t *data, igt_plane_t *plane)
 {
 	int index = plane->index;
+	int i;
+
+	for (i = 0; i < plane->format_mod_count; i++) {
+		if (IS_AMD_FMT_MOD(plane->modifiers[i]) &&
+		    (AMD_FMT_MOD_GET(DCC, plane->modifiers[i]) ||
+		     AMD_FMT_MOD_GET(DCC_RETILE, plane->modifiers[i]))) {
+			igt_debug("Skipping planes with DCC or DCC_RETILE\n");
+			return true;
+		}
+	}
 
 	if (data->extended)
 		return false;
@@ -987,7 +1055,7 @@ static bool skip_plane(data_t *data, igt_plane_t *plane)
 	if (plane->type == DRM_PLANE_TYPE_CURSOR)
 		return false;
 
-	if (intel_gen(intel_get_drm_devid(data->drm_fd)) < 11)
+	if (intel_display_ver(intel_get_drm_devid(data->drm_fd)) < 11)
 		return false;
 
 	/*
@@ -1019,13 +1087,15 @@ test_pixel_formats(data_t *data, enum pipe pipe)
 		data->num_colors = ARRAY_SIZE(colors_reduced);
 	}
 
+	test_init(data, pipe);
+
 	output = igt_get_single_output_for_pipe(&data->display, pipe);
 	igt_require(output);
 
 	mode = igt_output_get_mode(output);
 
 	igt_create_fb(data->drm_fd, mode->hdisplay, mode->vdisplay,
-		      DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE, &primary_fb);
+		      DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR, &primary_fb);
 
 	igt_output_set_pipe(output, pipe);
 	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
@@ -1034,8 +1104,6 @@ test_pixel_formats(data_t *data, enum pipe pipe)
 	igt_display_commit2(&data->display, data->display.is_atomic ? COMMIT_ATOMIC : COMMIT_LEGACY);
 
 	set_legacy_lut(data, pipe, LUT_MASK);
-
-	test_init(data, pipe);
 
 	result = true;
 	for_each_plane_on_pipe(&data->display, pipe, plane) {
@@ -1057,62 +1125,75 @@ test_pixel_formats(data_t *data, enum pipe pipe)
 	igt_assert_f(result, "At least one CRC mismatch happened\n");
 }
 
-static void
-run_tests_for_pipe_plane(data_t *data, enum pipe pipe)
-{
-	igt_fixture {
-		igt_require_pipe(&data->display, pipe);
-		igt_require(data->display.pipes[pipe].n_planes > 0);
-	}
+static bool is_pipe_limit_reached(int count) {
+	return count >= CRTC_RESTRICT_CNT && !all_pipes;
+}
 
+static void run_test(data_t *data, void (*test)(data_t *, enum pipe))
+{
+	enum pipe pipe;
+	int count = 0;
+
+	for_each_pipe(&data->display, pipe) {
+		igt_dynamic_f("pipe-%s-planes", kmstest_pipe_name(pipe))
+			test(data, pipe);
+
+		if (is_pipe_limit_reached(++count))
+			break;
+	}
+}
+
+static void
+run_tests_for_pipe_plane(data_t *data)
+{
 	igt_describe("verify the pixel formats for given plane and pipe");
-	igt_subtest_f("pixel-format-pipe-%s-planes",
-		      kmstest_pipe_name(pipe))
-		test_pixel_formats(data, pipe);
+	igt_subtest_with_dynamic_f("pixel-format")
+		run_test(data, test_pixel_formats);
 
 	igt_describe("verify the pixel formats for given plane and pipe with source clamping");
-	igt_subtest_f("pixel-format-pipe-%s-planes-source-clamping",
-		      kmstest_pipe_name(pipe)) {
+	igt_subtest_with_dynamic_f("pixel-format-source-clamping") {
 		data->crop = 4;
-		test_pixel_formats(data, pipe);
+		run_test(data, test_pixel_formats);
 	}
 
 	data->crop = 0;
 	igt_describe("verify plane position using two planes to create a fully covered screen");
-	igt_subtest_f("plane-position-covered-pipe-%s-planes",
-		      kmstest_pipe_name(pipe))
-		test_plane_position(data, pipe, 0);
+	igt_subtest_with_dynamic_f("plane-position-covered") {
+		data->flags = 0;
+		run_test(data, test_plane_position);
+	}
 
 	igt_describe("verify plane position using two planes to create a partially covered screen");
-	igt_subtest_f("plane-position-hole-pipe-%s-planes",
-		      kmstest_pipe_name(pipe))
-		test_plane_position(data, pipe,
-				    TEST_POSITION_PARTIALLY_COVERED);
+	igt_subtest_with_dynamic_f("plane-position-hole") {
+		data->flags = TEST_POSITION_PARTIALLY_COVERED;
+		run_test(data, test_plane_position);
+	}
 
 	igt_describe("verify plane position using two planes to create a partially covered screen and"
 		       "check for DPMS");
-	igt_subtest_f("plane-position-hole-dpms-pipe-%s-planes",
-		      kmstest_pipe_name(pipe))
-		test_plane_position(data, pipe,
-				    TEST_POSITION_PARTIALLY_COVERED |
-				    TEST_DPMS);
+	igt_subtest_with_dynamic_f("plane-position-hole-dpms") {
+		data->flags = TEST_POSITION_PARTIALLY_COVERED | TEST_DPMS;
+		run_test(data, test_plane_position);
+	}
 
 	igt_describe("verify plane panning at top-left position using primary plane");
-	igt_subtest_f("plane-panning-top-left-pipe-%s-planes",
-		      kmstest_pipe_name(pipe))
-		test_plane_panning(data, pipe, TEST_PANNING_TOP_LEFT);
+	igt_subtest_with_dynamic_f("plane-panning-top-left") {
+		data->flags = TEST_PANNING_TOP_LEFT;
+		run_test(data, test_plane_panning);
+	}
 
 	igt_describe("verify plane panning at bottom-right position using primary plane");
-	igt_subtest_f("plane-panning-bottom-right-pipe-%s-planes",
-		      kmstest_pipe_name(pipe))
-		test_plane_panning(data, pipe, TEST_PANNING_BOTTOM_RIGHT);
+	igt_subtest_with_dynamic_f("plane-panning-bottom-right") {
+		data->flags = TEST_PANNING_BOTTOM_RIGHT;
+		run_test(data, test_plane_panning);
+	}
 
 	igt_describe("verify plane panning at bottom-right position using primary plane and executes system"
 		       "suspend cycles");
-	igt_subtest_f("plane-panning-bottom-right-suspend-pipe-%s-planes",
-		      kmstest_pipe_name(pipe))
-		test_plane_panning(data, pipe, TEST_PANNING_BOTTOM_RIGHT |
-					       TEST_SUSPEND_RESUME);
+	igt_subtest_with_dynamic_f("plane-panning-bottom-right-suspend") {
+		data->flags = TEST_PANNING_BOTTOM_RIGHT | TEST_SUSPEND_RESUME;
+		run_test(data, test_plane_panning);
+	}
 }
 
 static int opt_handler(int opt, int opt_index, void *_data)
@@ -1123,6 +1204,9 @@ static int opt_handler(int opt, int opt_index, void *_data)
 	case 'e':
 		data->extended = true;
 		break;
+	case 'p':
+		all_pipes = true;
+		break;
 	}
 
 	return IGT_OPT_HANDLER_SUCCESS;
@@ -1130,18 +1214,18 @@ static int opt_handler(int opt, int opt_index, void *_data)
 
 static const struct option long_opts[] = {
 	{ .name = "extended", .has_arg = false, .val = 'e', },
+	{ .name = "all-pipes", .has_arg = false, .val = 'p', },
 	{}
 };
 
 static const char help_str[] =
-	"  --extended\t\tRun the extended tests\n";
+	"  --extended\t\tRun the extended tests\n"
+	"  --all-pipes\t\tRun on all pipes.(Default it will Run only two pipes)\n";
 
 static data_t data;
 
 igt_main_args("", long_opts, help_str, opt_handler, &data)
 {
-	enum pipe pipe;
-
 	igt_fixture {
 		data.drm_fd = drm_open_driver_master(DRIVER_ANY);
 
@@ -1151,10 +1235,10 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 		igt_display_require(&data.display, data.drm_fd);
 	}
 
-	for_each_pipe_static(pipe)
-		run_tests_for_pipe_plane(&data, pipe);
+	run_tests_for_pipe_plane(&data);
 
 	igt_fixture {
 		igt_display_fini(&data.display);
+		close(data.drm_fd);
 	}
 }

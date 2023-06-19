@@ -49,12 +49,13 @@
 
 #include "drmtest.h"
 #include "i915_drm.h"
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "intel_batchbuffer.h"
 #include "intel_chipset.h"
 #include "intel_io.h"
 #include "igt_debugfs.h"
 #include "igt_sysfs.h"
+#include "igt_x86.h"
 #include "config.h"
 #include "i915/gem_mman.h"
 
@@ -90,37 +91,6 @@
 
 int (*igt_ioctl)(int fd, unsigned long request, void *arg) = drmIoctl;
 
-
-/**
- * gem_handle_to_libdrm_bo:
- * @bufmgr: libdrm buffer manager instance
- * @fd: open i915 drm file descriptor
- * @name: buffer name in libdrm
- * @handle: gem buffer object handle
- *
- * This helper function imports a raw gem buffer handle into the libdrm buffer
- * manager.
- *
- * Returns: The imported libdrm buffer manager object.
- */
-drm_intel_bo *
-gem_handle_to_libdrm_bo(drm_intel_bufmgr *bufmgr, int fd, const char *name, uint32_t handle)
-{
-	struct drm_gem_flink flink;
-	int ret;
-	drm_intel_bo *bo;
-
-	memset(&flink, 0, sizeof(handle));
-	flink.handle = handle;
-	ret = ioctl(fd, DRM_IOCTL_GEM_FLINK, &flink);
-	igt_assert(ret == 0);
-	errno = 0;
-
-	bo = drm_intel_bo_gem_create_from_name(bufmgr, name, flink.name);
-	igt_assert(bo);
-
-	return bo;
-}
 
 static int
 __gem_get_tiling(int fd, struct drm_i915_gem_get_tiling *arg)
@@ -338,7 +308,18 @@ static void mmap_write(int fd, uint32_t handle, uint64_t offset,
 	if (!length)
 		return;
 
-	if (is_cache_coherent(fd, handle)) {
+	if (gem_has_lmem(fd)) {
+		/*
+		 * set/get_caching and set_domain are no longer supported on
+		 * discrete, also the only mmap mode supportd is FIXED.
+		 */
+		map = gem_mmap_offset__fixed(fd, handle, 0,
+					     offset + length,
+					     PROT_READ | PROT_WRITE);
+		igt_assert_eq(gem_wait(fd, handle, 0), 0);
+	}
+
+	if (!map && is_cache_coherent(fd, handle)) {
 		/* offset arg for mmap functions must be 0 */
 		map = __gem_mmap__cpu_coherent(fd, handle, 0, offset + length,
 					       PROT_READ | PROT_WRITE);
@@ -368,7 +349,17 @@ static void mmap_read(int fd, uint32_t handle, uint64_t offset, void *buf, uint6
 	if (!length)
 		return;
 
-	if (gem_has_llc(fd) || is_cache_coherent(fd, handle)) {
+	if (gem_has_lmem(fd)) {
+		/*
+		 * set/get_caching and set_domain are no longer supported on
+		 * discrete, also the only supported mmap mode is FIXED.
+		 */
+		map = gem_mmap_offset__fixed(fd, handle, 0,
+					     offset + length, PROT_READ);
+		igt_assert_eq(gem_wait(fd, handle, 0), 0);
+	}
+
+	if (!map && (gem_has_llc(fd) || is_cache_coherent(fd, handle))) {
 		/* offset arg for mmap functions must be 0 */
 		map = __gem_mmap__cpu_coherent(fd, handle, 0,
 					       offset + length, PROT_READ);
@@ -385,7 +376,7 @@ static void mmap_read(int fd, uint32_t handle, uint64_t offset, void *buf, uint6
 		gem_set_domain(fd, handle, I915_GEM_DOMAIN_WC, 0);
 	}
 
-	memcpy(buf, map + offset, length);
+	igt_memcpy_from_wc(buf, map + offset, length);
 	munmap(map, offset + length);
 }
 
@@ -543,7 +534,12 @@ int __gem_set_domain(int fd, uint32_t handle, uint32_t read, uint32_t write)
  */
 void gem_set_domain(int fd, uint32_t handle, uint32_t read, uint32_t write)
 {
-	igt_assert_eq(__gem_set_domain(fd, handle, read, write), 0);
+	int ret = __gem_set_domain(fd, handle, read, write);
+
+	if (ret == -ENODEV && gem_has_lmem(fd))
+		igt_assert_eq(gem_wait(fd, handle, 0), 0);
+	else
+		igt_assert_eq(ret, 0);
 }
 
 /**
@@ -591,6 +587,28 @@ void gem_sync(int fd, uint32_t handle)
 			       I915_GEM_DOMAIN_GTT,
 			       I915_GEM_DOMAIN_GTT);
 	errno = 0;
+}
+
+/**
+ * gem_buffer_create_fb_obj:
+ * @fd: open i915 drm file descriptor
+ * @size: desired size of the buffer
+ *
+ * This wraps the GEM_CREATE ioctl, which allocates a new gem buffer object of
+ * @size from file descriptor specific region
+ *
+ * Returns: The file-private handle of the created buffer object
+ */
+uint32_t gem_buffer_create_fb_obj(int fd, uint64_t size)
+{
+	uint32_t handle;
+
+	if (gem_has_lmem(fd))
+		handle = gem_create_in_memory_regions(fd, size, REGION_LMEM(0));
+	else
+		handle = gem_create(fd, size);
+
+	return handle;
 }
 
 /**
@@ -961,34 +979,6 @@ bool gem_has_vebox(int fd)
 bool gem_has_bsd2(int fd)
 {
 	return has_param(fd, I915_PARAM_HAS_BSD2);
-}
-
-struct local_i915_gem_get_aperture {
-	__u64 aper_size;
-	__u64 aper_available_size;
-	__u64 version;
-	__u64 map_total_size;
-	__u64 stolen_total_size;
-};
-#define DRM_I915_GEM_GET_APERTURE	0x23
-#define LOCAL_IOCTL_I915_GEM_GET_APERTURE DRM_IOR  (DRM_COMMAND_BASE + DRM_I915_GEM_GET_APERTURE, struct local_i915_gem_get_aperture)
-
-/**
- * gem_total_stolen_size:
- * @fd: open i915 drm file descriptor
- *
- * Feature test macro to query the kernel for the total stolen size.
- *
- * Returns: Total stolen memory.
- */
-uint64_t gem_total_stolen_size(int fd)
-{
-	struct local_i915_gem_get_aperture aperture;
-
-	memset(&aperture, 0, sizeof(aperture));
-	do_ioctl(fd, LOCAL_IOCTL_I915_GEM_GET_APERTURE, &aperture);
-
-	return aperture.stolen_total_size;
 }
 
 /**

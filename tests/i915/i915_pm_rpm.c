@@ -40,12 +40,18 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#if defined(__linux__)
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
+#elif defined(__FreeBSD__)
+#include <dev/iicbus/iic.h>
+#define	addr	slave
+#endif
 
 #include <drm.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_kmod.h"
 #include "igt_sysfs.h"
@@ -98,6 +104,7 @@ struct mode_set_data {
 	igt_display_t display;
 
 	uint32_t devid;
+	int fw_fd;
 };
 
 /* Stuff we query at different times so we can compare. */
@@ -200,10 +207,18 @@ static bool wait_for_pc8_status(enum pc8_status status)
 
 static bool wait_for_suspended(void)
 {
-	if (has_pc8 && !has_runtime_pm)
+	if (has_pc8 && !has_runtime_pm) {
 		return wait_for_pc8_status(PC8_ENABLED);
-	else
-		return igt_wait_for_pm_status(IGT_RUNTIME_PM_STATUS_SUSPENDED);
+	} else {
+		bool suspended = igt_wait_for_pm_status(IGT_RUNTIME_PM_STATUS_SUSPENDED);
+
+		if (!suspended) {
+			/* Dump runtime pm status even if test skips */
+			__igt_debugfs_dump(drm_fd, "i915_runtime_pm_status", IGT_LOG_INFO);
+		}
+
+		return suspended;
+	}
 }
 
 static bool wait_for_active(void)
@@ -282,7 +297,7 @@ static bool init_modeset_params_for_type(struct mode_set_data *data,
 		return false;
 
 	igt_create_pattern_fb(drm_fd, mode->hdisplay, mode->vdisplay,
-			      DRM_FORMAT_XRGB8888, LOCAL_DRM_FORMAT_MOD_NONE,
+			      DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR,
 			      &params->fb);
 
 	params->crtc_id = kmstest_find_crtc_for_connector(drm_fd, data->res,
@@ -360,6 +375,42 @@ static void enable_one_screen(struct mode_set_data *data)
 	igt_assert(wait_for_active()); \
 } while (0)
 
+static void
+enable_one_screen_or_forcewake_get_and_wait(struct mode_set_data *data)
+{
+	bool headless;
+
+	/* Try to resume by enabling any type of display */
+	headless = !enable_one_screen_with_type(data, SCREEN_TYPE_ANY);
+
+	/*
+	 * Get User Forcewake to trigger rpm resume in case of headless
+	 * as well as no display being connected.
+	 */
+	if (headless) {
+		data->fw_fd = igt_open_forcewake_handle(drm_fd);
+		igt_require(data->fw_fd > 0);
+	}
+	igt_assert(wait_for_active());
+}
+
+static void forcewake_put(struct mode_set_data *data)
+{
+	if (data->fw_fd <= 0)
+		return;
+
+	data->fw_fd = close(data->fw_fd);
+	igt_assert_eq(data->fw_fd, 0);
+}
+
+static void
+disable_all_screens_or_forcewake_put_and_wait(struct mode_set_data *data)
+{
+	forcewake_put(data);
+	disable_all_screens(data);
+	igt_assert(wait_for_suspended());
+}
+
 static drmModePropertyBlobPtr get_connector_edid(drmModeConnectorPtr connector,
 						 int index)
 {
@@ -397,10 +448,9 @@ static void init_mode_set_data(struct mode_set_data *data)
 		}
 
 		kmstest_set_vt_graphics_mode();
+		igt_display_require(&data->display, drm_fd);
 	}
 
-	igt_display_require(&data->display, drm_fd);
-	data->devid = intel_get_drm_devid(drm_fd);
 	init_modeset_cached_params(&ms_data);
 }
 
@@ -412,9 +462,8 @@ static void fini_mode_set_data(struct mode_set_data *data)
 			drmModeFreePropertyBlob(data->edids[i]);
 		}
 		drmModeFreeResources(data->res);
+		igt_display_fini(&data->display);
 	}
-
-	igt_display_fini(&data->display);
 }
 
 static void get_drm_info(struct compare_data *data)
@@ -661,6 +710,13 @@ static void format_hex_string(const unsigned char edid[static EDID_BLOCK_SIZE],
 		sprintf(buf+i*5, "0x%02x ", edid[i]);
 }
 
+static bool is_mst_connector(int fd, uint32_t connector_id)
+{
+	return kmstest_get_property(fd, connector_id,
+				    DRM_MODE_OBJECT_CONNECTOR,
+				    "PATH", NULL, NULL, NULL);
+}
+
 static void test_i2c(struct mode_set_data *data)
 {
 	bool edid_mistmach_i2c_vs_drm = false;
@@ -680,6 +736,10 @@ static void test_i2c(struct mode_set_data *data)
 		bool is_vga = data->connectors[i]->connector_type == DRM_MODE_CONNECTOR_VGA;
 
 		bool edids_equal;
+
+		if (data->connectors[i]->connection != DRM_MODE_CONNECTED ||
+		    is_mst_connector(drm_fd, data->connectors[i]->connector_id))
+			continue;
 
 		/* We fail to detect some VGA monitors using our i2c method. If you look
 		 * at the dmesg of these cases, you'll see the Kernel complaining about
@@ -765,7 +825,7 @@ static void dump_file(int dir, const char *filename)
 	free(contents);
 }
 
-static bool setup_environment(bool display_disabled)
+static bool setup_environment(bool display_enabled)
 {
 	if (has_runtime_pm)
 		goto out;
@@ -777,7 +837,9 @@ static bool setup_environment(bool display_disabled)
 	debugfs = igt_debugfs_dir(drm_fd);
 	igt_require(debugfs != -1);
 
-	if (!display_disabled)
+	ms_data.devid = intel_get_drm_devid(drm_fd);
+
+	if (display_enabled)
 		init_mode_set_data(&ms_data);
 
 	igt_pm_enable_sata_link_power_management();
@@ -791,14 +853,14 @@ static bool setup_environment(bool display_disabled)
 	igt_require(igt_pm_dmc_loaded(debugfs));
 
 out:
-	if (!display_disabled)
+	if (display_enabled)
 		disable_all_screens(&ms_data);
 	dump_file(debugfs, "i915_runtime_pm_status");
 
 	return wait_for_suspended();
 }
 
-static void teardown_environment(bool display_disabled)
+static void teardown_environment(bool display_enabled)
 {
 	close(msr_fd);
 	if (has_pc8)
@@ -808,7 +870,7 @@ static void teardown_environment(bool display_disabled)
 
 	igt_pm_restore_sata_link_power_management();
 
-	if (!display_disabled)
+	if (display_enabled)
 		fini_mode_set_data(&ms_data);
 
 	close(debugfs);
@@ -821,8 +883,8 @@ static void basic_subtest(void)
 {
 	disable_all_screens_and_wait(&ms_data);
 
-	if (ms_data.res)
-		enable_one_screen_and_wait(&ms_data);
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
+	forcewake_put(&ms_data);
 
 	/* XXX Also we can test wake up via exec nop */
 }
@@ -1049,7 +1111,8 @@ static void debugfs_forcewake_user_subtest(void)
 	igt_assert(wait_for_suspended());
 }
 
-static void gem_mmap_args(const struct mmap_offset *t)
+static void gem_mmap_args(const struct mmap_offset *t,
+			  struct drm_i915_gem_memory_class_instance *mem_regions)
 {
 	int i;
 	uint32_t handle;
@@ -1057,9 +1120,9 @@ static void gem_mmap_args(const struct mmap_offset *t)
 	uint8_t *gem_buf;
 
 	/* Create, map and set data while the device is active. */
-	enable_one_screen_and_wait(&ms_data);
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
 
-	handle = gem_create(drm_fd, buf_size);
+	handle = gem_create_in_memory_region_list(drm_fd, buf_size, 0, mem_regions, 1);
 
 	gem_buf = __gem_mmap_offset(drm_fd, handle, 0, buf_size,
 				    PROT_READ | PROT_WRITE, t->type);
@@ -1072,7 +1135,7 @@ static void gem_mmap_args(const struct mmap_offset *t)
 		igt_assert(gem_buf[i] == (i & 0xFF));
 
 	/* Now suspend, read and modify. */
-	disable_all_screens_and_wait(&ms_data);
+	disable_all_screens_or_forcewake_put_and_wait(&ms_data);
 
 	for (i = 0; i < buf_size; i++)
 		igt_assert(gem_buf[i] == (i & 0xFF));
@@ -1083,7 +1146,7 @@ static void gem_mmap_args(const struct mmap_offset *t)
 	igt_assert(wait_for_suspended());
 
 	/* Now resume and see if it's still there. */
-	enable_one_screen_and_wait(&ms_data);
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
 	for (i = 0; i < buf_size; i++)
 		igt_assert(gem_buf[i] == (~i & 0xFF));
 
@@ -1091,7 +1154,7 @@ static void gem_mmap_args(const struct mmap_offset *t)
 
 	/* Now the opposite: suspend, and try to create the mmap while
 	 * suspended. */
-	disable_all_screens_and_wait(&ms_data);
+	disable_all_screens_or_forcewake_put_and_wait(&ms_data);
 
 	gem_buf = __gem_mmap_offset(drm_fd, handle, 0, buf_size,
 				    PROT_READ | PROT_WRITE, t->type);
@@ -1108,12 +1171,13 @@ static void gem_mmap_args(const struct mmap_offset *t)
 	igt_assert(wait_for_suspended());
 
 	/* Resume and check if it's still there. */
-	enable_one_screen_and_wait(&ms_data);
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
 	for (i = 0; i < buf_size; i++)
 		igt_assert(gem_buf[i] == (i & 0xFF));
 
 	igt_assert(munmap(gem_buf, buf_size) == 0);
 	gem_close(drm_fd, handle);
+	forcewake_put(&ms_data);
 }
 
 static void gem_pread_subtest(void)
@@ -1131,7 +1195,7 @@ static void gem_pread_subtest(void)
 	memset(read_buf, 0, buf_size);
 
 	/* Create and set data while the device is active. */
-	enable_one_screen_and_wait(&ms_data);
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
 
 	handle = gem_create(drm_fd, buf_size);
 
@@ -1146,7 +1210,7 @@ static void gem_pread_subtest(void)
 		igt_assert(cpu_buf[i] == read_buf[i]);
 
 	/* Now suspend, read and modify. */
-	disable_all_screens_and_wait(&ms_data);
+	disable_all_screens_or_forcewake_put_and_wait(&ms_data);
 
 	memset(read_buf, 0, buf_size);
 	gem_read(drm_fd, handle, 0, read_buf, buf_size);
@@ -1161,7 +1225,7 @@ static void gem_pread_subtest(void)
 	igt_assert(wait_for_suspended());
 
 	/* Now resume and see if it's still there. */
-	enable_one_screen_and_wait(&ms_data);
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
 
 	memset(read_buf, 0, buf_size);
 	gem_read(drm_fd, handle, 0, read_buf, buf_size);
@@ -1173,11 +1237,13 @@ static void gem_pread_subtest(void)
 
 	free(cpu_buf);
 	free(read_buf);
+	forcewake_put(&ms_data);
 }
 
 /* Paints a square of color $color, size $width x $height, at position $x x $y
  * of $dst_handle, which contains pitch $pitch. */
-static void submit_blt_cmd(uint32_t dst_handle, uint16_t x, uint16_t y,
+static void submit_blt_cmd(uint32_t dst_handle, int dst_size,
+			   uint16_t x, uint16_t y,
 			   uint16_t width, uint16_t height, uint32_t pitch,
 			   uint32_t color, uint32_t *presumed_dst_offset)
 {
@@ -1189,6 +1255,12 @@ static void submit_blt_cmd(uint32_t dst_handle, uint16_t x, uint16_t y,
 	struct drm_i915_gem_exec_object2 objs[2] = {{}, {}};
 	struct drm_i915_gem_relocation_entry relocs[1] = {{}};
 	struct drm_i915_gem_wait gem_wait;
+	uint64_t ahnd = get_reloc_ahnd(drm_fd, 0), dst_offset;
+
+	if (ahnd)
+		dst_offset = get_offset(ahnd, dst_handle, dst_size, 0);
+	else
+		dst_offset = *presumed_dst_offset;
 
 	i = 0;
 
@@ -1204,9 +1276,9 @@ static void submit_blt_cmd(uint32_t dst_handle, uint16_t x, uint16_t y,
 	batch_buf[i++] = (y << 16) | x;
 	batch_buf[i++] = ((y + height) << 16) | (x + width);
 	reloc_pos = i;
-	batch_buf[i++] = *presumed_dst_offset;
+	batch_buf[i++] = dst_offset;
 	if (intel_gen(ms_data.devid) >= 8)
-		batch_buf[i++] = 0;
+		batch_buf[i++] = dst_offset >> 32;
 	batch_buf[i++] = color;
 
 	batch_buf[i++] = MI_BATCH_BUFFER_END;
@@ -1226,11 +1298,18 @@ static void submit_blt_cmd(uint32_t dst_handle, uint16_t x, uint16_t y,
 	relocs[0].write_domain = I915_GEM_DOMAIN_RENDER;
 
 	objs[0].handle = dst_handle;
-	objs[0].alignment = 64;
+	objs[0].alignment = 0;
 
 	objs[1].handle = batch_handle;
-	objs[1].relocation_count = 1;
+	objs[1].relocation_count = !ahnd ? 1 : 0;
 	objs[1].relocs_ptr = (uintptr_t)relocs;
+
+	if (ahnd) {
+		objs[0].offset = dst_offset;
+		objs[0].flags = EXEC_OBJECT_PINNED | EXEC_OBJECT_WRITE;
+		objs[1].offset = get_offset(ahnd, batch_handle, batch_size, 0);
+		objs[1].flags = EXEC_OBJECT_PINNED;
+	}
 
 	execbuf.buffers_ptr = (uintptr_t)objs;
 	execbuf.buffer_count = 2;
@@ -1252,10 +1331,11 @@ static void submit_blt_cmd(uint32_t dst_handle, uint16_t x, uint16_t y,
 	do_ioctl(drm_fd, DRM_IOCTL_I915_GEM_WAIT, &gem_wait);
 
 	gem_close(drm_fd, batch_handle);
+	put_ahnd(ahnd);
 }
 
 /* Make sure we can submit a batch buffer and verify its result. */
-static void gem_execbuf_subtest(void)
+static void gem_execbuf_subtest(struct drm_i915_gem_memory_class_instance *mem_regions)
 {
 	int x, y;
 	uint32_t handle;
@@ -1271,9 +1351,9 @@ static void gem_execbuf_subtest(void)
 	gem_require_blitter(drm_fd);
 
 	/* Create and set data while the device is active. */
-	enable_one_screen_and_wait(&ms_data);
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
 
-	handle = gem_create(drm_fd, dst_size);
+	handle = gem_create_in_memory_region_list(drm_fd, dst_size, 0, mem_regions, 1);
 
 	cpu_buf = malloc(dst_size);
 	igt_assert(cpu_buf);
@@ -1281,10 +1361,10 @@ static void gem_execbuf_subtest(void)
 	gem_write(drm_fd, handle, 0, cpu_buf, dst_size);
 
 	/* Now suspend and try it. */
-	disable_all_screens_and_wait(&ms_data);
+	disable_all_screens_or_forcewake_put_and_wait(&ms_data);
 
 	color = 0x12345678;
-	submit_blt_cmd(handle, sq_x, sq_y, sq_w, sq_h, pitch, color,
+	submit_blt_cmd(handle, dst_size, sq_x, sq_y, sq_w, sq_h, pitch, color,
 		       &presumed_offset);
 	igt_assert(wait_for_suspended());
 
@@ -1303,7 +1383,7 @@ static void gem_execbuf_subtest(void)
 	}
 
 	/* Now resume and check for it again. */
-	enable_one_screen_and_wait(&ms_data);
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
 
 	memset(cpu_buf, 0, dst_size);
 	gem_read(drm_fd, handle, 0, cpu_buf, dst_size);
@@ -1323,10 +1403,10 @@ static void gem_execbuf_subtest(void)
 	 * suspended. We use the same spot, but a different color. As a bonus,
 	 * we're testing the presumed_offset from the previous command. */
 	color = 0x87654321;
-	submit_blt_cmd(handle, sq_x, sq_y, sq_w, sq_h, pitch, color,
+	submit_blt_cmd(handle, dst_size, sq_x, sq_y, sq_w, sq_h, pitch, color,
 		       &presumed_offset);
 
-	disable_all_screens_and_wait(&ms_data);
+	disable_all_screens_or_forcewake_put_and_wait(&ms_data);
 
 	memset(cpu_buf, 0, dst_size);
 	gem_read(drm_fd, handle, 0, cpu_buf, dst_size);
@@ -1349,7 +1429,9 @@ static void gem_execbuf_subtest(void)
 
 /* Assuming execbuf already works, let's see what happens when we force many
  * suspend/resume cycles with commands. */
-static void gem_execbuf_stress_subtest(int rounds, int wait_flags)
+static void
+gem_execbuf_stress_subtest(int rounds, int wait_flags,
+			   struct drm_i915_gem_memory_class_instance *mem_regions)
 {
 	int i;
 	int batch_size = 4 * sizeof(uint32_t);
@@ -1372,7 +1454,12 @@ static void gem_execbuf_stress_subtest(int rounds, int wait_flags)
 
 	disable_all_screens_and_wait(&ms_data);
 
-	handle = gem_create(drm_fd, batch_size);
+	/* PC8 test is only applicable to igfx  */
+	if (wait_flags & WAIT_PC8_RES)
+		handle = gem_create(drm_fd, batch_size);
+	else
+		handle = gem_create_in_memory_region_list(drm_fd, batch_size, 0, mem_regions, 1);
+
 	gem_write(drm_fd, handle, 0, batch_buf, batch_size);
 
 	objs[0].handle = handle;
@@ -1407,7 +1494,7 @@ static void gem_idle_subtest(void)
 
 	sleep(5);
 
-	gem_test_engine(drm_fd, -1);
+	gem_test_all_engines(drm_fd);
 }
 
 static void gem_evict_pwrite_subtest(void)
@@ -1458,12 +1545,12 @@ static void reg_read_ioctl_subtest(void)
 	igt_assert(wait_for_suspended());
 }
 
-static bool device_in_pci_d3(void)
+static bool device_in_pci_d3(struct pci_device *pci_dev)
 {
 	uint16_t val;
 	int rc;
 
-	rc = pci_device_cfg_read_u16(igt_device_get_pci_device(drm_fd), &val, 0xd4);
+	rc = pci_device_cfg_read_u16(pci_dev, &val, 0xd4);
 	igt_assert_eq(rc, 0);
 
 	igt_debug("%s: PCI D3 state=%d\n", __func__, val & 0x3);
@@ -1472,15 +1559,23 @@ static bool device_in_pci_d3(void)
 
 static void pci_d3_state_subtest(void)
 {
+	struct pci_device *pci_dev, *bridge_pci_dev;
+
 	igt_require(has_runtime_pm);
 
-	disable_all_screens_and_wait(&ms_data);
-	igt_assert(igt_wait(device_in_pci_d3(), 2000, 100));
+	pci_dev = igt_device_get_pci_device(drm_fd);
+	bridge_pci_dev = pci_device_get_parent_bridge(pci_dev);
 
-	if (ms_data.res) {
-		enable_one_screen_and_wait(&ms_data);
-		igt_assert(!device_in_pci_d3());
-	}
+	disable_all_screens_and_wait(&ms_data);
+	igt_assert(igt_wait(device_in_pci_d3(pci_dev), 2000, 100));
+
+	if (gem_has_lmem(drm_fd))
+		igt_require_f(pci_device_has_kernel_driver(bridge_pci_dev),
+			      "pci bridge device does not bind with pcieport driver\n");
+
+	enable_one_screen_or_forcewake_get_and_wait(&ms_data);
+	igt_assert(!device_in_pci_d3(pci_dev));
+	forcewake_put(&ms_data);
 }
 
 __noreturn static void stay_subtest(void)
@@ -1587,11 +1682,11 @@ static void cursor_subtest(bool dpms)
 	crtc_id = default_mode_params->crtc_id;
 
 	igt_create_fb(drm_fd, 64, 64, DRM_FORMAT_ARGB8888,
-		      LOCAL_DRM_FORMAT_MOD_NONE, &cursor_fb1);
+		      DRM_FORMAT_MOD_LINEAR, &cursor_fb1);
 	igt_create_fb(drm_fd, 64, 64, DRM_FORMAT_ARGB8888,
-		      LOCAL_DRM_FORMAT_MOD_NONE, &cursor_fb2);
+		      DRM_FORMAT_MOD_LINEAR, &cursor_fb2);
 	igt_create_fb(drm_fd, 64, 64, DRM_FORMAT_XRGB8888,
-		      LOCAL_I915_FORMAT_MOD_X_TILED, &cursor_fb3);
+		      I915_FORMAT_MOD_X_TILED, &cursor_fb3);
 
 	fill_igt_fb(&cursor_fb1, 0xFF00FFFF);
 	fill_igt_fb(&cursor_fb2, 0xFF00FF00);
@@ -1698,7 +1793,7 @@ static void test_one_plane(bool dpms, uint32_t plane_id,
 	uint32_t crtc_id;
 	struct igt_fb plane_fb1, plane_fb2;
 	int32_t crtc_x = 0, crtc_y = 0;
-	uint64_t tiling;
+	uint64_t modifier;
 
 	disable_all_screens_and_wait(&ms_data);
 
@@ -1709,28 +1804,28 @@ static void test_one_plane(bool dpms, uint32_t plane_id,
 		plane_format = DRM_FORMAT_XRGB8888;
 		plane_w = 64;
 		plane_h = 64;
-		tiling = LOCAL_I915_FORMAT_MOD_X_TILED;
+		modifier = I915_FORMAT_MOD_X_TILED;
 		break;
 	case PLANE_PRIMARY:
 		plane_format = DRM_FORMAT_XRGB8888;
 		plane_w = default_mode_params->mode->hdisplay;
 		plane_h = default_mode_params->mode->vdisplay;
-		tiling = LOCAL_I915_FORMAT_MOD_X_TILED;
+		modifier = I915_FORMAT_MOD_X_TILED;
 		break;
 	case PLANE_CURSOR:
 		plane_format = DRM_FORMAT_ARGB8888;
 		plane_w = 64;
 		plane_h = 64;
-		tiling = LOCAL_DRM_FORMAT_MOD_NONE;
+		modifier = DRM_FORMAT_MOD_LINEAR;
 		break;
 	default:
 		igt_assert(0);
 		break;
 	}
 
-	igt_create_fb(drm_fd, plane_w, plane_h, plane_format, tiling,
+	igt_create_fb(drm_fd, plane_w, plane_h, plane_format, modifier,
 		      &plane_fb1);
-	igt_create_fb(drm_fd, plane_w, plane_h, plane_format, tiling,
+	igt_create_fb(drm_fd, plane_w, plane_h, plane_format, modifier,
 		      &plane_fb2);
 	fill_igt_fb(&plane_fb1, 0xFF00FFFF);
 	fill_igt_fb(&plane_fb2, 0xFF00FF00);
@@ -1934,7 +2029,7 @@ static void fences_subtest(bool dpms)
 	params.connector_id = default_mode_params->connector_id;
 	params.mode = default_mode_params->mode;
 	igt_create_fb(drm_fd, params.mode->hdisplay, params.mode->vdisplay,
-		      DRM_FORMAT_XRGB8888, LOCAL_I915_FORMAT_MOD_X_TILED,
+		      DRM_FORMAT_XRGB8888, I915_FORMAT_MOD_X_TILED,
 		      &params.fb);
 
 	/* Even though we passed "true" as the tiling argument, double-check
@@ -2007,15 +2102,16 @@ static struct option long_options[] = {
 igt_main_args("", long_options, help_str, opt_handler, NULL)
 {
 	igt_subtest("basic-rte") {
-		igt_assert(setup_environment(false));
+		igt_assert(setup_environment(true));
 		basic_subtest();
 	}
 
 	/* Skip instead of failing in case the machine is not prepared to reach
 	 * PC8+. We don't want bug reports from cases where the machine is just
 	 * not properly configured. */
-	igt_fixture
-		igt_require(setup_environment(false));
+	igt_fixture {
+		igt_require(setup_environment(true));
+	}
 
 	if (stay)
 		igt_subtest("stay")
@@ -2040,15 +2136,21 @@ igt_main_args("", long_options, help_str, opt_handler, NULL)
 	/* GEM */
 	igt_subtest_with_dynamic("gem-mmap-type") {
 		for_each_mmap_offset_type(drm_fd, t) {
-			igt_dynamic_f("%s", t->name)
-				gem_mmap_args(t);
+			for_each_memory_region(r, drm_fd) {
+				igt_dynamic_f("%s-%s", t->name, r->name)
+				gem_mmap_args(t, &r->ci);
+			}
 		}
 	}
 
 	igt_subtest("gem-pread")
 		gem_pread_subtest();
-	igt_subtest("gem-execbuf")
-		gem_execbuf_subtest();
+	igt_subtest_with_dynamic("gem-execbuf") {
+		for_each_memory_region(r, drm_fd) {
+			igt_dynamic_f("%s", r->name)
+				gem_execbuf_subtest(&r->ci);
+		}
+	}
 	igt_subtest("gem-idle")
 		gem_idle_subtest();
 	igt_subtest("gem-evict-pwrite") {
@@ -2127,12 +2229,19 @@ igt_main_args("", long_options, help_str, opt_handler, NULL)
 		system_suspend_subtest(SUSPEND_STATE_DISK, SUSPEND_TEST_NONE);
 
 	/* GEM stress */
-	igt_subtest("gem-execbuf-stress")
-		gem_execbuf_stress_subtest(rounds, WAIT_STATUS);
+	igt_describe("Validate execbuf submission while exercising rpm "
+		     "suspend/resume cycles.");
+	igt_subtest_with_dynamic("gem-execbuf-stress") {
+		for_each_memory_region(r, drm_fd) {
+			igt_dynamic_f("%s", r->name)
+				gem_execbuf_stress_subtest(rounds, WAIT_STATUS, &r->ci);
+			igt_dynamic_f("%s-%s", "extra-wait", r->name)
+				gem_execbuf_stress_subtest(rounds, WAIT_STATUS | WAIT_EXTRA, &r->ci);
+		}
+	}
+
 	igt_subtest("gem-execbuf-stress-pc8")
-		gem_execbuf_stress_subtest(rounds, WAIT_PC8_RES);
-	igt_subtest("gem-execbuf-stress-extra-wait")
-		gem_execbuf_stress_subtest(rounds, WAIT_STATUS | WAIT_EXTRA);
+		gem_execbuf_stress_subtest(rounds, WAIT_PC8_RES, 0);
 
 	/* power-wake reference tests */
 	igt_subtest("pm-tiling") {
@@ -2144,19 +2253,24 @@ igt_main_args("", long_options, help_str, opt_handler, NULL)
 		pm_test_caching();
 	}
 
-	igt_fixture
-		teardown_environment(false);
+	igt_fixture {
+		teardown_environment(true);
+		forcewake_put(&ms_data);
+	}
 
 	igt_subtest("module-reload") {
+		struct pci_device *pci_dev;
+
 		igt_debug("Reload w/o display\n");
 		igt_i915_driver_unload();
 
 		igt_kmsg(KMSG_INFO "Reloading i915 w/o display\n");
 		igt_assert_eq(igt_i915_driver_load("disable_display=1 mmio_debug=-1"), 0);
 
-		igt_assert(setup_environment(true));
-		igt_assert(igt_wait(device_in_pci_d3(), 2000, 100));
-		teardown_environment(true);
+		igt_assert(setup_environment(false));
+		pci_dev = igt_device_get_pci_device(drm_fd);
+		igt_assert(igt_wait(device_in_pci_d3(pci_dev), 2000, 100));
+		teardown_environment(false);
 
 		igt_debug("Reload as normal\n");
 		igt_i915_driver_unload();
@@ -2164,11 +2278,12 @@ igt_main_args("", long_options, help_str, opt_handler, NULL)
 		igt_kmsg(KMSG_INFO "Reloading i915 as normal\n");
 		igt_assert_eq(igt_i915_driver_load("mmio_debug=-1"), 0);
 
-		igt_assert(setup_environment(false));
-		igt_assert(igt_wait(device_in_pci_d3(), 2000, 100));
+		igt_assert(setup_environment(true));
+		pci_dev = igt_device_get_pci_device(drm_fd);
+		igt_assert(igt_wait(device_in_pci_d3(pci_dev), 2000, 100));
 		if (enable_one_screen_with_type(&ms_data, SCREEN_TYPE_ANY))
 			drm_resources_equal_subtest();
-		teardown_environment(false);
+		teardown_environment(true);
 
 		/* Remove our mmio_debugging module */
 		igt_i915_driver_unload();

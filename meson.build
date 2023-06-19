@@ -1,5 +1,5 @@
 project('igt-gpu-tools', 'c',
-	version : '1.26',
+	version : '1.27.1',
         default_options: [
           'warning_level=2',
           'c_std=gnu11',
@@ -70,7 +70,6 @@ cc_args = [
 # well with longjmp which is heavily used by IGT framework.
 	'-fno-builtin-malloc',
 	'-fno-builtin-calloc',
-	'-fcommon',
 ]
 
 foreach cc_arg : cc_args
@@ -86,7 +85,7 @@ with_libdrm = get_option('libdrm_drivers')
 
 build_info = ['Build type: ' + get_option('buildtype')]
 
-inc = include_directories('include/drm-uapi', 'lib', 'lib/stubs/syscalls', '.')
+inc = include_directories('include/drm-uapi', 'include/linux-uapi', 'lib', 'lib/stubs/syscalls', '.')
 
 inc_for_gtkdoc = include_directories('lib')
 
@@ -260,8 +259,11 @@ includedir = get_option('includedir')
 libdir = get_option('libdir')
 libexecdir = join_paths(get_option('libexecdir'), 'igt-gpu-tools')
 amdgpudir = join_paths(libexecdir, 'amdgpu')
+v3ddir = join_paths(libexecdir, 'v3d')
+vc4dir = join_paths(libexecdir, 'vc4')
 mandir = get_option('mandir')
 pkgconfigdir = join_paths(libdir, 'pkgconfig')
+python3 = find_program('python3', required : true)
 
 if get_option('use_rpath')
 	# Set up runpath for the test executables towards libigt.so.
@@ -294,10 +296,24 @@ if get_option('use_rpath')
 		amdgpudir_rpathdir = join_paths(amdgpudir_rpathdir, '..')
 	endforeach
 	amdgpudir_rpathdir = join_paths(amdgpudir_rpathdir, libdir)
+
+	v3d_rpathdir = '$ORIGIN'
+	foreach p : v3ddir.split('/')
+		v3d_rpathdir = join_paths(v3d_rpathdir, '..')
+	endforeach
+	v3d_rpathdir = join_paths(v3d_rpathdir, libdir)
+
+	vc4_rpathdir = '$ORIGIN'
+	foreach p : vc4dir.split('/')
+		vc4_rpathdir = join_paths(vc4_rpathdir, '..')
+	endforeach
+	vc4_rpathdir = join_paths(vc4_rpathdir, libdir)
 else
 	bindir_rpathdir = ''
 	libexecdir_rpathdir = ''
 	amdgpudir_rpathdir = ''
+	v3d_rpathdir = ''
+	vc4_rpathdir = ''
 endif
 
 subdir('lib')
@@ -314,10 +330,10 @@ if libdrm_intel.found()
 endif
 subdir('overlay')
 subdir('man')
+subdir('scripts')
 
 gtk_doc = dependency('gtk-doc', required : build_docs)
-python3 = find_program('python3', required : build_docs)
-if build_tests and gtk_doc.found() and python3.found()
+if build_tests and gtk_doc.found()
 	subdir('docs')
 elif build_docs.enabled()
 	error('Documentation requires building tests')

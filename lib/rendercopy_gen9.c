@@ -23,6 +23,7 @@
 #include "gen9_render.h"
 #include "intel_reg.h"
 #include "igt_aux.h"
+#include "intel_chipset.h"
 
 #define VERTEX_SIZE (3*4)
 
@@ -115,12 +116,61 @@ static const uint32_t gen12_render_copy[][4] = {
 	{ 0x80040131, 0x00000004, 0x50007144, 0x00c40000 },
 };
 
+/* see lib/i915/shaders/ps/gen12p71_render_copy.asm */
+static const uint32_t gen12p71_render_copy[][4] = {
+	{ 0x8003005b, 0x200002a0, 0x0a0a0664, 0x06040205 },
+	{ 0x8003005b, 0x71040aa8, 0x0a0a2001, 0x06240305 },
+	{ 0x8003005b, 0x200002a0, 0x0a0a0664, 0x06040405 },
+	{ 0x8003005b, 0x72040aa8, 0x0a0a2001, 0x06240505 },
+	{ 0x8003005b, 0x200002a0, 0x0a0a06e4, 0x06840205 },
+	{ 0x8003005b, 0x73040aa8, 0x0a0a2001, 0x06a40305 },
+	{ 0x8003005b, 0x200002a0, 0x0a0a06e4, 0x06840405 },
+	{ 0x8003005b, 0x74040aa8, 0x0a0a2001, 0x06a40505 },
+	{ 0x80031101, 0x00010000, 0x00000000, 0x00000000 },
+	{ 0x80044031, 0x0c440000, 0x20027124, 0x01000000 },
+	{ 0x00042061, 0x71050aa0, 0x00460c05, 0x00000000 },
+	{ 0x00040061, 0x73050aa0, 0x00460e05, 0x00000000 },
+	{ 0x00040061, 0x75050aa0, 0x00461005, 0x00000000 },
+	{ 0x00040061, 0x77050aa0, 0x00461205, 0x00000000 },
+	{ 0x80041131, 0x00000004, 0x50007144, 0x00c40000 },
+};
+
+/*
+ * Gen >= 12 onwards don't have a setting for PTE,
+ * so using I915_MOCS_PTE as mocs index may lead to
+ * some undefined MOCS behavior.
+ * Correct MOCS index should be referred from BSpec
+ * and programmed accordingly.
+ * This helper function is providing appropriate UC index.
+ */
+static uint8_t
+intel_get_uc_mocs(int fd) {
+
+	uint16_t devid = intel_get_drm_devid(fd);
+	uint8_t  uc_index;
+
+	if (IS_DG1(devid))
+		uc_index = 1;
+	else if (IS_GEN12(devid))
+		uc_index = 3;
+	else
+		uc_index = I915_MOCS_PTE;
+
+	/*
+	 * BitField [6:1] represents index to MOCS Tables
+	 * BitField [0] represents Encryption/Decryption
+	 */
+	return uc_index << 1;
+}
+
 /* Mostly copy+paste from gen6, except height, width, pitch moved */
 static uint32_t
-gen8_bind_buf(struct intel_bb *ibb, const struct intel_buf *buf, int is_dst) {
+gen8_bind_buf(struct intel_bb *ibb, const struct intel_buf *buf, int is_dst,
+	      bool fast_clear) {
 	struct gen9_surface_state *ss;
 	uint32_t write_domain, read_domain;
 	uint64_t address;
+	int i915 = buf_ops_get_fd(buf->bops);
 
 	igt_assert_lte(buf->surface[0].stride, 256*1024);
 	igt_assert_lte(intel_buf_width(buf), 16384);
@@ -143,21 +193,33 @@ gen8_bind_buf(struct intel_bb *ibb, const struct intel_buf *buf, int is_dst) {
 		case 64: ss->ss0.surface_format = SURFACEFORMAT_R16G16B16A16_FLOAT; break;
 		default: igt_assert(0);
 	}
-	ss->ss0.render_cache_read_write = 1;
 	ss->ss0.vertical_alignment = 1; /* align 4 */
-	ss->ss0.horizontal_alignment = 1; /* align 4 */
+	ss->ss0.horizontal_alignment = 1; /* align 4 or HALIGN_32 on display ver >= 13*/
+
+	if (HAS_4TILE(ibb->devid)) {
+		/*
+		 * mocs table version 1 index 3 groub wb use l3
+		 */
+		ss->ss1.memory_object_control = 3 << 1;
+		ss->ss5.mip_tail_start_lod = 0;
+	} else {
+		ss->ss0.render_cache_read_write = 1;
+		ss->ss1.memory_object_control = intel_get_uc_mocs(i915);
+		ss->ss5.mip_tail_start_lod = 1; /* needed with trmode */
+	}
+
 	if (buf->tiling == I915_TILING_X)
 		ss->ss0.tiled_mode = 2;
 	else if (buf->tiling != I915_TILING_NONE)
 		ss->ss0.tiled_mode = 3;
 
-	ss->ss1.memory_object_control = I915_MOCS_PTE << 1;
+	if (intel_buf_pxp(buf))
+		ss->ss1.memory_object_control |= 1;
 
 	if (buf->tiling == I915_TILING_Yf)
 		ss->ss5.trmode = 1;
 	else if (buf->tiling == I915_TILING_Ys)
 		ss->ss5.trmode = 2;
-	ss->ss5.mip_tail_start_lod = 1; /* needed with trmode */
 
 	address = intel_bb_offset_reloc(ibb, buf->handle,
 					read_domain, write_domain,
@@ -178,20 +240,23 @@ gen8_bind_buf(struct intel_bb *ibb, const struct intel_buf *buf, int is_dst) {
 	if (buf->compression == I915_COMPRESSION_MEDIA)
 		ss->ss7.tgl.media_compression = 1;
 	else if (buf->compression == I915_COMPRESSION_RENDER) {
-		igt_assert(buf->ccs[0].stride);
-
 		ss->ss6.aux_mode = 0x5; /* AUX_CCS_E */
-		ss->ss6.aux_pitch = (buf->ccs[0].stride / 128) - 1;
 
-		address = intel_bb_offset_reloc_with_delta(ibb, buf->handle,
-							   read_domain, write_domain,
-							   (buf->cc.offset ? (1 << 10) : 0) | buf->ccs[0].offset,
-							   intel_bb_offset(ibb) + 4 * 10,
-							   buf->addr.offset);
-		ss->ss10.aux_base_addr = (address + buf->ccs[0].offset) >> 12;
-		ss->ss11.aux_base_addr_hi = (address + buf->ccs[0].offset) >> 32;
+		if (buf->ccs[0].stride) {
 
-		if (buf->cc.offset) {
+			ss->ss6.aux_pitch = (buf->ccs[0].stride / 128) - 1;
+
+			address = intel_bb_offset_reloc_with_delta(ibb, buf->handle,
+								   read_domain, write_domain,
+								   (buf->cc.offset ? (1 << 10) : 0)
+								   | buf->ccs[0].offset,
+								   intel_bb_offset(ibb) + 4 * 10,
+								   buf->addr.offset);
+			ss->ss10.aux_base_addr = (address + buf->ccs[0].offset) >> 12;
+			ss->ss11.aux_base_addr_hi = (address + buf->ccs[0].offset) >> 32;
+		}
+
+		if (fast_clear || (buf->cc.offset && !HAS_FLATCCS(ibb->devid))) {
 			igt_assert(buf->compression == I915_COMPRESSION_RENDER);
 
 			ss->ss10.clearvalue_addr_enable = 1;
@@ -201,8 +266,30 @@ gen8_bind_buf(struct intel_bb *ibb, const struct intel_buf *buf, int is_dst) {
 								   buf->cc.offset,
 								   intel_bb_offset(ibb) + 4 * 12,
 								   buf->addr.offset);
-			ss->ss12.clear_address = address + buf->cc.offset;
+
+			/*
+			 * If this assert doesn't hold below clear address will be
+			 * written wrong.
+			 */
+
+			igt_assert(__builtin_ctzl(address + buf->cc.offset) >= 6 &&
+				   (__builtin_clzl(address + buf->cc.offset) >= 16));
+
+			ss->ss12.clear_address = (address + buf->cc.offset) >> 6;
 			ss->ss13.clear_address_hi = (address + buf->cc.offset) >> 32;
+		} else if (HAS_FLATCCS(ibb->devid)) {
+			ss->ss7.dg2.memory_compression_type = 0;
+			ss->ss7.dg2.memory_compression_enable = 0;
+			ss->ss7.dg2.disable_support_for_multi_gpu_partial_writes = 1;
+			ss->ss7.dg2.disable_support_for_multi_gpu_atomics = 1;
+
+			/*
+			 * For now here is coming only 32bpp rgb format
+			 * which is marked below as B8G8R8X8_UNORM = '8'
+			 * If here ever arrive other formats below need to be
+			 * fixed to take that into account.
+			 */
+			ss->ss12.compression_format = 8;
 		}
 	}
 
@@ -215,14 +302,15 @@ gen8_bind_surfaces(struct intel_bb *ibb,
 		   const struct intel_buf *dst)
 {
 	uint32_t *binding_table, binding_table_offset;
+	bool fast_clear = !src;
 
 	binding_table = intel_bb_ptr_align(ibb, 32);
 	binding_table_offset = intel_bb_ptr_add_return_prev_offset(ibb, 32);
 
-	binding_table[0] = gen8_bind_buf(ibb, dst, 1);
+	binding_table[0] = gen8_bind_buf(ibb, dst, 1, fast_clear);
 
 	if (src != NULL)
-		binding_table[1] = gen8_bind_buf(ibb, src, 0);
+		binding_table[1] = gen8_bind_buf(ibb, src, 0, false);
 
 	return binding_table_offset;
 }
@@ -805,12 +893,14 @@ gen8_emit_ps(struct intel_bb *ibb, uint32_t kernel, bool fast_clear) {
 static void
 gen9_emit_depth(struct intel_bb *ibb)
 {
+	bool need_10dw = HAS_4TILE(ibb->devid);
+
 	intel_bb_out(ibb, GEN8_3DSTATE_WM_DEPTH_STENCIL | (4 - 2));
 	intel_bb_out(ibb, 0);
 	intel_bb_out(ibb, 0);
 	intel_bb_out(ibb, 0);
 
-	intel_bb_out(ibb, GEN7_3DSTATE_DEPTH_BUFFER | (8-2));
+	intel_bb_out(ibb, GEN7_3DSTATE_DEPTH_BUFFER | (need_10dw ? (10-2) : (8-2)));
 	intel_bb_out(ibb, 0);
 	intel_bb_out(ibb, 0);
 	intel_bb_out(ibb, 0);
@@ -818,6 +908,10 @@ gen9_emit_depth(struct intel_bb *ibb)
 	intel_bb_out(ibb, 0);
 	intel_bb_out(ibb, 0);
 	intel_bb_out(ibb, 0);
+	if (need_10dw) {
+		intel_bb_out(ibb, 0);
+		intel_bb_out(ibb, 0);
+	}
 
 	intel_bb_out(ibb, GEN8_3DSTATE_HIER_DEPTH_BUFFER | (5-2));
 	intel_bb_out(ibb, 0);
@@ -873,6 +967,53 @@ static void gen8_emit_primitive(struct intel_bb *ibb, uint32_t offset)
 	intel_bb_out(ibb, 0);	/* index buffer offset, ignored */
 }
 
+#define GFX_OP_PIPE_CONTROL    ((3 << 29) | (3 << 27) | (2 << 24))
+#define PIPE_CONTROL_CS_STALL	            (1 << 20)
+#define PIPE_CONTROL_RENDER_TARGET_FLUSH    (1 << 12)
+#define PIPE_CONTROL_FLUSH_ENABLE           (1 << 7)
+#define PIPE_CONTROL_DATA_CACHE_INVALIDATE  (1 << 5)
+#define PIPE_CONTROL_PROTECTEDPATH_DISABLE  (1 << 27)
+#define PIPE_CONTROL_PROTECTEDPATH_ENABLE   (1 << 22)
+#define PIPE_CONTROL_POST_SYNC_OP           (1 << 14)
+#define PIPE_CONTROL_POST_SYNC_OP_STORE_DW_IDX (1 << 21)
+#define PS_OP_TAG_START                     0x1234fed0
+#define PS_OP_TAG_END                       0x5678cbaf
+static void gen12_emit_pxp_state(struct intel_bb *ibb, bool enable,
+		 uint32_t pxp_write_op_offset)
+{
+	uint32_t pipe_ctl_flags;
+	uint32_t set_app_id, ps_op_id;
+
+	if (enable) {
+		pipe_ctl_flags = PIPE_CONTROL_FLUSH_ENABLE;
+		intel_bb_out(ibb, GFX_OP_PIPE_CONTROL);
+		intel_bb_out(ibb, pipe_ctl_flags);
+
+		set_app_id =  MI_SET_APPID |
+			      APPTYPE(intel_bb_pxp_apptype(ibb)) |
+			      APPID(intel_bb_pxp_appid(ibb));
+		intel_bb_out(ibb, set_app_id);
+
+		pipe_ctl_flags = PIPE_CONTROL_PROTECTEDPATH_ENABLE;
+		ps_op_id = PS_OP_TAG_START;
+	} else {
+		pipe_ctl_flags = PIPE_CONTROL_PROTECTEDPATH_DISABLE;
+		ps_op_id = PS_OP_TAG_END;
+	}
+
+	pipe_ctl_flags |= (PIPE_CONTROL_CS_STALL |
+			   PIPE_CONTROL_RENDER_TARGET_FLUSH |
+			   PIPE_CONTROL_DATA_CACHE_INVALIDATE |
+			   PIPE_CONTROL_POST_SYNC_OP);
+	intel_bb_out(ibb, GFX_OP_PIPE_CONTROL | 4);
+	intel_bb_out(ibb, pipe_ctl_flags);
+	intel_bb_emit_reloc(ibb, ibb->handle, 0, I915_GEM_DOMAIN_COMMAND,
+			    (enable ? pxp_write_op_offset : (pxp_write_op_offset+8)),
+			    ibb->batch_offset);
+	intel_bb_out(ibb, ps_op_id);
+	intel_bb_out(ibb, ps_op_id);
+}
+
 /* The general rule is if it's named gen6 it is directly copied from
  * gen6_render_copyfunc.
  *
@@ -922,6 +1063,7 @@ void _gen9_render_op(struct intel_bb *ibb,
 	uint32_t vertex_buffer;
 	uint32_t aux_pgtable_state;
 	bool fast_clear = !src;
+	uint32_t pxp_scratch_offset;
 
 	if (!fast_clear)
 		igt_assert(src->bpp == dst->bpp);
@@ -950,7 +1092,11 @@ void _gen9_render_op(struct intel_bb *ibb,
 	aux_pgtable_state = gen12_create_aux_pgtable_state(ibb, aux_pgtable_buf);
 
 	/* TODO: there is other state which isn't setup */
+	pxp_scratch_offset = intel_bb_offset(ibb);
 	intel_bb_ptr_set(ibb, 0);
+
+	if (intel_bb_pxp_enabled(ibb))
+		gen12_emit_pxp_state(ibb, true, pxp_scratch_offset);
 
 	/* Start emitting the commands. The order roughly follows the mesa blorp
 	 * order */
@@ -976,6 +1122,14 @@ void _gen9_render_op(struct intel_bb *ibb,
 	gen7_emit_push_constants(ibb);
 
 	gen9_emit_state_base_address(ibb);
+
+	if (HAS_4TILE(ibb->devid) || intel_gen(ibb->devid) > 12) {
+		intel_bb_out(ibb, GEN4_3DSTATE_BINDING_TABLE_POOL_ALLOC | 2);
+		intel_bb_emit_reloc(ibb, ibb->handle,
+				    I915_GEM_DOMAIN_RENDER | I915_GEM_DOMAIN_INSTRUCTION, 0,
+				    0, ibb->batch_offset);
+		intel_bb_out(ibb, 1 << 12);
+	}
 
 	intel_bb_out(ibb, GEN7_3DSTATE_VIEWPORT_STATE_POINTERS_CC);
 	intel_bb_out(ibb, viewport.cc_state);
@@ -1022,6 +1176,9 @@ void _gen9_render_op(struct intel_bb *ibb,
 
 	gen8_emit_vf_topology(ibb);
 	gen8_emit_primitive(ibb, vertex_buffer);
+
+	if (intel_bb_pxp_enabled(ibb))
+		gen12_emit_pxp_state(ibb, false, pxp_scratch_offset);
 
 	intel_bb_emit_bbe(ibb);
 	intel_bb_exec(ibb, intel_bb_offset(ibb),
@@ -1076,6 +1233,21 @@ void gen12_render_copyfunc(struct intel_bb *ibb,
 	gen12_aux_pgtable_cleanup(ibb, &pgtable_info);
 }
 
+void gen12p71_render_copyfunc(struct intel_bb *ibb,
+			      struct intel_buf *src,
+			      unsigned int src_x, unsigned int src_y,
+			      unsigned int width, unsigned int height,
+			      struct intel_buf *dst,
+			      unsigned int dst_x, unsigned int dst_y)
+{
+	_gen9_render_op(ibb, src, src_x, src_y,
+			width, height, dst, dst_x, dst_y,
+			NULL,
+			NULL,
+			gen12p71_render_copy,
+			sizeof(gen12p71_render_copy));
+}
+
 void gen12_render_clearfunc(struct intel_bb *ibb,
 			    struct intel_buf *dst,
 			    unsigned int dst_x, unsigned int dst_y,
@@ -1087,11 +1259,24 @@ void gen12_render_clearfunc(struct intel_bb *ibb,
 	gen12_aux_pgtable_init(&pgtable_info, ibb, NULL, dst);
 
 	_gen9_render_op(ibb, NULL, 0, 0,
-		        width, height, dst, dst_x, dst_y,
-		        pgtable_info.pgtable_buf,
-		        clear_color,
-		        gen12_render_copy,
-		        sizeof(gen12_render_copy));
-
+			width, height, dst, dst_x, dst_y,
+			pgtable_info.pgtable_buf,
+			clear_color,
+			gen12_render_copy,
+			sizeof(gen12_render_copy));
 	gen12_aux_pgtable_cleanup(ibb, &pgtable_info);
+}
+
+void gen12p71_render_clearfunc(struct intel_bb *ibb,
+			       struct intel_buf *dst,
+			       unsigned int dst_x, unsigned int dst_y,
+			       unsigned int width, unsigned int height,
+			       const float clear_color[4])
+{
+	_gen9_render_op(ibb, NULL, 0, 0,
+			width, height, dst, dst_x, dst_y,
+			NULL,
+			clear_color,
+			gen12p71_render_copy,
+			sizeof(gen12p71_render_copy));
 }

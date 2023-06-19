@@ -78,6 +78,27 @@ enum port {
 };
 
 /**
+ * igt_custom_edid_type:
+ *
+ * Enum used for the helper function igt_custom_edid_type
+ * @IGT_CUSTOM_EDID_BASE: Returns base edid
+ * @IGT_CUSTOM_EDID_FULL: Returns edid with full list of standard timings.
+ * @IGT_CUSTOM_EDID_ALT: Returns alternate edid
+ * @IGT_CUSTOM_EDID_HDMI_AUDIO: Returns edid with HDMI audio block
+ * @IGT_CUSTOM_EDID_DP_AUDIO: Returns edid with DP audio block
+ * @IGT_CUSTOM_EDID_ASPECT_RATIO: Returns base edid with apect ratio data block
+ */
+enum igt_custom_edid_type {
+	IGT_CUSTOM_EDID_BASE,
+	IGT_CUSTOM_EDID_FULL,
+	IGT_CUSTOM_EDID_ALT,
+	IGT_CUSTOM_EDID_HDMI_AUDIO,
+	IGT_CUSTOM_EDID_DP_AUDIO,
+	IGT_CUSTOM_EDID_ASPECT_RATIO,
+};
+#define IGT_CUSTOM_EDID_COUNT 6
+
+/**
  * kmstest_port_name:
  * @port: display plane
  *
@@ -88,8 +109,10 @@ enum port {
 const char *kmstest_encoder_type_str(int type);
 const char *kmstest_connector_status_str(int status);
 const char *kmstest_connector_type_str(int type);
+const char *kmstest_scaling_filter_str(int filter);
 
 void kmstest_dump_mode(drmModeModeInfo *mode);
+#define MAX_HDISPLAY_PER_PIPE 5120
 
 int kmstest_get_pipe_from_crtc_id(int fd, int crtc_id);
 void kmstest_set_vt_graphics_mode(void);
@@ -106,6 +129,7 @@ enum igt_atomic_crtc_properties {
        IGT_CRTC_ACTIVE,
        IGT_CRTC_OUT_FENCE_PTR,
        IGT_CRTC_VRR_ENABLED,
+       IGT_CRTC_SCALING_FILTER,
        IGT_NUM_CRTC_PROPS
 };
 
@@ -151,6 +175,7 @@ struct kmstest_connector_config {
 
 	int pipe;
 	unsigned valid_crtc_idx_mask;
+	char *connector_path;
 };
 
 struct kmstest_plane {
@@ -212,6 +237,7 @@ bool kmstest_get_connector_default_mode(int drm_fd, drmModeConnector *connector,
 bool kmstest_get_connector_config(int drm_fd, uint32_t connector_id,
 				  unsigned long crtc_idx_mask,
 				  struct kmstest_connector_config *config);
+drmModePropertyBlobPtr kmstest_get_path_blob(int drm_fd, uint32_t connector_id);
 bool kmstest_probe_connector_config(int drm_fd, uint32_t connector_id,
 				    unsigned long crtc_idx_mask,
 				    struct kmstest_connector_config *config);
@@ -282,6 +308,7 @@ enum igt_atomic_plane_properties {
        IGT_PLANE_ALPHA,
        IGT_PLANE_ZPOS,
        IGT_PLANE_FB_DAMAGE_CLIPS,
+       IGT_PLANE_SCALING_FILTER,
        IGT_NUM_PLANE_PROPS
 };
 
@@ -310,6 +337,11 @@ typedef enum {
 #define IGT_ROTATION_MASK \
 	(IGT_ROTATION_0 | IGT_ROTATION_90 | IGT_ROTATION_180 | IGT_ROTATION_270)
 
+static inline bool igt_rotation_90_or_270(igt_rotation_t rotation)
+{
+	return rotation & (IGT_ROTATION_90 | IGT_ROTATION_270);
+}
+
 typedef struct igt_plane {
 	/*< private >*/
 	igt_pipe_t *pipe;
@@ -334,6 +366,8 @@ typedef struct igt_plane {
 		uint64_t values[IGT_NUM_COLOR_RANGES];
 	} color_range;
 
+	igt_rotation_t rotations;
+
 	uint64_t changed;
 	uint32_t props[IGT_NUM_PLANE_PROPS];
 	uint64_t values[IGT_NUM_PLANE_PROPS];
@@ -357,6 +391,7 @@ struct igt_pipe {
 	bool enabled;
 
 	int n_planes;
+	int num_primary_planes;
 	int plane_cursor;
 	int plane_primary;
 	igt_plane_t *planes;
@@ -419,6 +454,7 @@ typedef struct {
 	uint16_t tile_h_size, tile_v_size;
 } igt_tile_info_t;
 
+void igt_display_reset_outputs(igt_display_t *display);
 void igt_display_require(igt_display_t *display, int drm_fd);
 void igt_display_fini(igt_display_t *display);
 void igt_display_reset(igt_display_t *display);
@@ -435,6 +471,7 @@ void igt_display_require_output_on_pipe(igt_display_t *display, enum pipe pipe);
 const char *igt_output_name(igt_output_t *output);
 drmModeModeInfo *igt_output_get_mode(igt_output_t *output);
 void igt_output_override_mode(igt_output_t *output, const drmModeModeInfo *mode);
+int igt_output_preferred_vrefresh(igt_output_t *output);
 void igt_output_set_pipe(igt_output_t *output, enum pipe pipe);
 igt_plane_t *igt_output_get_plane(igt_output_t *output, int plane_idx);
 igt_plane_t *igt_output_get_plane_type(igt_output_t *output, int plane_type);
@@ -444,13 +481,15 @@ igt_plane_t *igt_output_get_plane_type_index(igt_output_t *output,
 igt_output_t *igt_output_from_connector(igt_display_t *display,
     drmModeConnector *connector);
 void igt_output_refresh(igt_output_t *output);
-const drmModeModeInfo *igt_std_1024_mode_get(void);
+drmModeModeInfo *igt_std_1024_mode_get(int vrefresh);
 void igt_output_set_writeback_fb(igt_output_t *output, struct igt_fb *fb);
+void igt_modeset_disable_all_outputs(igt_display_t *display);
 
 igt_plane_t *igt_pipe_get_plane_type(igt_pipe_t *pipe, int plane_type);
 int igt_pipe_count_plane_type(igt_pipe_t *pipe, int plane_type);
 igt_plane_t *igt_pipe_get_plane_type_index(igt_pipe_t *pipe, int plane_type,
 					   int index);
+bool output_is_internal_panel(igt_output_t *output);
 igt_output_t *igt_get_single_output_for_pipe(igt_display_t *display, enum pipe pipe);
 
 void igt_pipe_request_out_fence(igt_pipe_t *pipe);
@@ -465,6 +504,20 @@ void igt_fb_set_position(struct igt_fb *fb, igt_plane_t *plane,
 	uint32_t x, uint32_t y);
 void igt_fb_set_size(struct igt_fb *fb, igt_plane_t *plane,
 	uint32_t w, uint32_t h);
+
+/**
+ * igt_plane_has_rotation:
+ * @plane: Plane pointer for which rotation is to be queried
+ * @rotation: Plane rotation value (0, 90, 180, 270)
+ *
+ * Check whether @plane potentially supports the given @rotation.
+ * Note that @rotation may still rejected later due to other
+ * constraints (eg. incompatible pixel format or modifier).
+ */
+static inline bool igt_plane_has_rotation(igt_plane_t *plane, igt_rotation_t rotation)
+{
+	return (plane->rotations & rotation) == rotation;
+}
 
 void igt_wait_for_vblank(int drm_fd, int crtc_offset);
 void igt_wait_for_vblank_count(int drm_fd, int crtc_offset, int count);
@@ -496,16 +549,37 @@ static inline bool igt_output_is_connected(igt_output_t *output)
 #define for_each_if(condition) if (!(condition)) {} else
 
 /**
- * for_each_connected_output:
+ * for_each_output:
  * @display: a pointer to an #igt_display_t structure
  * @output: The output to iterate.
  *
  * This for loop iterates over all outputs.
  */
-#define for_each_connected_output(display, output)		\
+#define for_each_output(display, output)		\
 	for (int i__ = 0;  assert(igt_can_fail()), i__ < (display)->n_outputs; i__++)	\
-		for_each_if ((((output) = &(display)->outputs[i__]), \
-			      igt_output_is_connected((output))))
+		for_each_if (((output) = (&(display)->outputs[i__])))
+
+/**
+ * for_each_connected_output:
+ * @display: a pointer to an #igt_display_t structure
+ * @output: The output to iterate.
+ *
+ * This for loop iterates over all connected outputs.
+ */
+#define for_each_connected_output(display, output)		\
+	for_each_output((display), (output))	\
+		for_each_if ((igt_output_is_connected((output))))
+
+/**
+ * for_each_disconnected_output:
+ * @display: a pointer to an #igt_display_t structure
+ * @output: The output to iterate.
+ *
+ * This for loop iterates over all disconnected outputs.
+ */
+#define for_each_disconnected_output(display, output)		\
+	for_each_output((display), (output))	\
+		for_each_if ((!(igt_output_is_connected((output)))))
 
 /**
  * for_each_pipe_static:
@@ -592,6 +666,9 @@ igt_output_t **__igt_pipe_populate_outputs(igt_display_t *display,
 #define for_each_plane_on_pipe(display, pipe, plane)			\
 	for (int j__ = 0; assert(igt_can_fail()), (plane) = &(display)->pipes[(pipe)].planes[j__], \
 		     j__ < (display)->pipes[(pipe)].n_planes; j__++)
+
+#define for_each_connector_mode(output)		\
+	for (int j__ = 0;  j__ < output->config.connector->count_modes; j__++)
 
 #define IGT_FIXED(i,f)	((i) << 16 | (f))
 
@@ -790,12 +867,16 @@ void igt_reset_connectors(void);
 uint32_t kmstest_get_vbl_flag(int crtc_offset);
 
 const struct edid *igt_kms_get_base_edid(void);
+const struct edid *igt_kms_get_full_edid(void);
+const struct edid *igt_kms_get_base_tile_edid(void);
 const struct edid *igt_kms_get_alt_edid(void);
 const struct edid *igt_kms_get_hdmi_audio_edid(void);
 const struct edid *igt_kms_get_dp_audio_edid(void);
 const struct edid *igt_kms_get_4k_edid(void);
 const struct edid *igt_kms_get_3d_edid(void);
-
+const struct edid *igt_kms_get_aspect_ratio_edid(void);
+struct edid **igt_kms_get_tiled_edid(uint8_t htile, uint8_t vtile);
+const struct edid *igt_kms_get_custom_edid(enum igt_custom_edid_type edid);
 struct udev_monitor *igt_watch_uevents(void);
 bool igt_hotplug_detected(struct udev_monitor *mon,
 			  int timeout_secs);
@@ -892,5 +973,34 @@ void igt_require_pipe(igt_display_t *display,
 
 void igt_dump_connectors_fd(int drmfd);
 void igt_dump_crtcs_fd(int drmfd);
+bool igt_override_all_active_output_modes_to_fit_bw(igt_display_t *display);
+
+bool igt_is_dsc_supported(int drmfd, char *connector_name);
+bool igt_is_fec_supported(int drmfd, char *connector_name);
+bool igt_is_dsc_enabled(int drmfd, char *connector_name);
+bool igt_is_force_dsc_enabled(int drmfd, char *connector_name);
+int igt_force_dsc_enable(int drmfd, char *connector_name);
+int igt_force_dsc_enable_bpc(int drmfd, char *connector_name,
+			     int bpc);
+int igt_get_dsc_debugfs_fd(int drmfd, char *connector_name);
+
+unsigned int igt_get_output_max_bpc(int drmfd, char *connector_name);
+unsigned int igt_get_pipe_current_bpc(int drmfd, enum pipe pipe);
+void igt_assert_output_bpc_equal(int drmfd, enum pipe pipe,
+				char *output_name, unsigned int bpc);
+bool igt_check_output_bpc_equal(int drmfd, enum pipe pipe,
+				char *output_name, unsigned int bpc);
+
+int sort_drm_modes_by_clk_dsc(const void *a, const void *b);
+int sort_drm_modes_by_clk_asc(const void *a, const void *b);
+int sort_drm_modes_by_res_dsc(const void *a, const void *b);
+int sort_drm_modes_by_res_asc(const void *a, const void *b);
+void igt_sort_connector_modes(drmModeConnector *connector,
+		int (*comparator)(const void *, const void*));
+
+bool igt_max_bpc_constraint(igt_display_t *display, enum pipe pipe,
+		igt_output_t *output, int bpc);
+bool igt_check_bigjoiner_support(igt_display_t *display);
+bool igt_parse_mode_string(const char *mode_string, drmModeModeInfo *mode);
 
 #endif /* __IGT_KMS_H__ */

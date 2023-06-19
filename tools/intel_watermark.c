@@ -35,10 +35,16 @@
 
 static uint32_t display_base;
 static uint32_t devid;
+static unsigned int sr_sleep;
 
 static uint32_t read_reg(uint32_t addr)
 {
 	return INREG(display_base + addr);
+}
+
+static void write_reg(uint32_t addr, uint32_t val)
+{
+	OUTREG(display_base + addr, val);
 }
 
 struct gmch_wm {
@@ -125,11 +131,20 @@ static char endis_ast(bool enabled)
 	return enabled ? '*' : ' ';
 }
 
+static int skl_num_pipes(uint32_t d)
+{
+	return intel_gen(d) >= 12 ? 4 : 3;
+}
+
 static int skl_num_planes(uint32_t d, int pipe)
 {
-	if (IS_GEN11(d))
+	int gen = intel_gen(d);
+
+	if (gen >= 13 || IS_ALDERLAKE_S(d) || IS_ROCKETLAKE(d))
+		return 6;
+	else if (gen >= 11)
 		return 8;
-	else if (IS_GEN10(d) || IS_GEMINILAKE(d))
+	else if (gen == 10 || IS_GEMINILAKE(d))
 		return 5;
 	else if (IS_BROXTON(d))
 		return pipe == 2 ? 4 : 5;
@@ -139,116 +154,166 @@ static int skl_num_planes(uint32_t d, int pipe)
 
 static int skl_max_planes(uint32_t d)
 {
-	if (IS_GEN11(d))
+	int gen = intel_gen(d);
+
+	if (gen >= 13 || IS_ALDERLAKE_S(d) || IS_ROCKETLAKE(d))
+		return 6;
+	else if (gen >= 11)
 		return 8;
-	else if (IS_GEN10(d) || IS_GEMINILAKE(d) || IS_BROXTON(d))
+	else if (gen == 10 || IS_GEMINILAKE(d) || IS_BROXTON(d))
 		return 5;
 	else
 		return 4;
 }
 
-static const char *skl_plane_name(int pipe, int plane)
+static bool skl_has_sagv_wm(uint32_t d)
+{
+	return intel_gen(d) >= 13;
+}
+
+static int skl_num_wm_levels(uint32_t d)
+{
+	if (skl_has_sagv_wm(d))
+		return 6;
+	else
+		return 8;
+}
+
+static const char *skl_plane_name(int plane)
 {
 	static char name[32];
 
 	if (plane == 0)
 		snprintf(name, sizeof(name), "CURSOR");
 	else
-		snprintf(name, sizeof(name), "PLANE_%1d%c",
-			 plane, pipe_name(pipe));
+		snprintf(name, sizeof(name), "PLANE_%1d", plane);
 
 	return name;
 }
 
-static const char *skl_wm_linetime_reg_name(int pipe)
+static const char *skl_wm_linetime_reg_name(void)
 {
 	static char reg_name[32];
 
-	snprintf(reg_name, sizeof(reg_name), "WM_LINETIME_%c",
-		 pipe_name(pipe));
+	snprintf(reg_name, sizeof(reg_name), "WM_LINETIME");
 
 	return reg_name;
 }
 
-static const char *skl_plane_ctl_reg_name(int pipe, int plane)
+static const char *skl_plane_ctl_reg_name(int plane)
 {
 	static char reg_name[32];
 
 	if (plane == 0)
-		snprintf(reg_name, sizeof(reg_name), "CUR_CTL_%c",
-			 pipe_name(pipe));
+		snprintf(reg_name, sizeof(reg_name), "CUR_CTL");
 	else
-		snprintf(reg_name, sizeof(reg_name), "PLANE_CTL_%1d_%c",
-			 plane, pipe_name(pipe));
+		snprintf(reg_name, sizeof(reg_name), "PLANE_CTL_%1d", plane);
 
 	return reg_name;
 }
 
-static const char *skl_wm_reg_name(int pipe, int plane, int level)
+static const char *skl_wm_reg_name(int plane, int level)
 {
 	static char reg_name[32];
 
 	if (plane == 0)
-		snprintf(reg_name, sizeof(reg_name), "CUR_WM_%c_%1d",
-			 pipe_name(pipe), level);
+		snprintf(reg_name, sizeof(reg_name), "CUR_WM_%1d", level);
 	else
-		snprintf(reg_name, sizeof(reg_name), "PLANE_WM_%1d_%c_%1d",
-			 plane, pipe_name(pipe), level);
+		snprintf(reg_name, sizeof(reg_name), "PLANE_WM_%1d_%1d", plane, level);
 
 	return reg_name;
 }
 
-static const char *skl_wm_trans_reg_name(int pipe, int plane)
+static const char *skl_wm_trans_reg_name(int plane)
 {
 	static char reg_name[32];
 
 	if (plane == 0)
-		snprintf(reg_name, sizeof(reg_name), "CUR_WM_TRANS_%c",
-			 pipe_name(pipe));
+		snprintf(reg_name, sizeof(reg_name), "CUR_WM_TRANS");
 	else
-		snprintf(reg_name, sizeof(reg_name), "PLANE_WM_TRANS_%1d_%c",
-			 plane, pipe_name(pipe));
+		snprintf(reg_name, sizeof(reg_name), "PLANE_WM_TRANS_%1d", plane);
+
 	return reg_name;
 }
 
-static const char *skl_buf_cfg_reg_name(int pipe, int plane)
+static const char *skl_wm_sagv_reg_name(int plane)
 {
 	static char reg_name[32];
 
 	if (plane == 0)
-		snprintf(reg_name, sizeof(reg_name), "CUR_BUF_CFG_%c",
-			 pipe_name(pipe));
+		snprintf(reg_name, sizeof(reg_name), "CUR_WM_SAGV");
 	else
-		snprintf(reg_name, sizeof(reg_name), "PLANE_BUF_CFG_%1d_%c",
-			 plane, pipe_name(pipe));
+		snprintf(reg_name, sizeof(reg_name), "PLANE_WM_SAGV_%1d", plane);
 
 	return reg_name;
 }
 
-static const char *skl_nv12_buf_cfg_reg_name(int pipe, int plane)
+static const char *skl_wm_sagv_trans_reg_name(int plane)
 {
 	static char reg_name[32];
 
-	snprintf(reg_name, sizeof(reg_name), "PLANE_NV12_BUF_CFG_%1d_%c",
-		 plane, pipe_name(pipe));
+	if (plane == 0)
+		snprintf(reg_name, sizeof(reg_name), "CUR_WM_SAGV_TRANS");
+	else
+		snprintf(reg_name, sizeof(reg_name), "PLANE_WM_SAGV_TRANS_%1d", plane);
 
 	return reg_name;
+}
+
+static const char *skl_buf_cfg_reg_name(int plane)
+{
+	static char reg_name[32];
+
+	if (plane == 0)
+		snprintf(reg_name, sizeof(reg_name), "CUR_BUF_CFG");
+	else
+		snprintf(reg_name, sizeof(reg_name), "PLANE_BUF_CFG_%1d", plane);
+
+	return reg_name;
+}
+
+static const char *skl_nv12_buf_cfg_reg_name(int plane)
+{
+	static char reg_name[32];
+
+	snprintf(reg_name, sizeof(reg_name), "PLANE_NV12_BUF_CFG_%1d", plane);
+
+	return reg_name;
+}
+
+static void hsw_wm_sr_cnt(void)
+{
+	if (sr_sleep) {
+		uint32_t pre, post;
+
+		pre = read_reg(0x45264);
+		sleep(sr_sleep);
+		post = read_reg(0x45264);
+
+		printf("WM_SR_CNT: 0x%08x->0x%08x\n", pre, post);
+		printf("SR residency: %u%%\n", ((post - pre) * 8 / (sr_sleep * 10000)));
+	} else {
+		printf("WM_SR_CNT: 0x%08x\n", read_reg(0x45264));
+	}
 }
 
 static void skl_wm_dump(void)
 {
 	struct intel_mmio_data mmio_data;
 	int pipe, plane, level;
-	int num_pipes = 3;
+	int num_pipes = skl_num_pipes(devid);
 	int max_planes = skl_max_planes(devid);
-	int num_levels = 8;
+	int num_levels = skl_num_wm_levels(devid);
 	uint32_t base_addr = 0x70000, addr, wm_offset;
 	uint32_t wm[num_levels][num_pipes][max_planes];
 	uint32_t wm_trans[num_pipes][max_planes];
+	uint32_t wm_sagv[num_pipes][max_planes];
+	uint32_t wm_sagv_trans[num_pipes][max_planes];
 	uint32_t buf_cfg[num_pipes][max_planes];
 	uint32_t nv12_buf_cfg[num_pipes][max_planes];
 	uint32_t plane_ctl[num_pipes][max_planes];
 	uint32_t wm_linetime[num_pipes];
+	uint32_t wm_dbg;
 
 	intel_register_access_init(&mmio_data, intel_get_pci_device(), 0, -1);
 
@@ -271,24 +336,31 @@ static void skl_wm_dump(void)
 				wm_offset = addr + 0x00140 + level * 0x4;
 				wm[level][pipe][plane] = read_reg(wm_offset);
 			}
+
+			if (skl_has_sagv_wm(devid)) {
+				wm_sagv[pipe][plane] = read_reg(addr + 0x00158);
+				wm_sagv_trans[pipe][plane] = read_reg(addr + 0x0015c);
+			}
 		}
 	}
 
-	for (pipe = 0; pipe < num_pipes; pipe++) {
-		printf("%18s 0x%08x\t",
-		       skl_wm_linetime_reg_name(pipe),
-		       wm_linetime[pipe]);
-	}
+	printf("%21c\t", '\0');
+	for (pipe = 0; pipe < num_pipes; pipe++)
+		printf("PIPE_%-5c\t", pipe_name(pipe));
+	printf("\n\n");
+
+	printf("%21s\t", skl_wm_linetime_reg_name());
+	for (pipe = 0; pipe < num_pipes; pipe++)
+		printf("0x%08x\t", wm_linetime[pipe]);
 	printf("\n\n");
 
 	for (plane = 0; plane < max_planes; plane++) {
+		printf("%21s\t", skl_plane_ctl_reg_name(plane));
+
 		for (pipe = 0; pipe < num_pipes; pipe++) {
 			if (plane >= skl_num_planes(devid, pipe))
 				break;
-
-			printf("%18s 0x%08x\t" ,
-			       skl_plane_ctl_reg_name(pipe, plane),
-			       plane_ctl[pipe][plane]);
+			printf("0x%08x\t" , plane_ctl[pipe][plane]);
 		}
 		printf("\n");
 	}
@@ -296,13 +368,12 @@ static void skl_wm_dump(void)
 
 	for (plane = 0; plane < max_planes; plane++) {
 		for (level = 0; level < num_levels; level++) {
+			printf("%21s\t", skl_wm_reg_name(plane, level));
+
 			for (pipe = 0; pipe < num_pipes; pipe++) {
 				if (plane >= skl_num_planes(devid, pipe))
 					break;
-
-				printf("%18s 0x%08x\t" ,
-				       skl_wm_reg_name(pipe, plane, level),
-				       wm[level][pipe][plane]);
+				printf("0x%08x\t", wm[level][pipe][plane]);
 			}
 			printf("\n");
 		}
@@ -310,26 +381,50 @@ static void skl_wm_dump(void)
 	}
 
 	for (plane = 0; plane < max_planes; plane++) {
+		printf("%21s\t", skl_wm_trans_reg_name(plane));
+
 		for (pipe = 0; pipe < num_pipes; pipe++) {
 			if (plane >= skl_num_planes(devid, pipe))
 				break;
-
-			printf("%18s 0x%08x\t",
-			       skl_wm_trans_reg_name(pipe, plane),
-			       wm_trans[pipe][plane]);
+			printf("0x%08x\t", wm_trans[pipe][plane]);
 		}
 		printf("\n");
 	}
 	printf("\n");
 
+	if (skl_has_sagv_wm(devid)) {
+		for (plane = 0; plane < max_planes; plane++) {
+			printf("%21s\t", skl_wm_sagv_reg_name(plane));
+
+			for (pipe = 0; pipe < num_pipes; pipe++) {
+				if (plane >= skl_num_planes(devid, pipe))
+					break;
+				printf("0x%08x\t", wm_sagv[pipe][plane]);
+			}
+			printf("\n");
+		}
+		printf("\n");
+
+		for (plane = 0; plane < max_planes; plane++) {
+			printf("%21s\t", skl_wm_sagv_trans_reg_name(plane));
+
+			for (pipe = 0; pipe < num_pipes; pipe++) {
+				if (plane >= skl_num_planes(devid, pipe))
+					break;
+				printf("0x%08x\t", wm_sagv_trans[pipe][plane]);
+			}
+			printf("\n");
+		}
+		printf("\n");
+	}
+
 	for (plane = 0; plane < max_planes; plane++) {
+		printf("%21s\t", skl_buf_cfg_reg_name(plane));
+
 		for (pipe = 0; pipe < num_pipes; pipe++) {
 			if (plane >= skl_num_planes(devid, pipe))
 				break;
-
-			printf("%18s 0x%08x\t",
-			       skl_buf_cfg_reg_name(pipe, plane),
-			       buf_cfg[pipe][plane]);
+			printf("0x%08x\t", buf_cfg[pipe][plane]);
 		}
 		printf("\n");
 
@@ -339,13 +434,12 @@ static void skl_wm_dump(void)
 		if (plane == 0)
 			continue;
 
+		printf("%21s\t", skl_nv12_buf_cfg_reg_name(plane));
+
 		for (pipe = 0; pipe < num_pipes; pipe++) {
 			if (plane >= skl_num_planes(devid, pipe))
 				break;
-
-			printf("%18s 0x%08x\t",
-			       skl_nv12_buf_cfg_reg_name(pipe, plane),
-			       nv12_buf_cfg[pipe][plane]);
+			printf("0x%08x\t", nv12_buf_cfg[pipe][plane]);
 		}
 		printf("\n");
 	}
@@ -362,23 +456,23 @@ static void skl_wm_dump(void)
 		linetime = REG_DECODE1(wm_linetime[pipe], 0, 9);
 		printf("LINETIME: %d (%.3f usec)\n", linetime, linetime* 0.125f);
 
-		printf("LEVEL");
+		printf("     LEVEL");
 		for (plane = 0; plane < num_planes; plane++) {
 			if (plane == 0)
 				enable = REG_DECODE1(plane_ctl[pipe][plane], 0, 3) ||
 					REG_DECODE1(plane_ctl[pipe][plane], 5, 1);
 			else
 				enable = REG_DECODE1(plane_ctl[pipe][plane], 31, 1);
-			printf("%9s%c", skl_plane_name(pipe, plane),
+			printf("%9s%c", skl_plane_name(plane),
 			       endis_ast(enable));
 		}
 		printf("\n");
 
 		for (level = 0; level < num_levels; level++) {
-			printf("%5d", level);
+			printf("%10d", level);
 			for (plane = 0; plane < num_planes; plane++) {
-				blocks = REG_DECODE1(wm[level][pipe][plane], 0, 11);
-				lines = REG_DECODE1(wm[level][pipe][plane], 14, 5);
+				blocks = REG_DECODE1(wm[level][pipe][plane], 0, 12);
+				lines = REG_DECODE1(wm[level][pipe][plane], 14, 13);
 				enable = REG_DECODE1(wm[level][pipe][plane], 31, 1);
 
 				printf("%5d%c", blocks, endis_ast(enable));
@@ -390,10 +484,10 @@ static void skl_wm_dump(void)
 			printf("\n");
 		}
 
-		printf("TRANS");
+		printf("     TRANS");
 		for (plane = 0; plane < num_planes; plane++) {
-			blocks = REG_DECODE1(wm_trans[pipe][plane], 0, 11);
-			lines = REG_DECODE1(wm_trans[pipe][plane], 14, 5);
+			blocks = REG_DECODE1(wm_trans[pipe][plane], 0, 12);
+			lines = REG_DECODE1(wm_trans[pipe][plane], 14, 13);
 			enable = REG_DECODE1(wm_trans[pipe][plane], 31, 1);
 
 			printf("%5d%c", blocks, endis_ast(enable));
@@ -403,24 +497,52 @@ static void skl_wm_dump(void)
 				printf("(--)");
 		}
 
+		if (skl_has_sagv_wm(devid)) {
+			printf("\n      SAGV");
+			for (plane = 0; plane < num_planes; plane++) {
+				blocks = REG_DECODE1(wm_sagv[pipe][plane], 0, 12);
+				lines = REG_DECODE1(wm_sagv[pipe][plane], 14, 13);
+				enable = REG_DECODE1(wm_sagv[pipe][plane], 31, 1);
+
+				printf("%5d%c", blocks, endis_ast(enable));
+				if (!REG_DECODE1(wm_sagv[pipe][plane], 30, 1))
+					printf("(%2d)", lines);
+				else
+					printf("(--)");
+			}
+
+			printf("\nSAGV TRANS");
+			for (plane = 0; plane < num_planes; plane++) {
+				blocks = REG_DECODE1(wm_sagv_trans[pipe][plane], 0, 12);
+				lines = REG_DECODE1(wm_sagv_trans[pipe][plane], 14, 13);
+				enable = REG_DECODE1(wm_sagv_trans[pipe][plane], 31, 1);
+
+				printf("%5d%c", blocks, endis_ast(enable));
+				if (!REG_DECODE1(wm_sagv_trans[pipe][plane], 30, 1))
+					printf("(%2d)", lines);
+				else
+					printf("(--)");
+			}
+		}
+
 		printf("\nDDB allocation:");
 
 		printf("\nstart");
 		for (plane = 0; plane < num_planes; plane++) {
-			start = REG_DECODE1(buf_cfg[pipe][plane], 0, 11);
+			start = REG_DECODE1(buf_cfg[pipe][plane], 0, 12);
 			printf("%10d", start);
 		}
 
 		printf("\n  end");
 		for (plane = 0; plane < num_planes; plane++) {
-			end = REG_DECODE1(buf_cfg[pipe][plane], 16, 11);
+			end = REG_DECODE1(buf_cfg[pipe][plane], 16, 12);
 			printf("%10d", end);
 		}
 
 		printf("\n size");
 		for (plane = 0; plane < num_planes; plane++) {
-			start = REG_DECODE1(buf_cfg[pipe][plane], 0, 11);
-			end =  REG_DECODE1(buf_cfg[pipe][plane], 16, 11);
+			start = REG_DECODE1(buf_cfg[pipe][plane], 0, 12);
+			end =  REG_DECODE1(buf_cfg[pipe][plane], 16, 12);
 			size = end - start + 1;
 			printf("%10d", (end == 0 && size == 1) ? 0 : size);
 		}
@@ -431,20 +553,20 @@ static void skl_wm_dump(void)
 
 			printf("\nstart");
 			for (plane = 0; plane < num_planes; plane++) {
-				start = REG_DECODE1(nv12_buf_cfg[pipe][plane], 0, 11);
+				start = REG_DECODE1(nv12_buf_cfg[pipe][plane], 0, 12);
 				printf("%10d", start);
 			}
 
 			printf("\n  end");
 			for (plane = 0; plane < num_planes; plane++) {
-				end = REG_DECODE1(nv12_buf_cfg[pipe][plane], 16, 11);
+				end = REG_DECODE1(nv12_buf_cfg[pipe][plane], 16, 12);
 				printf("%10d", end);
 			}
 
 			printf("\n size");
 			for (plane = 0; plane < num_planes; plane++) {
-				start = REG_DECODE1(nv12_buf_cfg[pipe][plane], 0, 11);
-				end =  REG_DECODE1(nv12_buf_cfg[pipe][plane], 16, 11);
+				start = REG_DECODE1(nv12_buf_cfg[pipe][plane], 0, 12);
+				end =  REG_DECODE1(nv12_buf_cfg[pipe][plane], 16, 12);
 				size = end - start + 1;
 				printf("%10d", (end == 0 && size == 1) ? 0 : size);
 			}
@@ -455,6 +577,19 @@ static void skl_wm_dump(void)
 
 	printf("* plane watermark enabled\n");
 	printf("(x) line watermark if enabled\n");
+
+	hsw_wm_sr_cnt();
+
+	wm_dbg = read_reg(0x45280);
+	printf("WM_DBG: 0x%08x\n", wm_dbg);
+	printf(" LP used:");
+	for (level = 1; level < num_levels; level++) {
+		if (wm_dbg & (1 << (23 + level)))
+			printf(" LP%d", level);
+	}
+	printf("\n");
+	/* clear the sticky bits */
+	write_reg(0x45280, wm_dbg);
 }
 
 static void ilk_wm_dump(void)
@@ -608,6 +743,26 @@ static void ilk_wm_dump(void)
 	}
 	printf("FBC watermark = %s\n",
 	       endis(!REG_DECODE1(arb_ctl, 15, 1)));
+
+	if (IS_BROADWELL(devid) || IS_HASWELL(devid)) {
+		uint32_t wm_dbg;
+
+		hsw_wm_sr_cnt();
+
+		wm_dbg = read_reg(0x45280);
+		printf("WM_DBG: 0x%08x\n", wm_dbg);
+		if (wm_dbg & (1 << 31))
+			printf(" Full maxfifo used\n");
+		if (wm_dbg & (1 << 30))
+			printf(" Sprite maxfifo used\n");
+		printf(" LP used:");
+		for (i = 1; i < 4; i++) {
+			if (wm_dbg & (1 << (23+i)))
+				printf(" LP%d", i);
+		}
+		/* clear the sticky bits */
+		write_reg(0x45280, wm_dbg);
+	}
 }
 
 static void vlv_wm_dump(void)
@@ -1232,9 +1387,37 @@ static void gen2_wm_dump(void)
 	}
 }
 
+static void __attribute__((noreturn)) usage(const char *name)
+{
+	fprintf(stderr, "Usage: %s [options]\n"
+		" -s,--sr-sleep <seconds>\n",
+		name);
+	exit(1);
+}
+
 int main(int argc, char *argv[])
 {
 	devid = intel_get_pci_device()->device_id;
+
+	for (;;) {
+		static const struct option long_options[] = {
+			{ .name = "sr-sleep", .has_arg = required_argument, },
+			{}
+		};
+
+		int opt = getopt_long(argc, argv, "s:", long_options, NULL);
+		if (opt == -1)
+			break;
+
+		switch (opt) {
+		case 's':
+			sr_sleep = atoi(optarg);
+			break;
+		default:
+			usage(argv[0]);
+			break;
+		}
+	}
 
 	if (intel_gen(devid) >= 9) {
 		skl_wm_dump();

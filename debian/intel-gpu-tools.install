@@ -55,6 +55,7 @@ usr/bin/intel_lid
 usr/bin/intel_opregion_decode
 usr/bin/intel_panel_fitter
 usr/bin/intel_perf_counters
+usr/bin/intel_pm_rpm
 usr/bin/intel_reg
 usr/bin/intel_reg_checker
 usr/bin/intel_residency

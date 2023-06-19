@@ -114,6 +114,16 @@ bool is_i915_device(int fd)
 	return __is_device(fd, "i915");
 }
 
+bool is_mtk_device(int fd)
+{
+	return __is_device(fd, "mediatek");
+}
+
+bool is_msm_device(int fd)
+{
+	return __is_device(fd, "msm");
+}
+
 bool is_nouveau_device(int fd)
 {
 	/* Currently all nouveau-specific codepaths require libdrm */
@@ -174,6 +184,7 @@ static const struct module {
 } modules[] = {
 	{ DRIVER_AMDGPU, "amdgpu" },
 	{ DRIVER_INTEL, "i915", modprobe_i915 },
+	{ DRIVER_MSM, "msm" },
 	{ DRIVER_PANFROST, "panfrost" },
 	{ DRIVER_V3D, "v3d" },
 	{ DRIVER_VC4, "vc4" },
@@ -302,6 +313,7 @@ void drm_load_module(unsigned int chipset)
 		}
 	}
 	pthread_mutex_unlock(&mutex);
+	igt_devices_scan(true);
 }
 
 static int __open_driver(const char *base, int offset, unsigned int chipset, int as_idx)
@@ -353,8 +365,6 @@ static bool __get_card_for_nth_filter(int idx, struct igt_device_card *card)
 			igt_debug("Filter matched %s | %s\n", card->card, card->render);
 			return true;
 		}
-
-		igt_warn("No card matches the filter!\n");
 	}
 
 	return false;
@@ -430,7 +440,8 @@ int __drm_open_driver_another(int idx, int chipset)
 		}
 
 		if (!found || !strlen(card.card))
-			igt_warn("No card matches the filter!\n");
+			igt_warn("No card matches the filter! [%s]\n",
+				 igt_device_filter_get(idx));
 		else if (_is_already_opened(card.card, idx))
 			igt_warn("card maching filter %d is already opened\n", idx);
 		else
@@ -534,6 +545,8 @@ static const char *chipset_to_str(int chipset)
 		return "amdgpu";
 	case DRIVER_PANFROST:
 		return "panfrost";
+	case DRIVER_MSM:
+		return "msm";
 	case DRIVER_ANY:
 		return "any";
 	default:

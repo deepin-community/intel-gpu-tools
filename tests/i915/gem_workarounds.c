@@ -28,8 +28,10 @@
 #include <fcntl.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_device.h"
+#include "igt_types.h"
 
 #define PAGE_SIZE 4096
 #define PAGE_ALIGN(x) ALIGN(x, PAGE_SIZE)
@@ -82,9 +84,7 @@ static bool write_only(const uint32_t addr)
 	return false;
 }
 
-#define MI_STORE_REGISTER_MEM (0x24 << 23)
-
-static int workaround_fail_count(int i915, uint32_t ctx)
+static int workaround_fail_count(int i915, const intel_ctx_t *ctx)
 {
 	struct drm_i915_gem_exec_object2 obj[2];
 	struct drm_i915_gem_relocation_entry *reloc;
@@ -93,6 +93,7 @@ static int workaround_fail_count(int i915, uint32_t ctx)
 	uint32_t *base, *out;
 	igt_spin_t *spin;
 	int fw, fail = 0;
+	uint64_t ahnd = get_reloc_ahnd(i915, ctx->id);
 
 	reloc = calloc(num_wa_regs, sizeof(*reloc));
 	igt_assert(reloc);
@@ -105,24 +106,31 @@ static int workaround_fail_count(int i915, uint32_t ctx)
 
 	memset(obj, 0, sizeof(obj));
 	obj[0].handle = gem_create(i915, result_sz);
-	gem_set_caching(i915, obj[0].handle, I915_CACHING_CACHED);
+	if (!gem_has_lmem(i915))
+		gem_set_caching(i915, obj[0].handle, I915_CACHING_CACHED);
 	obj[1].handle = gem_create(i915, batch_sz);
 	obj[1].relocs_ptr = to_user_pointer(reloc);
-	obj[1].relocation_count = num_wa_regs;
+	obj[1].relocation_count = !ahnd ? num_wa_regs : 0;
+	if (ahnd) {
+		obj[0].offset = get_offset(ahnd, obj[0].handle, result_sz, 0);
+		obj[0].flags |= EXEC_OBJECT_PINNED | EXEC_OBJECT_WRITE;
+		obj[1].offset = get_offset(ahnd, obj[1].handle, batch_sz, 0);
+		obj[1].flags |= EXEC_OBJECT_PINNED;
+	}
 
 	out = base =
 		gem_mmap__cpu(i915, obj[1].handle, 0, batch_sz, PROT_WRITE);
 	for (int i = 0; i < num_wa_regs; i++) {
-		*out++ = MI_STORE_REGISTER_MEM | ((gen >= 8 ? 4 : 2) - 2);
+		*out++ = MI_STORE_REGISTER_MEM | (1 + (gen >= 8));
 		*out++ = wa_regs[i].addr;
 		reloc[i].target_handle = obj[0].handle;
 		reloc[i].offset = (out - base) * sizeof(*out);
 		reloc[i].delta = i * sizeof(uint32_t);
 		reloc[i].read_domains = I915_GEM_DOMAIN_INSTRUCTION;
 		reloc[i].write_domain = I915_GEM_DOMAIN_INSTRUCTION;
-		*out++ = reloc[i].delta;
+		*out++ = obj[0].offset + reloc[i].delta;
 		if (gen >= 8)
-			*out++ = 0;
+			*out++ = (obj[0].offset + reloc[i].delta) >> 32;
 	}
 	*out++ = MI_BATCH_BUFFER_END;
 	munmap(base, batch_sz);
@@ -130,12 +138,13 @@ static int workaround_fail_count(int i915, uint32_t ctx)
 	memset(&execbuf, 0, sizeof(execbuf));
 	execbuf.buffers_ptr = to_user_pointer(obj);
 	execbuf.buffer_count = 2;
-	execbuf.rsvd1 = ctx;
+	execbuf.rsvd1 = ctx->id;
 	gem_execbuf(i915, &execbuf);
 
 	gem_set_domain(i915, obj[0].handle, I915_GEM_DOMAIN_CPU, 0);
 
-	spin = igt_spin_new(i915, .ctx = ctx, .flags = IGT_SPIN_POLL_RUN);
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
+			    .flags = IGT_SPIN_POLL_RUN);
 	igt_spin_busywait_until_started(spin);
 
 	fw = igt_open_forcewake_handle(i915);
@@ -171,6 +180,7 @@ static int workaround_fail_count(int i915, uint32_t ctx)
 
 	close(fw);
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 
 	gem_close(i915, obj[1].handle);
 	gem_close(i915, obj[0].handle);
@@ -183,14 +193,15 @@ static int workaround_fail_count(int i915, uint32_t ctx)
 #define FD 0x2
 static void check_workarounds(int fd, enum operation op, unsigned int flags)
 {
-	uint32_t ctx = 0;
+	const intel_ctx_t *ctx;
 
 	if (flags & FD)
 		fd = gem_reopen_driver(fd);
 
+	ctx = intel_ctx_0(fd);
 	if (flags & CONTEXT) {
 		gem_require_contexts(fd);
-		ctx = gem_context_create(fd);
+		ctx = intel_ctx_create(fd, NULL);
 	}
 
 	igt_assert_eq(workaround_fail_count(fd, ctx), 0);
@@ -220,7 +231,7 @@ static void check_workarounds(int fd, enum operation op, unsigned int flags)
 	igt_assert_eq(workaround_fail_count(fd, ctx), 0);
 
 	if (flags & CONTEXT)
-		gem_context_destroy(fd, ctx);
+		intel_ctx_destroy(fd, ctx);
 	if (flags & FD)
 		close(fd);
 }
@@ -228,7 +239,6 @@ static void check_workarounds(int fd, enum operation op, unsigned int flags)
 igt_main
 {
 	struct intel_mmio_data mmio_data;
-	int device = -1;
 	const struct {
 		const char *name;
 		enum operation op;
@@ -248,6 +258,7 @@ igt_main
 		{ "-fd", FD },
 		{ }
 	}, *m;
+	igt_fd_t(device);
 
 	igt_fixture {
 		FILE *file;

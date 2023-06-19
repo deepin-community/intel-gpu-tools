@@ -1,5 +1,6 @@
 lib_sources = [
 	'drmtest.c',
+	'dmabuf_sync_file.c',
 	'huc_copy.c',
 	'i915/gem.c',
 	'i915/gem_context.c',
@@ -10,40 +11,52 @@ lib_sources = [
 	'i915/gem_ring.c',
 	'i915/gem_mman.c',
 	'i915/gem_vm.c',
+	'i915/intel_decode.c',
+	'i915/intel_memory_region.c',
+	'i915/intel_mocs.c',
+	'i915/i915_blt.c',
+	'i915/i915_crc.c',
 	'igt_collection.c',
 	'igt_color_encoding.c',
+	'igt_crc.c',
 	'igt_debugfs.c',
 	'igt_device.c',
 	'igt_device_scan.c',
+	'igt_drm_fdinfo.c',
 	'igt_aux.c',
 	'igt_gt.c',
 	'igt_halffloat.c',
+	'igt_hwmon.c',
+	'igt_io.c',
 	'igt_matrix.c',
+	'igt_os.c',
 	'igt_params.c',
 	'igt_perf.c',
+	'igt_pipe_crc.c',
+	'igt_power.c',
 	'igt_primes.c',
+	'igt_pci.c',
 	'igt_rand.c',
-	'igt_rapl.c',
 	'igt_stats.c',
 	'igt_syncobj.c',
 	'igt_sysfs.c',
 	'igt_sysrq.c',
 	'igt_taints.c',
 	'igt_thread.c',
+	'igt_types.c',
 	'igt_vec.c',
 	'igt_vgem.c',
 	'igt_x86.c',
 	'instdone.c',
 	'intel_allocator.c',
 	'intel_allocator_msgchannel.c',
-	'intel_allocator_random.c',
 	'intel_allocator_reloc.c',
 	'intel_allocator_simple.c',
 	'intel_batchbuffer.c',
 	'intel_bufops.c',
 	'intel_chipset.c',
+	'intel_ctx.c',
 	'intel_device_info.c',
-	'intel_os.c',
 	'intel_mmio.c',
 	'ioctl_wrappers.c',
 	'media_spin.c',
@@ -57,6 +70,7 @@ lib_sources = [
 	'rendercopy_gen7.c',
 	'rendercopy_gen8.c',
 	'rendercopy_gen9.c',
+	'runnercomms.c',
 	'sw_sync.c',
 	'intel_aux_pgtable.c',
 	'intel_reg_map.c',
@@ -69,6 +83,7 @@ lib_sources = [
 	'igt_map.c',
 	'igt_pm.c',
 	'igt_dummyload.c',
+	'igt_store.c',
 	'uwildmat/uwildmat.c',
 	'igt_kmod.c',
 	'igt_panfrost.c',
@@ -80,6 +95,7 @@ lib_sources = [
 	'igt_eld.c',
 	'igt_infoframe.c',
 	'veboxcopy_gen12.c',
+	'igt_msm.c',
 ]
 
 lib_deps = [
@@ -99,18 +115,31 @@ lib_deps = [
 	zlib
 ]
 
-if libdrm_intel.found()
-	lib_deps += libdrm_intel
-else
-	lib_sources += 'stubs/drm/intel_bufmgr.c'
-	inc = [ inc, include_directories('stubs/drm') ]
-endif
-
 if libdrm_nouveau.found()
 	lib_deps += libdrm_nouveau
 	lib_sources += [
 		'igt_nouveau.c',
 		'nouveau/cea0b5.c'
+	]
+endif
+
+if libdrm_amdgpu.found()
+	lib_deps += libdrm_amdgpu
+	lib_sources += [
+		'amdgpu/amd_memory.c',
+		'amdgpu/amd_command_submission.c',
+		'amdgpu/amd_compute.c',
+		'amdgpu/amd_gfx.c',
+		'amdgpu/amd_ip_blocks.c',
+		'amdgpu/amd_shaders.c',
+		'amdgpu/amd_gfx_v8_0.c',
+		'amdgpu/amd_gfx_v9_0.c',
+		'amdgpu/amd_dispatch_helpers.c',
+		'amdgpu/amd_dispatch.c',
+		'amdgpu/amd_deadlock_helpers.c',
+		'amdgpu/amd_pci_unplug.c',
+		'amdgpu/xalloc.h',
+		'amdgpu/amd_cp_dma.c'
 	]
 endif
 
@@ -136,8 +165,8 @@ endif
 
 if chamelium.found()
 	lib_deps += chamelium
-	lib_sources += 'igt_chamelium.c'
-	lib_sources += 'igt_chamelium_stream.c'
+	lib_sources += [ 'igt_chamelium.c', 'igt_chamelium_stream.c' ]
+	lib_sources += 'monitor_edids/monitor_edids_helper.c'
 endif
 
 if get_option('srcdir') != ''
@@ -146,13 +175,19 @@ else
     srcdir = join_paths(meson.source_root(), 'tests')
 endif
 
+if get_option('version_hash') != ''
+    vcs_command = ['echo', get_option('version_hash')]
+else
+    vcs_command = [ 'git', 'log', '-n1', '--pretty=format:g%h' ]
+endif
+
 lib_version = vcs_tag(input : 'version.h.in', output : 'version.h',
 		      fallback : 'NO-GIT',
-		      command : [ 'git', 'log', '-n1', '--pretty=format:g%h' ] )
+		      command : vcs_command )
 
 lib_intermediates = []
 foreach f: lib_sources
-    name = f.underscorify(f)
+    name = f.underscorify()
     lib = static_library('igt-' + name,
 	[ f, lib_version ],
 	include_directories: inc,
@@ -211,6 +246,12 @@ lib_igt_device_scan_build = static_library('igt_device_scan',
 lib_igt_device_scan = declare_dependency(link_with : lib_igt_device_scan_build,
 				  include_directories : inc)
 
+lib_igt_drm_fdinfo_build = static_library('igt_drm_fdinfo',
+	['igt_drm_fdinfo.c'],
+	include_directories : inc)
+
+lib_igt_drm_fdinfo = declare_dependency(link_with : lib_igt_drm_fdinfo_build,
+				  include_directories : inc)
 i915_perf_files = [
   'igt_list.c',
   'i915/perf.c',
@@ -227,51 +268,52 @@ i915_perf_hardware = [
   'cnl',
   'icl', 'ehl',
   'tglgt1', 'tglgt2', 'rkl', 'dg1', 'adl',
+  'acmgt1', 'acmgt2', 'acmgt3',
+  'mtlgt2', 'mtlgt3',
 ]
 
 i915_xml_files = []
 foreach hw : i915_perf_hardware
-  i915_xml_files += 'i915/perf-configs/oa-@0@.xml'.format(hw)
+  i915_xml_files += files('i915/perf-configs/oa-@0@.xml'.format(hw))
 endforeach
 
 i915_perf_files += custom_target(
   'i915-perf-equations',
-  input : i915_xml_files,
+  input : [ 'i915/perf-configs/perf-equations-codegen.py' ] + i915_xml_files,
   output : [ 'i915_perf_equations.c', 'i915_perf_equations.h' ],
   command : [
-    find_program('i915/perf-configs/perf-equations-codegen.py'),
+    python3, '@INPUT0@',
     '--code', '@OUTPUT0@',
     '--header', '@OUTPUT1@',
-    '@INPUT@',
+    i915_xml_files,
   ])
-
-i915_perf_register_codegen = find_program('i915/perf-configs/perf-registers-codegen.py')
-i915_perf_metrics_codegen = find_program('i915/perf-configs/perf-metricset-codegen.py')
 
 foreach hw : i915_perf_hardware
   i915_perf_files += custom_target(
     'i915-perf-registers-@0@'.format(hw),
-    input : 'i915/perf-configs/oa-@0@.xml'.format(hw),
+    input : [ 'i915/perf-configs/perf-registers-codegen.py',
+              'i915/perf-configs/oa-@0@.xml'.format(hw) ],
     output : [ 'i915_perf_registers_@0@.c'.format(hw),
                'i915_perf_registers_@0@.h'.format(hw), ],
     command : [
-      i915_perf_register_codegen,
+      python3, '@INPUT0@',
       '--code', '@OUTPUT0@',
       '--header', '@OUTPUT1@',
-      '--xml-file', '@INPUT@'
+      '--xml-file', '@INPUT1@'
     ])
   i915_perf_files += custom_target(
     'i915-perf-metrics-@0@'.format(hw),
-    input : 'i915/perf-configs/oa-@0@.xml'.format(hw),
+    input : [ 'i915/perf-configs/perf-metricset-codegen.py',
+              'i915/perf-configs/oa-@0@.xml'.format(hw) ],
     output : [ 'i915_perf_metrics_@0@.c'.format(hw),
                'i915_perf_metrics_@0@.h'.format(hw), ],
     command : [
-      i915_perf_metrics_codegen,
+      python3, '@INPUT0@',
       '--code', '@OUTPUT0@',
       '--header', '@OUTPUT1@',
       '--equations-include', 'i915_perf_equations.h',
       '--registers-include', 'i915_perf_registers_@0@.h'.format(hw),
-      '--xml-file', '@INPUT@',
+      '--xml-file', '@INPUT1@',
     ])
 endforeach
 
@@ -281,7 +323,7 @@ lib_igt_i915_perf_build = shared_library(
   dependencies: lib_igt_chipset,
   include_directories : inc,
   install: true,
-  soversion: '1')
+  soversion: '1.5')
 
 lib_igt_i915_perf = declare_dependency(
   link_with : lib_igt_i915_perf_build,
@@ -302,7 +344,7 @@ pkgconf.set('prefix', get_option('prefix'))
 pkgconf.set('exec_prefix', '${prefix}')
 pkgconf.set('libdir', '${prefix}/@0@'.format(get_option('libdir')))
 pkgconf.set('includedir', '${prefix}/@0@'.format(get_option('includedir')))
-pkgconf.set('i915_perf_version', '1.2.0')
+pkgconf.set('i915_perf_version', '1.5.1')
 
 configure_file(
   input : 'i915-perf.pc.in',

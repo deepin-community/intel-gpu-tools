@@ -5,6 +5,7 @@
 
 #include <stdatomic.h>
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_aux.h"
 #include "intel_allocator.h"
@@ -95,9 +96,10 @@ static void reserve_simple(int fd)
 static void reserve(int fd, uint8_t type)
 {
 	struct test_obj obj;
-	uint64_t ahnd, offset = 0x40000, size = 0x1000;
+	uint64_t ahnd, offset, size = 0x1000;
 
 	ahnd = intel_allocator_open(fd, 0, type);
+	intel_allocator_get_address_range(ahnd, &offset, NULL);
 
 	igt_assert_eq(intel_allocator_reserve(ahnd, 0, size, offset), true);
 	/* try overlapping won't succeed */
@@ -115,6 +117,34 @@ static void reserve(int fd, uint8_t type)
 	igt_assert_eq(intel_allocator_unreserve(ahnd, 0, size, offset), true);
 	igt_assert_eq(intel_allocator_reserve(ahnd, 0, size, offset + size/2), true);
 	igt_assert_eq(intel_allocator_unreserve(ahnd, 0, size, offset + size/2), true);
+
+	igt_assert_eq(intel_allocator_close(ahnd), true);
+}
+
+static void default_alignment(int fd)
+{
+	struct test_obj obj[3];
+	uint64_t ahnd, default_alignment = 0x4000;
+
+	ahnd = intel_allocator_open_full(fd, 0, 0, 0, INTEL_ALLOCATOR_SIMPLE,
+					 ALLOC_STRATEGY_LOW_TO_HIGH,
+					 default_alignment);
+
+	for (int i = 0; i < ARRAY_SIZE(obj); i++) {
+		obj[i].handle = gem_handle_gen();
+		obj[i].offset = intel_allocator_alloc(ahnd, obj[i].handle, 4096,
+				i == 2 ? 4096 : 0);
+		igt_debug("obj[%d].offset: %llx, handle: %u\n", i,
+			 (long long) obj[i].offset, obj[i].handle);
+	}
+
+	igt_assert_eq(obj[1].offset - obj[0].offset, default_alignment);
+	/* obj[2] should be between obj[0] and obj[1] */
+	igt_assert(obj[0].offset < obj[2].offset);
+	igt_assert(obj[2].offset < obj[1].offset);
+
+	for (int i = 0; i < ARRAY_SIZE(obj); i++)
+		intel_allocator_free(ahnd, obj[i].handle);
 
 	igt_assert_eq(intel_allocator_close(ahnd), true);
 }
@@ -150,13 +180,10 @@ static void basic_alloc(int fd, int cnt, uint8_t type)
 	for (i = 0; i < cnt; i++) {
 		igt_progress("check overlapping: ", i, cnt);
 
-		if (type == INTEL_ALLOCATOR_RANDOM)
-			continue;
-
 		for (j = 0; j < cnt; j++) {
 			if (j == i)
 				continue;
-				igt_assert(!overlaps(&obj[i], &obj[j]));
+			igt_assert(!overlaps(&obj[i], &obj[j]));
 		}
 	}
 
@@ -169,23 +196,25 @@ static void basic_alloc(int fd, int cnt, uint8_t type)
 	igt_assert_eq(intel_allocator_close(ahnd), true);
 }
 
+#define NUM_OBJS 128
 static void reuse(int fd, uint8_t type)
 {
 	struct test_obj obj[128], tmp;
 	uint64_t ahnd, prev_offset;
+	uint64_t align = 0x40;
 	int i;
 
 	ahnd = intel_allocator_open(fd, 0, type);
 
-	for (i = 0; i < 128; i++) {
+	for (i = 0; i < NUM_OBJS; i++) {
 		obj[i].handle = gem_handle_gen();
 		obj[i].size = OBJ_SIZE;
 		obj[i].offset = intel_allocator_alloc(ahnd, obj[i].handle,
-						      obj[i].size, 0x40);
+						      obj[i].size, align);
 	}
 
-	/* check simple reuse */
-	for (i = 0; i < 128; i++) {
+	/* check reuse */
+	for (i = 0; i < NUM_OBJS; i++) {
 		prev_offset = obj[i].offset;
 		obj[i].offset = intel_allocator_alloc(ahnd, obj[i].handle,
 						      obj[i].size, 0);
@@ -197,8 +226,14 @@ static void reuse(int fd, uint8_t type)
 	intel_allocator_free(ahnd, obj[i].handle);
 	/* alloc different buffer to fill freed hole */
 	tmp.handle = gem_handle_gen();
-	tmp.offset = intel_allocator_alloc(ahnd, tmp.handle, OBJ_SIZE, 0);
-	igt_assert(prev_offset == tmp.offset);
+	tmp.offset = intel_allocator_alloc(ahnd, tmp.handle, OBJ_SIZE, align);
+
+	/* Simple will return previously returned offset if fits */
+	if (type == INTEL_ALLOCATOR_SIMPLE)
+		igt_assert(prev_offset == tmp.offset);
+	/* Reloc is moving forward for new allocations */
+	else if (type == INTEL_ALLOCATOR_RELOC)
+		igt_assert(prev_offset != tmp.offset);
 
 	obj[i].offset = intel_allocator_alloc(ahnd, obj[i].handle,
 					      obj[i].size, 0);
@@ -277,8 +312,8 @@ static void parallel_one(int fd, uint8_t type)
 
 	/* Check if all objects are allocated */
 	for (i = 0; i < count; i++) {
-		/* Reloc + random allocators don't have state. */
-		if (type == INTEL_ALLOCATOR_RELOC || type == INTEL_ALLOCATOR_RANDOM)
+		/* Reloc don't have state. */
+		if (type == INTEL_ALLOCATOR_RELOC)
 			break;
 
 		igt_assert_eq(offsets[i],
@@ -312,10 +347,10 @@ static void standalone(int fd)
 
 	igt_fork(child, 2) {
 		/*
-		 * Use standalone allocator for child 1, detach from parent,
-		 * child 2 use allocator from parent.
+		 * Use standalone allocator for child 0, detach from parent,
+		 * child 1 use allocator from parent.
 		 */
-		if (child == 1)
+		if (child == 0)
 			intel_allocator_init();
 
 		ahnd = intel_allocator_open(fd, 0, INTEL_ALLOCATOR_SIMPLE);
@@ -325,8 +360,8 @@ static void standalone(int fd)
 		intel_allocator_close(ahnd);
 	}
 	igt_waitchildren();
-	igt_assert_eq(offset, shared[1]);
-	igt_assert_neq(offset, shared[2]);
+	igt_assert_eq(offset, shared[0]);
+	igt_assert_neq(offset, shared[1]);
 
 	intel_allocator_free(ahnd, handle);
 	igt_assert_eq(intel_allocator_close(ahnd), true);
@@ -574,15 +609,20 @@ static void execbuf_with_allocator(int fd)
 
 	/* Blit src -> dst */
 	i = 0;
-	batch[i++] = XY_SRC_COPY_BLT_CMD |
-		  XY_SRC_COPY_BLT_WRITE_ALPHA |
-		  XY_SRC_COPY_BLT_WRITE_RGB;
-	if (gen >= 8)
-		batch[i - 1] |= 8;
-	else
-		batch[i - 1] |= 6;
+	if (gen >= 9) {
+		batch[i++] = XY_FAST_COPY_BLT; /* No tiling */
+		batch[i++] = XY_FAST_COPY_COLOR_DEPTH_32 | 0x10;
+	} else {
+		batch[i++] = XY_SRC_COPY_BLT_CMD |
+			  XY_SRC_COPY_BLT_WRITE_ALPHA |
+			  XY_SRC_COPY_BLT_WRITE_RGB;
+		if (gen >= 8)
+			batch[i - 1] |= 8;
+		else
+			batch[i - 1] |= 6;
 
-	batch[i++] = (3 << 24) | (0xcc << 16) | 4;
+		batch[i++] = (3 << 24) | (0xcc << 16) | 4;
+	}
 	batch[i++] = 0;
 	batch[i++] = (1 << 16) | 4;
 	batch[i++] = object[1].offset;
@@ -620,13 +660,103 @@ static void execbuf_with_allocator(int fd)
 	igt_assert(intel_allocator_close(ahnd) == true);
 }
 
+static void fork_reopen_allocator(int fd, uint8_t type)
+{
+	uint64_t p_ahnd, sh_ahnd, fd_ahnd, ctx_ahnd;
+	uint64_t offset;
+
+	intel_allocator_multiprocess_start();
+
+	p_ahnd = intel_allocator_open(fd, 0, type);
+	offset = intel_allocator_alloc(p_ahnd, 1, 123, 0);
+	if (type == INTEL_ALLOCATOR_SIMPLE)
+		igt_assert(intel_allocator_is_allocated(p_ahnd, 1, 123, offset));
+
+	igt_fork(child, 1) {
+		sh_ahnd = intel_allocator_open(fd, 0, type);
+		if (type == INTEL_ALLOCATOR_SIMPLE)
+			igt_assert(intel_allocator_is_allocated(sh_ahnd, 1, 123, offset));
+
+		ctx_ahnd = intel_allocator_open(fd, 1, type);
+		igt_assert(!intel_allocator_is_allocated(ctx_ahnd, 1, 123, offset));
+		intel_allocator_alloc(ctx_ahnd, 2, 123, 0);
+
+		fd = gem_reopen_driver(fd);
+		fd_ahnd = intel_allocator_open(fd, 0, type);
+		igt_assert(!intel_allocator_is_allocated(fd_ahnd, 1, 123, offset));
+		intel_allocator_alloc(fd_ahnd, 2, 123, 0);
+
+		intel_allocator_close(sh_ahnd);
+		intel_allocator_close(ctx_ahnd);
+		intel_allocator_close(fd_ahnd);
+	}
+
+	igt_waitchildren();
+	intel_allocator_close(p_ahnd);
+
+	intel_allocator_multiprocess_stop();
+}
+
+static uint32_t single_exec_from_pool(int i915, uint64_t ahnd, uint64_t size)
+{
+	struct drm_i915_gem_execbuffer2 execbuf = {};
+	struct drm_i915_gem_exec_object2 obj = {};
+	uint32_t bb = gem_create_from_pool(i915, &size, REGION_SMEM);
+	uint32_t *bbptr;
+
+	bbptr = gem_mmap__device_coherent(i915, bb, 0, size, PROT_WRITE);
+	*bbptr = MI_BATCH_BUFFER_END;
+	gem_munmap(bbptr, size);
+	obj.offset = get_offset(ahnd, bb, size, 0);
+	if (ahnd)
+		obj.flags = EXEC_OBJECT_PINNED;
+	obj.handle = bb;
+	execbuf.buffer_count = 1;
+	execbuf.buffers_ptr = to_user_pointer(&obj);
+	gem_execbuf(i915, &execbuf);
+
+	return bb;
+}
+
+static void gem_pool(int i915)
+{
+	uint32_t bb[4];
+	uint64_t ahnd = get_reloc_ahnd(i915, 0);
+	igt_spin_t *spin;
+
+	bb[0] = single_exec_from_pool(i915, ahnd, 4096);
+	gem_sync(i915, bb[0]);
+	bb[1] = single_exec_from_pool(i915, ahnd, 4096);
+	igt_assert(bb[0] == bb[1]);
+
+	bb[2] = single_exec_from_pool(i915, ahnd, 8192);
+	gem_sync(i915, bb[2]);
+	bb[3] = single_exec_from_pool(i915, ahnd, 8192);
+	igt_assert(bb[2] == bb[3]);
+	igt_assert(bb[0] != bb[2]);
+
+	spin = igt_spin_new(i915,
+			    .ahnd = ahnd,
+			    .engine = I915_EXEC_DEFAULT);
+	bb[0] = single_exec_from_pool(i915, ahnd, 4096);
+	bb[1] = single_exec_from_pool(i915, ahnd, 4096);
+	bb[2] = single_exec_from_pool(i915, ahnd, 8192);
+	bb[3] = single_exec_from_pool(i915, ahnd, 8192);
+	igt_spin_free(i915, spin);
+	igt_assert(bb[0] != bb[1]);
+	igt_assert(bb[2] != bb[3]);
+
+	put_ahnd(ahnd);
+
+	gem_pool_dump();
+}
+
 struct allocators {
 	const char *name;
 	uint8_t type;
 } als[] = {
 	{"simple", INTEL_ALLOCATOR_SIMPLE},
 	{"reloc",  INTEL_ALLOCATOR_RELOC},
-	{"random", INTEL_ALLOCATOR_RANDOM},
 	{NULL, 0},
 };
 
@@ -647,11 +777,10 @@ igt_main
 	igt_subtest_f("reserve-simple")
 		reserve_simple(fd);
 
-	igt_subtest_f("reuse")
-		reuse(fd, INTEL_ALLOCATOR_SIMPLE);
-
-	igt_subtest_f("reserve")
-		reserve(fd, INTEL_ALLOCATOR_SIMPLE);
+	igt_describe("For simple allocator check does default alignment is "
+		     "properly handled in open and alloc functions");
+	igt_subtest_f("default-alignment")
+		default_alignment(fd);
 
 	for (a = als; a->name; a++) {
 		igt_subtest_with_dynamic_f("%s-allocator", a->name) {
@@ -664,13 +793,16 @@ igt_main
 			igt_dynamic("print")
 				basic_alloc(fd, 1UL << 2, a->type);
 
-			if (a->type == INTEL_ALLOCATOR_SIMPLE) {
-				igt_dynamic("reuse")
-					reuse(fd, a->type);
+			igt_dynamic("reuse")
+				reuse(fd, a->type);
 
+			if (a->type == INTEL_ALLOCATOR_SIMPLE) {
 				igt_dynamic("reserve")
 					reserve(fd, a->type);
 			}
+
+			igt_dynamic("fork-reopen-allocator")
+				fork_reopen_allocator(fd, a->type);
 		}
 	}
 
@@ -709,6 +841,10 @@ igt_main
 
 	igt_subtest_f("execbuf-with-allocator")
 		execbuf_with_allocator(fd);
+
+	igt_describe("Verifies creating and executing bb from gem pool");
+	igt_subtest_f("gem-pool")
+		gem_pool(fd);
 
 	igt_fixture
 		close(fd);

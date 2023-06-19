@@ -62,6 +62,7 @@ igt@sysfs_timeslice_duration@off
 # GEM: Not worth fixing
 ###############################################
 igt@gen7_exec_parse@.*lri.*
+igt@gem_exec_alignment@pi-shared
 ###############################################
 # There are no DRRS capable displays in CI lab
 ###############################################
@@ -76,7 +77,7 @@ igt@kms_frontbuffer_tracking@.*drrs.*
 # is too costly in comparison to the value
 # provided.
 ###############################################
-igt@kms_chamelium@hdmi-.*-planes-random
+igt@kms_chamelium_frames@hdmi-.*-planes-random
 ###############################################
 # Broadcom
 ###############################################
@@ -90,6 +91,10 @@ igt@amdgpu/.*
 # Panfrost
 ###############################################
 igt@panfrost_.*
+###############################################
+# Qualcomm
+###############################################
+igt@msm_.*
 ###############################################
 # Hibernate: not configured correctly on CI
 ###############################################
@@ -119,3 +124,6 @@ igt@core_hotunplug@.*(hot|plug).*
 
 # hangs several gens of hosts, and has no immediate fix
 igt@device_reset@reset-bound
+
+# not working for i915
+igt@kms_bw@.*
