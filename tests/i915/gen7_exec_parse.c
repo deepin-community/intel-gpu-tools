@@ -32,6 +32,7 @@
 #include "igt.h"
 #include "igt_device.h"
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "sw_sync.h"
 
 #define DERRMR 0x44050
@@ -47,8 +48,6 @@
 #define INSTR_CLIENT_SHIFT	29
 #define   INSTR_INVALID_CLIENT  0x7
 
-#define MI_LOAD_REGISTER_REG (0x2a << 23)
-#define MI_STORE_REGISTER_MEM (0x24 << 23)
 #define MI_ARB_ON_OFF (0x8 << 23)
 #define MI_DISPLAY_FLIP ((0x14 << 23) | 1)
 
@@ -336,7 +335,7 @@ static void test_allocations(int fd)
 	struct drm_i915_gem_exec_object2 obj[17];
 	unsigned long count;
 
-	intel_require_memory(2, 1ull<<(12 + ARRAY_SIZE(obj)), CHECK_RAM);
+	igt_require_memory(2, 1ull<<(12 + ARRAY_SIZE(obj)), CHECK_RAM);
 
 	memset(obj, 0, sizeof(obj));
 	for (int i = 0; i < ARRAY_SIZE(obj); i++) {
@@ -373,7 +372,7 @@ static void test_allocations(int fd)
 static void hsw_load_register_reg(void)
 {
 	uint32_t init_gpr0[16] = {
-		MI_LOAD_REGISTER_IMM | (3 - 2),
+		MI_LOAD_REGISTER_IMM,
 		HSW_CS_GPR0,
 		0xabcdabc0, /* leave [1:0] zero */
 		MI_BATCH_BUFFER_END,
@@ -385,7 +384,7 @@ static void hsw_load_register_reg(void)
 		MI_BATCH_BUFFER_END,
 	};
 	uint32_t do_lrr[16] = {
-		MI_LOAD_REGISTER_REG | (3 - 2),
+		MI_LOAD_REGISTER_REG,
 		0, /* [1] = src */
 		HSW_CS_GPR0, /* dst */
 		MI_BATCH_BUFFER_END,
@@ -462,7 +461,7 @@ igt_main
 		fd = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(fd);
 
-		parser_version = gem_cmdparser_version(fd, 0);
+		parser_version = gem_cmdparser_version(fd);
 		igt_require(parser_version != -1);
 
 		igt_require(gem_uses_ppgtt(fd));

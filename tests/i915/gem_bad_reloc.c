@@ -39,6 +39,7 @@
 
 #include "drm.h"
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 
 IGT_TEST_DESCRIPTION("Simulates SNA behaviour using negative self-relocations"
@@ -191,15 +192,22 @@ igt_main
 	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(fd);
+		/* Check if relocations supported by platform */
+		igt_require(gem_has_relocations(fd));
 		gem_require_blitter(fd);
 	}
 
+	igt_describe("SNA behaviour is compressing batch buffer which leads to negative"
+		     " relocation deltas. Negative self-relocation happening with"
+		     " real offset 0.\n");
 	igt_subtest("negative-reloc")
 		negative_reloc(fd, 0);
 
+	igt_describe("Similar to previous test with flags for lut_based_execbuffer.");
 	igt_subtest("negative-reloc-lut")
 		negative_reloc(fd, USE_LUT);
 
+	igt_describe("Exercising blitter operation with negative reloc.\n");
 	igt_subtest("negative-reloc-bltcopy")
 		negative_reloc_blt(fd);
 

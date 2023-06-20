@@ -26,29 +26,35 @@
 
 #include <stdint.h>
 
-#define GEM_SUBMISSION_SEMAPHORES	(1 << 0)
-#define GEM_SUBMISSION_EXECLISTS	(1 << 1)
-#define GEM_SUBMISSION_GUC		(1 << 2)
+#include "intel_ctx.h"
+
+#define GEM_SUBMISSION_RINGBUF		1
+#define GEM_SUBMISSION_EXECLISTS	2
+#define GEM_SUBMISSION_GUC		3
+
 unsigned gem_submission_method(int fd);
 void gem_submission_print_method(int fd);
-bool gem_has_semaphores(int fd);
-bool gem_has_execlists(int fd);
-bool gem_has_guc_submission(int fd);
+bool gem_using_execlists(int fd);
+bool gem_using_guc_submission(int fd);
 bool gem_engine_has_mutable_submission(int fd, unsigned int engine);
 bool gem_class_has_mutable_submission(int fd, int class);
 
-int gem_cmdparser_version(int i915, uint32_t engine);
-static inline bool gem_has_cmdparser(int i915, uint32_t engine)
+int gem_cmdparser_version(int i915);
+static inline bool gem_has_cmdparser(int i915)
 {
-	return gem_cmdparser_version(i915, engine) > 0;
+	return gem_cmdparser_version(i915) > 0;
 }
+bool gem_engine_has_cmdparser(int i915, const intel_ctx_cfg_t *cfg,
+			      unsigned int engine);
 
 bool gem_has_blitter(int i915);
 void gem_require_blitter(int i915);
 
-unsigned int gem_submission_measure(int i915, unsigned int engine);
+unsigned int gem_submission_measure(int i915, const intel_ctx_cfg_t *cfg,
+				    unsigned int engine);
 
-void gem_test_engine(int fd, unsigned int engine);
+void gem_test_all_engines(int fd);
 bool gem_has_relocations(int fd);
+bool gem_allows_obj_alignment(int fd);
 
 #endif /* GEM_SUBMISSION_H */

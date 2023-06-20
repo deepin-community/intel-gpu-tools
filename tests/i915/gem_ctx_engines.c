@@ -39,46 +39,53 @@
 
 #include "i915/gem.h"
 #include "i915/gem_context.h"
+#include "i915/gem_create.h"
 #include "igt.h"
+#include "igt_types.h"
 #include "sw_sync.h"
 
 #define engine_class(e, n) ((e)->engines[(n)].engine_class)
 #define engine_instance(e, n) ((e)->engines[(n)].engine_instance)
 
-static bool has_context_engines(int i915)
+static int
+__set_param_fresh_context(int i915, struct drm_i915_gem_context_param param)
 {
-	struct drm_i915_gem_context_param param = {
-		.ctx_id = 0,
-		.param = I915_CONTEXT_PARAM_ENGINES,
-	};
-	return __gem_context_set_param(i915, &param) == 0;
+	int err;
+
+	igt_assert_eq(param.ctx_id, 0);
+	param.ctx_id = gem_context_create(i915);
+	err = __gem_context_set_param(i915, &param);
+	gem_context_destroy(i915, param.ctx_id);
+
+	return err;
 }
 
 static void invalid_engines(int i915)
 {
 	struct i915_context_param_engines stack = {}, *engines;
 	struct drm_i915_gem_context_param param = {
-		.ctx_id = gem_context_create(i915),
 		.param = I915_CONTEXT_PARAM_ENGINES,
 		.value = to_user_pointer(&stack),
 	};
 	uint32_t handle;
+	igt_spin_t *spin;
 	void *ptr;
+	uint64_t ahnd;
 
 	param.size = 0;
-	igt_assert_eq(__gem_context_set_param(i915, &param), 0);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EINVAL);
 
 	param.size = 1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EINVAL);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EINVAL);
 
 	param.size = sizeof(stack) - 1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EINVAL);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EINVAL);
 
 	param.size = sizeof(stack) + 1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EINVAL);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EINVAL);
 
-	param.size = 0;
-	igt_assert_eq(__gem_context_set_param(i915, &param), 0);
+	param.size = sizeof(*engines) + (I915_EXEC_RING_MASK + 2) * sizeof(*engines->engines);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EINVAL);
 
 	/* Create a single page surrounded by inaccessible nothingness */
 	ptr = mmap(NULL, 3 * 4096, PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -92,57 +99,57 @@ static void invalid_engines(int i915)
 	param.value = to_user_pointer(engines);
 
 	engines->engines[0].engine_class = -1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -ENOENT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -ENOENT);
 
 	mprotect(engines, 4096, PROT_READ);
-	igt_assert_eq(__gem_context_set_param(i915, &param), -ENOENT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -ENOENT);
 
 	mprotect(engines, 4096, PROT_WRITE);
 	engines->engines[0].engine_class = 0;
-	if (__gem_context_set_param(i915, &param)) /* XXX needs RCS */
+	if (__set_param_fresh_context(i915, param)) /* XXX needs RCS */
 		goto out;
 
 	engines->extensions = to_user_pointer(ptr);
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	engines->extensions = 0;
-	igt_assert_eq(__gem_context_set_param(i915, &param), 0);
+	igt_assert_eq(__set_param_fresh_context(i915, param), 0);
 
 	param.value = to_user_pointer(engines - 1);
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines) - 1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines) - param.size +  1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines) + 4096;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines) - param.size + 4096;
-	igt_assert_eq(__gem_context_set_param(i915, &param), 0);
+	igt_assert_eq(__set_param_fresh_context(i915, param), 0);
 
 	param.value = to_user_pointer(engines) - param.size + 4096 + 1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines) + 4096;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines) + 4096 - 1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines) - 1;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines - 1);
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines - 1) + 4096;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(engines - 1) + 4096 - sizeof(*engines->engines) / 2;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	handle = gem_create(i915, 4096 * 3);
 	ptr = gem_mmap__device_coherent(i915, handle, 0, 4096 * 3, PROT_READ);
@@ -152,101 +159,42 @@ static void invalid_engines(int i915)
 	munmap(ptr + 8192, 4096);
 
 	param.value = to_user_pointer(ptr + 4096);
-	igt_assert_eq(__gem_context_set_param(i915, &param), 0);
+	igt_assert_eq(__set_param_fresh_context(i915, param), 0);
 
 	param.value = to_user_pointer(ptr);
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(ptr) + 4095;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(ptr) + 8192;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	param.value = to_user_pointer(ptr) + 12287;
-	igt_assert_eq(__gem_context_set_param(i915, &param), -EFAULT);
+	igt_assert_eq(__set_param_fresh_context(i915, param), -EFAULT);
 
 	munmap(ptr + 4096, 4096);
 
+	/* Reset back to a known-good param struct */
+	param.size = sizeof(*engines) + sizeof(*engines->engines);
+	param.value = to_user_pointer(engines);
+	igt_assert_eq(__set_param_fresh_context(i915, param), 0);
+
+	/* Test that we can't set engines after we've done an execbuf */
+	param.ctx_id = gem_context_create(i915);
+	ahnd = get_reloc_ahnd(i915, param.ctx_id);
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx_id = param.ctx_id);
+	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
+	igt_assert_eq(__gem_context_set_param(i915, &param), -EINVAL);
+	gem_context_destroy(i915, param.ctx_id);
+
+	/* Test that we can't set engines on ctx0 */
+	param.ctx_id = 0;
+	igt_assert_eq(__gem_context_set_param(i915, &param), -EINVAL);
+
 out:
 	munmap(engines, 4096);
-	gem_context_destroy(i915, param.ctx_id);
-}
-
-static void idempotent(int i915)
-{
-	I915_DEFINE_CONTEXT_PARAM_ENGINES(engines, I915_EXEC_RING_MASK + 1);
-	I915_DEFINE_CONTEXT_PARAM_ENGINES(expected, I915_EXEC_RING_MASK + 1);
-	struct drm_i915_gem_context_param p = {
-		.ctx_id = gem_context_create(i915),
-		.param = I915_CONTEXT_PARAM_ENGINES,
-		.value = to_user_pointer(&engines),
-		.size = sizeof(engines),
-	};
-	const size_t base = sizeof(struct i915_context_param_engines);
-	const struct intel_execution_engine2 *e;
-	int idx;
-
-	/* What goes in, must come out. And what comes out, must go in */
-
-	gem_context_get_param(i915, &p);
-	igt_assert_eq(p.size, 0); /* atm default is to use legacy ring mask */
-
-	idx = 0;
-	memset(&engines, 0, sizeof(engines));
-	__for_each_physical_engine(i915, e) {
-		engines.engines[idx].engine_class = e->class;
-		engines.engines[idx].engine_instance = e->instance;
-		idx++;
-	}
-	idx *= sizeof(*engines.engines);
-	p.size = base + idx;
-	gem_context_set_param(i915, &p);
-
-	memcpy(&expected, &engines, sizeof(expected));
-
-	gem_context_get_param(i915, &p);
-	igt_assert_eq(p.size, base + idx);
-	igt_assert(!memcmp(&expected, &engines, idx));
-
-	p.size = base;
-	gem_context_set_param(i915, &p);
-	gem_context_get_param(i915, &p);
-	igt_assert_eq(p.size, base);
-
-	/* and it should not have overwritten the previous contents */
-	igt_assert(!memcmp(&expected, &engines, idx));
-
-	memset(&engines, 0, sizeof(engines));
-	engines.engines[0].engine_class = I915_ENGINE_CLASS_INVALID;
-	engines.engines[0].engine_instance = I915_ENGINE_CLASS_INVALID_NONE;
-	idx = sizeof(*engines.engines);
-	p.size = base + idx;
-	gem_context_set_param(i915, &p);
-
-	memcpy(&expected, &engines, sizeof(expected));
-
-	gem_context_get_param(i915, &p);
-	igt_assert_eq(p.size, base + idx);
-	igt_assert(!memcmp(&expected, &engines, idx));
-
-	p.size = sizeof(engines);
-	__for_each_physical_engine(i915, e) {
-		memset(&engines, 0, sizeof(engines));
-		for (int n = 0; n < I915_EXEC_RING_MASK + 1; n++) {
-			engine_class(&engines, n) = e->class;
-			engine_instance(&engines, n) = e->instance;
-		}
-		gem_context_set_param(i915, &p);
-
-		memcpy(&expected, &engines, sizeof(expected));
-
-		gem_context_get_param(i915, &p);
-		igt_assert_eq(p.size, sizeof(engines));
-		igt_assert(!memcmp(&expected, &engines, p.size));
-	}
-
-	gem_context_destroy(i915, p.ctx_id);
 }
 
 static uint32_t batch_create(int i915)
@@ -316,41 +264,19 @@ static void none(int i915)
 
 static void execute_one(int i915)
 {
-	I915_DEFINE_CONTEXT_PARAM_ENGINES(engines, I915_EXEC_RING_MASK + 1);
-	struct drm_i915_gem_context_param param = {
-		.ctx_id = gem_context_create(i915),
-		.param = I915_CONTEXT_PARAM_ENGINES,
-		.value = to_user_pointer(&engines),
-		/* .size to be filled in later */
-	};
 	struct drm_i915_gem_exec_object2 obj = {
 		.handle = gem_create(i915, 4096),
 	};
 	struct drm_i915_gem_execbuffer2 execbuf = {
 		.buffers_ptr = to_user_pointer(&obj),
 		.buffer_count = 1,
-		.rsvd1 = param.ctx_id,
 	};
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
 	const struct intel_execution_engine2 *e;
-	igt_spin_t *spin;
-
-	/* Prewarm the spinner */
-	spin = igt_spin_new(i915, .ctx = param.ctx_id,
-			    .flags = (IGT_SPIN_NO_PREEMPTION |
-				      IGT_SPIN_POLL_RUN));
 
 	gem_write(i915, obj.handle, 0, &bbe, sizeof(bbe));
 
-	/* Unadulterated I915_EXEC_DEFAULT should work */
-	execbuf.flags = 0;
-	gem_execbuf(i915, &execbuf);
-	obj.flags |= EXEC_OBJECT_PINNED;
-
-	igt_spin_end(spin);
-	gem_sync(i915, obj.handle);
-
-	__for_each_physical_engine(i915, e) {
+	for_each_physical_engine(i915, e) {
 		struct drm_i915_gem_busy busy = { .handle = obj.handle };
 
 		if (!gem_class_can_store_dword(i915, e->class))
@@ -359,33 +285,43 @@ static void execute_one(int i915)
 		igt_debug("Testing [%s...]\n", e->name);
 
 		for (int i = -1; i <= I915_EXEC_RING_MASK; i++) {
-			memset(&engines, 0, sizeof(engines));
-			engine_class(&engines, 0) = e->class;
-			engine_instance(&engines, 0) = e->instance;
-			param.size = offsetof(typeof(engines), engines[1]);
-			gem_context_set_param(i915, &param);
+			intel_ctx_cfg_t cfg = {};
+			const intel_ctx_t *ctx;
+			uint64_t ahnd;
+			igt_spin_t *spin;
 
-			gem_sync(i915, spin->handle);
-			igt_spin_reset(spin);
-			gem_execbuf(i915, &spin->execbuf);
+			cfg.num_engines = 1;
+			cfg.engines[0].engine_class = e->class;
+			cfg.engines[0].engine_instance = e->instance;
+			ctx = intel_ctx_create(i915, &cfg);
+			ahnd = get_reloc_ahnd(i915, ctx->id);
+
+			spin = igt_spin_new(i915,
+					    .ahnd = ahnd,
+					    .ctx = ctx,
+					    .flags = (IGT_SPIN_FENCE_OUT |
+						      IGT_SPIN_POLL_RUN));
 
 			do_ioctl(i915, DRM_IOCTL_I915_GEM_BUSY, &busy);
 			igt_assert_eq(busy.busy, 0);
+			intel_ctx_destroy(i915, ctx);
 
+			/* Create a new context with a lot of engines */
 			igt_debug("Testing with map of %d engines\n", i + 1);
-			memset(&engines.engines, -1, sizeof(engines.engines));
+			memset(cfg.engines, -1, sizeof(cfg.engines));
 			if (i != -1) {
-				engine_class(&engines, i) = e->class;
-				engine_instance(&engines, i) = e->instance;
+				cfg.engines[i].engine_class = e->class;
+				cfg.engines[i].engine_instance = e->instance;
 			}
-			param.size = sizeof(uint64_t) + (i + 1) * sizeof(uint32_t);
-			gem_context_set_param(i915, &param);
+			cfg.num_engines = GEM_MAX_ENGINES;
+			ctx = intel_ctx_create(i915, &cfg);
+			execbuf.rsvd2 = spin->execbuf.rsvd2 >> 32;
 
-			igt_spin_busywait_until_started(spin);
 			for (int j = 0; j <= I915_EXEC_RING_MASK; j++) {
 				int expected = j == i ? 0 : -EINVAL;
 
-				execbuf.flags = j;
+				execbuf.rsvd1 = ctx->id;
+				execbuf.flags = j | I915_EXEC_FENCE_IN;
 				igt_assert_f(__gem_execbuf(i915, &execbuf) == expected,
 					     "Failed to report the %s engine for slot %d (valid at %d)\n",
 					     j == i ? "valid" : "invalid", j, i);
@@ -395,38 +331,34 @@ static void execute_one(int i915)
 			igt_assert_eq(batch_busy(busy.busy),
 				      i != -1 ? 1 << e->class : 0);
 
-			igt_spin_end(spin);
+			igt_spin_free(i915, spin);
+			put_ahnd(ahnd);
 
 			gem_sync(i915, obj.handle);
+			intel_ctx_destroy(i915, ctx);
 			do_ioctl(i915, DRM_IOCTL_I915_GEM_BUSY, &busy);
 			igt_assert_eq(busy.busy, 0);
 		}
 	}
 
-	/* Restore the defaults and check I915_EXEC_DEFAULT works again. */
-	param.size = 0;
-	gem_context_set_param(i915, &param);
-	execbuf.flags = 0;
-	gem_execbuf(i915, &execbuf);
-
-	igt_spin_free(i915, spin);
-
 	gem_close(i915, obj.handle);
-	gem_context_destroy(i915, param.ctx_id);
 }
 
 static void execute_oneforall(int i915)
 {
 	I915_DEFINE_CONTEXT_PARAM_ENGINES(engines, I915_EXEC_RING_MASK + 1);
 	struct drm_i915_gem_context_param param = {
-		.ctx_id = gem_context_create(i915),
 		.param = I915_CONTEXT_PARAM_ENGINES,
 		.value = to_user_pointer(&engines),
 		.size = sizeof(engines),
 	};
 	const struct intel_execution_engine2 *e;
+	uint64_t ahnd;
 
-	__for_each_physical_engine(i915, e) {
+	for_each_physical_engine(i915, e) {
+		param.ctx_id = gem_context_create(i915);
+		ahnd = get_reloc_ahnd(i915, param.ctx_id);
+
 		memset(&engines, 0, sizeof(engines));
 		for (int i = 0; i <= I915_EXEC_RING_MASK; i++) {
 			engine_class(&engines, i) = e->class;
@@ -439,7 +371,8 @@ static void execute_oneforall(int i915)
 			igt_spin_t *spin;
 
 			spin = __igt_spin_new(i915,
-					      .ctx = param.ctx_id,
+					      .ahnd = ahnd,
+					      .ctx_id = param.ctx_id,
 					      .engine = i);
 
 			busy.handle = spin->handle;
@@ -448,9 +381,10 @@ static void execute_oneforall(int i915)
 
 			igt_spin_free(i915, spin);
 		}
-	}
 
-	gem_context_destroy(i915, param.ctx_id);
+		gem_context_destroy(i915, param.ctx_id);
+		put_ahnd(ahnd);
+	}
 }
 
 static void execute_allforone(int i915)
@@ -463,10 +397,11 @@ static void execute_allforone(int i915)
 	};
 	const struct intel_execution_engine2 *e;
 	int i;
+	uint64_t ahnd = get_reloc_ahnd(i915, param.ctx_id);
 
 	i = 0;
 	memset(&engines, 0, sizeof(engines));
-	__for_each_physical_engine(i915, e) {
+	for_each_physical_engine(i915, e) {
 		engine_class(&engines, i) = e->class;
 		engine_instance(&engines, i) = e->instance;
 		i++;
@@ -475,12 +410,13 @@ static void execute_allforone(int i915)
 	gem_context_set_param(i915, &param);
 
 	i = 0;
-	__for_each_physical_engine(i915, e) {
+	for_each_physical_engine(i915, e) {
 		struct drm_i915_gem_busy busy = {};
 		igt_spin_t *spin;
 
 		spin = __igt_spin_new(i915,
-				      .ctx = param.ctx_id,
+				      .ahnd = ahnd,
+				      .ctx_id = param.ctx_id,
 				      .engine = i++);
 
 		busy.handle = spin->handle;
@@ -491,6 +427,7 @@ static void execute_allforone(int i915)
 	}
 
 	gem_context_destroy(i915, param.ctx_id);
+	put_ahnd(ahnd);
 }
 
 static uint32_t read_result(int timeline, uint32_t *map, int idx)
@@ -501,7 +438,7 @@ static uint32_t read_result(int timeline, uint32_t *map, int idx)
 	return map[idx];
 }
 
-static bool has_cs_timestamp(const struct intel_execution_engine2 *e, int gen)
+static bool has_cs_timestamp(const struct intel_execution_engine2 *e, unsigned int gen)
 {
 	if (gen >= 7)
 		return true;
@@ -512,7 +449,8 @@ static bool has_cs_timestamp(const struct intel_execution_engine2 *e, int gen)
 	return e->class == I915_ENGINE_CLASS_RENDER;
 }
 
-static void independent(int i915, const struct intel_execution_engine2 *e)
+static void independent(int i915, const intel_ctx_t *base_ctx,
+			const struct intel_execution_engine2 *e)
 {
 #define RCS_TIMESTAMP (mmio_base + 0x358)
 	const unsigned int gen = intel_gen(intel_get_drm_devid(i915));
@@ -520,7 +458,6 @@ static void independent(int i915, const struct intel_execution_engine2 *e)
 	const int has_64bit_reloc = gen >= 8;
 	I915_DEFINE_CONTEXT_PARAM_ENGINES(engines, I915_EXEC_RING_MASK + 1);
 	struct drm_i915_gem_context_param param = {
-		.ctx_id = gem_context_clone_with_engines(i915, 0),
 		.param = I915_CONTEXT_PARAM_ENGINES,
 		.value = to_user_pointer(&engines),
 		.size = sizeof(engines),
@@ -540,7 +477,7 @@ static void independent(int i915, const struct intel_execution_engine2 *e)
 		struct drm_i915_gem_execbuffer2 execbuf = {
 			.buffers_ptr = to_user_pointer(&results),
 			.buffer_count = 1,
-			.rsvd1 = param.ctx_id,
+			.rsvd1 = base_ctx->id,
 			.flags = e->flags,
 		};
 		gem_write(i915, results.handle, 0, &bbe, sizeof(bbe));
@@ -553,12 +490,12 @@ static void independent(int i915, const struct intel_execution_engine2 *e)
 		engine_class(&engines, i) = e->class;
 		engine_instance(&engines, i) = e->instance;
 	}
+	param.ctx_id = gem_context_create(i915);
 	gem_context_set_param(i915, &param);
 
-	gem_set_caching(i915, results.handle, I915_CACHING_CACHED);
-	map = gem_mmap__cpu(i915, results.handle, 0, 4096, PROT_READ);
+	map = gem_mmap__device_coherent(i915, results.handle, 0, 4096, PROT_READ);
 	gem_set_domain(i915, results.handle,
-		       I915_GEM_DOMAIN_CPU, I915_GEM_DOMAIN_CPU);
+		       I915_GEM_DOMAIN_WC, I915_GEM_DOMAIN_WC);
 
 	for (int i = 0; i < I915_EXEC_RING_MASK + 1; i++) {
 		struct drm_i915_gem_exec_object2 obj[2] = {
@@ -576,8 +513,7 @@ static void independent(int i915, const struct intel_execution_engine2 *e)
 		uint32_t *cs;
 		int j = 0;
 
-		cs = gem_mmap__cpu(i915, obj[1].handle, 0, 4096, PROT_WRITE);
-
+		cs = gem_mmap__device_coherent(i915, obj[1].handle, 0, 4096, PROT_WRITE);
 		cs[j] = 0x24 << 23 | 1; /* SRM */
 		if (has_64bit_reloc)
 			cs[j]++;
@@ -612,19 +548,23 @@ static void independent(int i915, const struct intel_execution_engine2 *e)
 	gem_context_destroy(i915, param.ctx_id);
 }
 
-static void independent_all(int i915)
+static void independent_all(int i915, const intel_ctx_t *ctx)
 {
 	const unsigned int gen = intel_gen(intel_get_drm_devid(i915));
 	const struct intel_execution_engine2 *e;
 	igt_spin_t *spin = NULL;
+	uint64_t ahnd = get_reloc_ahnd(i915, ctx->id);
 
-	__for_each_physical_engine(i915, e) {
+	for_each_ctx_engine(i915, ctx, e) {
 		if (spin) {
 			spin->execbuf.flags &= ~63;
 			spin->execbuf.flags |= e->flags;
 			gem_execbuf(i915, &spin->execbuf);
 		} else {
-			spin = igt_spin_new(i915, .engine = e->flags,
+			spin = igt_spin_new(i915,
+					    .ahnd = ahnd,
+					    .ctx = ctx,
+					    .engine = e->flags,
 					    .flags = (IGT_SPIN_NO_PREEMPTION |
 						      IGT_SPIN_POLL_RUN));
 		}
@@ -632,7 +572,7 @@ static void independent_all(int i915)
 	igt_require(spin);
 	igt_spin_busywait_until_started(spin);
 
-	__for_each_physical_engine(i915, e) {
+	for_each_ctx_engine(i915, ctx, e) {
 		if (!gem_engine_mmio_base(i915, e->name))
 			continue;
 
@@ -640,101 +580,31 @@ static void independent_all(int i915)
 			continue;
 
 		igt_fork(child, 1)
-			independent(i915, e);
+			independent(i915, ctx, e);
 	}
 	sched_yield();
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 	igt_waitchildren();
-}
-
-static void libapi(int i915)
-{
-	I915_DEFINE_CONTEXT_PARAM_ENGINES(engines, 64) = {};
-	struct drm_i915_gem_context_param p = {
-		.ctx_id = gem_context_create(i915),
-		.param = I915_CONTEXT_PARAM_ENGINES,
-		.value = to_user_pointer(&engines),
-	};
-	const struct intel_execution_engine2 *e;
-	unsigned int count, idx;
-
-	p.size = sizeof(struct i915_context_param_engines);
-	gem_context_set_param(i915, &p);
-
-	/* An empty context should be a short loop */
-	count = 0;
-	for_each_context_engine(i915, p.ctx_id, e)
-		count++;
-	igt_assert_eq(count, 0);
-
-	p.size += sizeof(struct i915_engine_class_instance);
-	engine_class(&engines, 0) = -1;
-	engine_instance(&engines, 0) = -1;
-	gem_context_set_param(i915, &p);
-
-	/* We report all engines from the context, even if invalid/unusable */
-	count = 0;
-	for_each_context_engine(i915, p.ctx_id, e) {
-		igt_assert_eq(e->class, engine_class(&engines, 0));
-		igt_assert_eq(e->instance, engine_instance(&engines, 0));
-		count++;
-	}
-	igt_assert_eq(count, 1);
-
-	/* Check that every known engine can be found from the context map */
-	idx = 0;
-	p.size = sizeof(struct i915_context_param_engines);
-	p.size += sizeof(struct i915_engine_class_instance);
-	for (engine_class(&engines, idx) = 0;
-	     engine_class(&engines, idx) < 16;
-	     engine_class(&engines, idx)++) {
-		for (engine_instance(&engines, idx) = 0;
-		     engine_instance(&engines, idx) < 16;
-		     engine_instance(&engines, idx)++) {
-			if (__gem_context_set_param(i915, &p))
-				break;
-
-			count = 0;
-			for_each_context_engine(i915, p.ctx_id, e) {
-				igt_assert_eq(e->class,
-					      engine_class(&engines, count));
-				igt_assert_eq(e->instance,
-					      engine_instance(&engines, count));
-				count++;
-			}
-			igt_assert_eq(count, idx + 1);
-
-			engines.engines[(idx + 1) % 64] = engines.engines[idx];
-			idx = (idx + 1) % 64;
-
-			p.size = sizeof(struct i915_context_param_engines);
-			p.size += (idx + 1) * sizeof(struct i915_engine_class_instance);
-		}
-	}
-
-	gem_context_destroy(i915, p.ctx_id);
 }
 
 igt_main
 {
 	const struct intel_execution_engine2 *e;
-	int i915 = -1;
+	igt_fd_t(i915);
 
 	igt_fixture {
 		i915 = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(i915);
 
 		gem_require_contexts(i915);
-		igt_require(has_context_engines(i915));
+		igt_require(gem_has_engine_topology(i915));
 
 		igt_fork_hang_detector(i915);
 	}
 
 	igt_subtest("invalid-engines")
 		invalid_engines(i915);
-
-	igt_subtest("idempotent")
-		idempotent(i915);
 
 	igt_subtest("none")
 		none(i915);
@@ -749,18 +619,19 @@ igt_main
 		execute_allforone(i915);
 
 	igt_subtest_with_dynamic("independent") {
+		const intel_ctx_t *ctx;
+
 		igt_require(gem_scheduler_enabled(i915));
 		igt_require(intel_gen(intel_get_drm_devid(i915) >= 6));
-		__for_each_physical_engine(i915, e) {
-			igt_dynamic_f("%s", e->name)
-				independent(i915, e);
-		}
-		igt_dynamic("all")
-			independent_all(i915);
-	}
 
-	igt_subtest("libapi")
-		libapi(i915);
+		ctx = intel_ctx_create_all_physical(i915);
+		for_each_ctx_engine(i915, ctx, e) {
+			igt_dynamic_f("%s", e->name)
+				independent(i915, ctx, e);
+		}
+		igt_dynamic("all-engines")
+			independent_all(i915, ctx);
+	}
 
 	igt_fixture
 		igt_stop_hang_detector();

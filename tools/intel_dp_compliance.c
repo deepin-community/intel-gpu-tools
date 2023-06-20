@@ -174,7 +174,7 @@ uint8_t bitdepth;
 
 drmModeRes *resources;
 int drm_fd, modes, gen;
-uint64_t tiling = LOCAL_DRM_FORMAT_MOD_NONE;
+uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
 uint32_t depth = 24, stride, bpp;
 int specified_mode_num = -1, specified_disp_id = -1;
 int width, height;
@@ -356,7 +356,7 @@ static int setup_framebuffers(struct connector *dp_conn)
 	dp_conn->fb = igt_create_fb(drm_fd,
 				    dp_conn->fb_width, dp_conn->fb_height,
 				    DRM_FORMAT_XRGB8888,
-				    LOCAL_DRM_FORMAT_MOD_NONE,
+				    DRM_FORMAT_MOD_LINEAR,
 				    &dp_conn->fb_video_pattern);
 	igt_assert(dp_conn->fb);
 
@@ -386,7 +386,7 @@ static int setup_failsafe_framebuffer(struct connector *dp_conn)
 					     dp_conn->failsafe_width,
 					     dp_conn->failsafe_height,
 					     DRM_FORMAT_XRGB8888,
-					     LOCAL_DRM_FORMAT_MOD_NONE,
+					     DRM_FORMAT_MOD_LINEAR,
 					     &dp_conn->fb_failsafe_pattern);
 	igt_assert(dp_conn->failsafe_fb);
 
@@ -423,7 +423,7 @@ static int setup_video_pattern_framebuffer(struct connector *dp_conn)
 	dp_conn->test_pattern.fb = igt_create_fb(drm_fd,
 						 video_width, video_height,
 						 gen == 10 ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888,
-						 LOCAL_DRM_FORMAT_MOD_NONE,
+						 DRM_FORMAT_MOD_LINEAR,
 						 &dp_conn->test_pattern.fb_pattern);
 	igt_assert(dp_conn->test_pattern.fb);
 
@@ -452,6 +452,7 @@ static int set_test_mode(struct connector *dp_conn)
 	bool found_std = false, found_fs = false;
 	uint32_t alpha;
 	drmModeConnector *c = dp_conn->connector;
+	uint32_t *pixmap;
 
 	/* Ignore any disconnected devices */
 	if (c->connection != DRM_MODE_CONNECTED) {
@@ -532,7 +533,9 @@ static int set_test_mode(struct connector *dp_conn)
 			return ret;
 		}
 
-		ret = igt_fill_cts_framebuffer(dp_conn->test_pattern.pixmap,
+		pixmap = dp_conn->test_pattern.pixmap;
+
+		ret = igt_fill_cts_color_ramp_framebuffer(pixmap,
 				dp_conn->test_pattern.hdisplay,
 				dp_conn->test_pattern.vdisplay,
 				dp_conn->test_pattern.bitdepth,
@@ -638,7 +641,7 @@ set_default_mode(struct connector *c, bool set_mode)
 
 	fb_id = igt_create_pattern_fb(drm_fd, width, height,
 				      DRM_FORMAT_XRGB8888,
-				      tiling, &fb_info);
+				      modifier, &fb_info);
 
 	igt_info("CRTC(%u):[%d]", c->crtc, 0);
 	kmstest_dump_mode(&c->mode);

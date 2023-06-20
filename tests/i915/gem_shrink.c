@@ -28,6 +28,7 @@
  */
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_gt.h"
 #include "igt_debugfs.h"
@@ -36,8 +37,6 @@
 #ifndef MADV_FREE
 #define MADV_FREE 8
 #endif
-
-static unsigned int engines[I915_EXEC_RING_MASK + 1], nengine;
 
 static void get_pages(int fd, uint64_t alloc)
 {
@@ -163,8 +162,10 @@ static void execbufN(int fd, uint64_t alloc)
 static void execbufX(int fd, uint64_t alloc)
 {
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
+	struct intel_engine_data engines;
 	struct drm_i915_gem_exec_object2 *obj;
 	struct drm_i915_gem_execbuffer2 execbuf;
+	const intel_ctx_t *ctx;
 	int count = alloc >> 20;
 	uint64_t obj_size;
 
@@ -173,6 +174,9 @@ static void execbufX(int fd, uint64_t alloc)
 
 	obj[count].handle = gem_create(fd, 4096);
 	gem_write(fd, obj[count].handle, 0, &bbe, sizeof(bbe));
+
+	ctx = intel_ctx_create_all_physical(fd);
+	engines = intel_engine_list_for_ctx_cfg(fd, &ctx->cfg);
 
 	for (int i = 1; i <= count; i++) {
 		int j = count - i;
@@ -184,13 +188,16 @@ static void execbufX(int fd, uint64_t alloc)
 
 		execbuf.buffers_ptr = to_user_pointer(&obj[j]);
 		execbuf.buffer_count = i + 1;
-		execbuf.flags = engines[j % nengine];
+		execbuf.flags = engines.engines[j % engines.nengines].flags;
+		execbuf.rsvd1 = ctx->id;
 		gem_execbuf(fd, &execbuf);
 	}
 
 	for (int i = 0; i <= count; i++)
 		gem_madvise(fd, obj[i].handle, I915_MADV_DONTNEED);
 	munmap(obj, obj_size);
+
+	intel_ctx_destroy(fd, ctx);
 }
 
 static void hang(int fd, uint64_t alloc)
@@ -362,6 +369,7 @@ static void reclaim(unsigned engine, int timeout)
 	int debugfs = igt_debugfs_dir(fd);
 	igt_spin_t *spin;
 	volatile uint32_t *shared;
+	uint64_t ahnd = get_reloc_ahnd(fd, 0);
 
 	shared = mmap(0, 4096, PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	igt_assert(shared != MAP_FAILED);
@@ -373,9 +381,9 @@ static void reclaim(unsigned engine, int timeout)
 		} while (!*shared);
 	}
 
-	spin = igt_spin_new(fd, .engine = engine);
+	spin = igt_spin_new(fd, .ahnd = ahnd, .engine = engine);
 	igt_until_timeout(timeout) {
-		igt_spin_t *next = __igt_spin_new(fd, .engine = engine);
+		igt_spin_t *next = __igt_spin_new(fd, .ahnd = ahnd, .engine = engine);
 
 		igt_spin_set_timeout(spin, timeout_100ms);
 		gem_sync(fd, spin->handle);
@@ -384,6 +392,7 @@ static void reclaim(unsigned engine, int timeout)
 		spin = next;
 	}
 	igt_spin_free(fd, spin);
+	put_ahnd(ahnd);
 
 	*shared = 1;
 	igt_waitchildren();
@@ -427,8 +436,7 @@ igt_main
 
 	igt_fixture {
 		const int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-		uint64_t mem_size = intel_get_total_ram_mb();
-		const struct intel_execution_engine2 *e;
+		uint64_t mem_size = igt_get_total_ram_mb();
 		int fd;
 
 		fd = drm_open_driver(DRIVER_INTEL);
@@ -447,14 +455,7 @@ igt_main
 		igt_info("Using %d processes and %'"PRIu64"MiB per process\n",
 			 num_processes, alloc_size);
 
-		intel_require_memory(num_processes, alloc_size,
-				     CHECK_SWAP | CHECK_RAM);
-
-		nengine = 0;
-		__for_each_physical_engine(fd, e)
-			engines[nengine++] = e->flags;
-		igt_require(nengine);
-
+		alloc_size <<= 20;
 		close(fd);
 	}
 
@@ -463,9 +464,12 @@ igt_main
 
 	for(const struct test *t = tests; t->name; t++) {
 		for(const struct mode *m = modes; m->suffix; m++) {
-			igt_subtest_f("%s%s", t->name, m->suffix)
+			igt_subtest_f("%s%s", t->name, m->suffix) {
+				igt_require_memory(num_processes, alloc_size,
+						   CHECK_SWAP | CHECK_RAM);
 				run_test(num_processes, alloc_size,
 					 t->func, m->flags);
+			}
 		}
 	}
 }

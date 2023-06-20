@@ -18,9 +18,12 @@ tools_progs = [
 	'intel_bios_dumper',
 	'intel_display_crc',
 	'intel_display_poller',
+	'intel_dump_decode',
+	'intel_error_decode',
 	'intel_forcewaked',
 	'intel_gpu_frequency',
 	'intel_firmware_decode',
+	'intel_framebuffer_dump',
 	'intel_gpu_time',
 	'intel_gtt',
 	'intel_guc_logger',
@@ -28,6 +31,8 @@ tools_progs = [
 	'intel_lid',
 	'intel_opregion_decode',
 	'intel_panel_fitter',
+	'intel_perf_counters',
+	'intel_pm_rpm',
 	'intel_reg_checker',
 	'intel_residency',
 	'intel_stepping',
@@ -39,16 +44,7 @@ tools_progs = [
 	'lsgpu',
 ]
 tool_deps = igt_deps
-
-if libdrm_intel.found()
-	tools_progs += [
-		'intel_dump_decode',
-		'intel_error_decode',
-		'intel_framebuffer_dump',
-		'intel_perf_counters',
-	]
-	tool_deps += zlib
-endif
+tool_deps += zlib
 
 foreach prog : tools_progs
 	executable(prog, prog + '.c',
@@ -91,7 +87,7 @@ install_subdir('registers', install_dir : datadir)
 executable('intel_gpu_top', 'intel_gpu_top.c',
 	   install : true,
 	   install_rpath : bindir_rpathdir,
-	   dependencies : [lib_igt_perf,lib_igt_device_scan,math])
+	   dependencies : [lib_igt_perf,lib_igt_device_scan,lib_igt_drm_fdinfo,math])
 
 executable('amd_hdmi_compliance', 'amd_hdmi_compliance.c',
 	   dependencies : [tool_deps],

@@ -26,6 +26,8 @@
 
 #include "v3d_drm.h"
 
+#define PAGE_SIZE 4096
+
 struct v3d_bo {
 	int handle;
 	uint32_t offset;
@@ -42,5 +44,9 @@ uint32_t igt_v3d_get_param(int fd, enum drm_v3d_param param);
 void *igt_v3d_mmap_bo(int fd, uint32_t handle, uint32_t size, unsigned prot);
 
 void igt_v3d_bo_mmap(int fd, struct v3d_bo *bo);
+
+uint32_t igt_v3d_perfmon_create(int fd, uint32_t ncounters, uint8_t *counters);
+void igt_v3d_perfmon_get_values(int fd, uint32_t id);
+void igt_v3d_perfmon_destroy(int fd, uint32_t id);
 
 #endif /* IGT_V3D_H */

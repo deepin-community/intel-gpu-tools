@@ -26,6 +26,7 @@
 #include <sys/signal.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_rand.h"
 #include "igt_sysfs.h"
@@ -52,7 +53,8 @@ static void xchg_obj(void *array, unsigned i, unsigned j)
 }
 
 #define CONTEXTS 0x1
-static void wide(int fd, int ring_size, int timeout, unsigned int flags)
+static void wide(int fd, const intel_ctx_t *ctx, int ring_size,
+		 int timeout, unsigned int flags)
 {
 	const struct intel_execution_engine2 *engine;
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
@@ -62,6 +64,7 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 		struct drm_i915_gem_exec_object2 exec[2];
 		struct drm_i915_gem_relocation_entry reloc;
 		struct drm_i915_gem_execbuffer2 execbuf;
+		const intel_ctx_t *ctx;
 		uint32_t *cmd;
 	} *exec;
 	struct drm_i915_gem_exec_object2 *obj;
@@ -69,9 +72,10 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 	unsigned engines[I915_EXEC_RING_MASK + 1], nengine;
 	unsigned long count;
 	double time;
+	uint64_t ahnd = get_reloc_ahnd(fd, 0); /* just offset provider */
 
 	nengine = 0;
-	__for_each_physical_engine(fd, engine) {
+	for_each_ctx_engine(fd, ctx, engine) {
 		if (!gem_class_has_mutable_submission(fd, engine->class))
 			continue;
 
@@ -84,7 +88,7 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 	exec = calloc(nengine, sizeof(*exec));
 	igt_assert(exec);
 
-	intel_require_memory(nengine*(2 + ring_size), 4096, CHECK_RAM);
+	igt_require_memory(nengine*(2 + ring_size), 4096, CHECK_RAM);
 	obj = calloc(nengine*ring_size + 1, sizeof(*obj));
 	igt_assert(obj);
 
@@ -94,8 +98,13 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 		for (unsigned n = 0; n < ring_size; n++)  {
 			exec[e].obj[n].handle = gem_create(fd, 4096);
 			exec[e].obj[n].flags = EXEC_OBJECT_WRITE;
+			exec[e].obj[n].offset = get_offset(ahnd, exec[e].obj[n].handle,
+							   4096, 0);
+			if (ahnd)
+				exec[e].obj[n].flags |= EXEC_OBJECT_PINNED;
 
 			obj[e*ring_size + n].handle = exec[e].obj[n].handle;
+			obj[e*ring_size + n].offset = exec[e].obj[n].offset;
 		}
 
 		exec[e].execbuf.buffers_ptr = to_user_pointer(exec[e].exec);
@@ -105,12 +114,20 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 					 I915_EXEC_HANDLE_LUT);
 
 		if (flags & CONTEXTS) {
-			exec[e].execbuf.rsvd1 = gem_context_create(fd);
+			exec[e].ctx = intel_ctx_create(fd, &ctx->cfg);
+			exec[e].execbuf.rsvd1 = exec[e].ctx->id;
+		} else {
+			exec[e].execbuf.rsvd1 = ctx->id;
 		}
 
 		exec[e].exec[0].handle = gem_create(fd, 4096);
-		exec[e].cmd = gem_mmap__wc(fd, exec[e].exec[0].handle,
-					   0, 4096, PROT_WRITE);
+		exec[e].exec[0].offset = get_offset(ahnd, exec[e].exec[0].handle,
+						    4096, 0);
+		if (ahnd)
+			exec[e].exec[0].flags = EXEC_OBJECT_PINNED;
+
+		exec[e].cmd = gem_mmap__device_coherent(fd, exec[e].exec[0].handle,
+							0, 4096, PROT_WRITE);
 
 		gem_set_domain(fd, exec[e].exec[0].handle,
 			       I915_GEM_DOMAIN_WC, I915_GEM_DOMAIN_WC);
@@ -127,10 +144,16 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 			exec[e].reloc.delta = 1;
 
 		exec[e].exec[1].relocs_ptr = to_user_pointer(&exec[e].reloc);
-		exec[e].exec[1].relocation_count = 1;
+		exec[e].exec[1].relocation_count = !ahnd ? 1 : 0;
 	}
+
 	obj[nengine*ring_size].handle = gem_create(fd, 4096);
 	gem_write(fd, obj[nengine*ring_size].handle, 0, &bbe, sizeof(bbe));
+
+	obj[nengine*ring_size].offset = get_offset(ahnd, obj[nengine*ring_size].handle,
+						   4096, 0);
+	if (ahnd)
+		obj[nengine*ring_size].flags |= EXEC_OBJECT_PINNED;
 
 	memset(&execbuf, 0, sizeof(execbuf));
 	execbuf.buffers_ptr = to_user_pointer(&obj[nengine*ring_size]);
@@ -150,9 +173,9 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 			int i;
 
 			if (flags & CONTEXTS) {
-				gem_context_destroy(fd, exec[e].execbuf.rsvd1);
-				exec[e].execbuf.rsvd1 =
-					gem_context_clone_with_engines(fd, 0);
+				intel_ctx_destroy(fd, exec[e].ctx);
+				exec[e].ctx = intel_ctx_create(fd, &ctx->cfg);
+				exec[e].execbuf.rsvd1 = exec[e].ctx->id;
 			}
 
 			exec[e].reloc.presumed_offset = exec[e].exec[1].offset;
@@ -192,6 +215,7 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 			execbuf.flags = (engines[e] |
 					 I915_EXEC_NO_RELOC |
 					 I915_EXEC_HANDLE_LUT);
+			execbuf.rsvd1 = ctx->id;
 			gem_execbuf(fd, &execbuf);
 		}
 		clock_gettime(CLOCK_MONOTONIC, &now);
@@ -213,30 +237,38 @@ static void wide(int fd, int ring_size, int timeout, unsigned int flags)
 
 	for (unsigned e = 0; e < nengine; e++) {
 		if (flags & CONTEXTS)
-			gem_context_destroy(fd, exec[e].execbuf.rsvd1);
+			intel_ctx_destroy(fd, exec[e].ctx);
 
-		for (unsigned n = 0; n < ring_size; n++)
+		for (unsigned n = 0; n < ring_size; n++) {
 			gem_close(fd, exec[e].obj[n].handle);
+			put_offset(ahnd, exec[e].obj[n].handle);
+		}
 		free(exec[e].obj);
 
 		munmap(exec[e].cmd, 4096);
 		gem_close(fd, exec[e].exec[1].handle);
+		put_offset(ahnd, exec[e].exec[1].handle);
 	}
 	free(exec);
+	put_ahnd(ahnd);
 }
+
+#define TIMEOUT 20
 
 igt_main
 {
 	int ring_size = 0;
 	int device = -1;
+	const intel_ctx_t *ctx;
 
 	igt_fixture {
 
 		device = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(device);
 		gem_submission_print_method(device);
+		ctx = intel_ctx_create_all_physical(device);
 
-		ring_size = gem_submission_measure(device, ALL_ENGINES);
+		ring_size = gem_submission_measure(device, &ctx->cfg, ALL_ENGINES);
 
 		igt_info("Ring size: %d batches\n", ring_size);
 		igt_require(ring_size > 0);
@@ -245,15 +277,16 @@ igt_main
 	}
 
 	igt_subtest("wide-all")
-		wide(device, ring_size, 20, 0);
+		wide(device, ctx, ring_size, TIMEOUT, 0);
 
 	igt_subtest("wide-contexts") {
 		gem_require_contexts(device);
-		wide(device, ring_size, 20, CONTEXTS);
+		wide(device, ctx, ring_size, TIMEOUT, CONTEXTS);
 	}
 
 	igt_fixture {
 		igt_stop_hang_detector();
+		intel_ctx_destroy(device, ctx);
 		close(device);
 	}
 }

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 #
 # Copyright © 2014 Intel Corporation
 #
@@ -29,11 +29,16 @@ RESULTS="$ROOT/results"
 PIGLIT=`which piglit 2> /dev/null`
 IGT_RUNNER=
 IGT_RESUME=
+IGT_KERNEL_TREE=
+COV_ARGS=
+COV_PER_TEST=
+LCOV_CMD="lcov"
+KERNEL_TREE=
 USE_PIGLIT=0
 RUNNER=
 RESUME=
 
-function find_file # basename <possible paths>
+find_file() # basename <possible paths>
 {
 	base=$1
 	shift
@@ -67,7 +72,7 @@ fi
 
 IGT_TEST_ROOT="`readlink -f ${IGT_TEST_ROOT}`"
 
-function find_runner_binary # basename
+find_runner_binary() # basename
 {
 	base=$1
 	shift
@@ -84,32 +89,51 @@ function find_runner_binary # basename
 	return 1
 }
 
-function download_piglit {
+find_lcov_binary() # basename
+{
+	if command -v $LCOV_CMD > /dev/null 2>&1; then
+		return 0
+	fi
+
+	return 1
+}
+
+download_piglit() {
 	git clone https://anongit.freedesktop.org/git/piglit.git "$ROOT/piglit"
 }
 
-function execute_runner # as-root <runner> <args>
+execute_runner() # as-root <runner> <args>
 {
-	local need_root=$1
+	need_root=$1
 	shift
-	local runner=$1
+	runner=$1
 	shift
-	local sudo
 
-	export IGT_TEST_ROOT IGT_CONFIG_PATH
+	export IGT_TEST_ROOT IGT_CONFIG_PATH IGT_KERNEL_TREE
 
-	if [ "$need_root" -ne 0 -a "$EUID" -ne 0 ]; then
-		sudo="sudo --preserve-env=IGT_TEST_ROOT,IGT_CONFIG_PATH"
+	if [ "$need_root" -ne 0 -a "$(id -u)" -ne 0 ]; then
+		if command -v sudo > /dev/null 2>&1; then
+			sudo="sudo --preserve-env=IGT_TEST_ROOT,IGT_CONFIG_PATH,IGT_KERNEL_TREE"
+		else
+			echo "$0: Could not start runner: Permission denied."
+			exit 1
+		fi
 	fi
 
 	$sudo $runner "$@"
 }
 
-function print_help {
+print_help() {
 	echo "Usage: run-tests.sh [options]"
 	echo "Available options:"
+	echo "  -c <capture_script>"
+	echo "                  capture gcov code coverage using the <capture_script>."
+	echo "  -P              store code coverage results per each test. Should be"
+	echo "                  used together with -k option"
 	echo "  -d              download Piglit to $ROOT/piglit"
 	echo "  -h              display this help message"
+	echo "  -k <kernel_dir> Linux Kernel source code directory used to generate code"
+	echo "                  coverage builds."
 	echo "  -l              list all available tests"
 	echo "  -r <directory>  store the results in directory"
 	echo "                  (default: $RESULTS)"
@@ -134,11 +158,14 @@ function print_help {
 	echo "Useful patterns for test filtering are described in the API documentation."
 }
 
-while getopts ":dhlr:st:T:vx:Rnpb:" opt; do
+while getopts ":c:dhk:lPr:st:T:vx:Rnpb:" opt; do
 	case $opt in
+		c) COV_ARGS="$COV_ARGS --collect-code-cov --collect-script $OPTARG " ;;
 		d) download_piglit; exit ;;
 		h) print_help; exit ;;
+		k) IGT_KERNEL_TREE="$OPTARG" ;;
 		l) LIST_TESTS="true" ;;
+		P) COV_ARGS="$COV_ARGS --coverage-per-test"; COV_PER_TEST=1 ;;
 		r) RESULTS="$OPTARG" ;;
 		s) SUMMARY="html" ;;
 		t) FILTER="$FILTER -t $OPTARG" ;;
@@ -168,8 +195,20 @@ if [ "x$1" != "x" ]; then
 	exit 1
 fi
 
-if [ "x$PIGLIT" == "x" ]; then
+if [ "x$PIGLIT" = "x" ]; then
 	PIGLIT="$ROOT/piglit/piglit"
+fi
+
+if [ "x$COV_ARGS" != "x" ]; then
+	if [ "$USE_PIGLIT" -eq "1" ]; then
+		echo "Cannot collect code coverage when running tests with Piglit. Use igt_runner instead."
+		exit 1
+	fi
+
+	if ! $(find_lcov_binary); then
+		echo "Can't check code coverage, as 'lcov' is not installed"
+		exit 1
+	fi
 fi
 
 RUN_ARGS=
@@ -201,18 +240,23 @@ else
 fi
 
 if [ "x$LIST_TESTS" != "x" ]; then
-	execute_runner 0 $RUNNER $LIST_ARGS $FILTER
+	execute_runner 0 $RUNNER $LIST_ARGS $FILTER $COV_ARGS
 	exit
 fi
 
 if [ "x$RESUME_RUN" != "x" ]; then
-	execute_runner 1 $RESUME $RESUME_ARGS "$RESULTS"
+	if [ "x$COV_ARGS" != "x" -a "x$COV_PER_TEST" = "x" ]; then
+		echo "Can't continue collecting coverage tests. Next time, run"
+		echo "$0 with '-P' in order to generate separate code coverage results".
+		exit 1
+	fi
+	execute_runner 1 $RESUME $RESUME_ARGS $COV_ARGS "$RESULTS"
 else
 	mkdir -p "$RESULTS"
-	execute_runner 1 $RUNNER $RUN_ARGS -o -s "$RESULTS" $VERBOSE $FILTER
+	execute_runner 1 $RUNNER $RUN_ARGS -o -s "$RESULTS" $COV_ARGS $VERBOSE $FILTER
 fi
 
-if [ "$SUMMARY" == "html" ]; then
+if [ "$SUMMARY" = "html" ]; then
 	if [ ! -x "$PIGLIT" ]; then
 		echo "Could not find Piglit, required for HTML generation."
 		echo "Please install Piglit or use -d to download Piglit locally."

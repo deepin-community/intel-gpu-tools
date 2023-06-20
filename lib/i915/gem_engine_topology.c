@@ -32,24 +32,62 @@
 #include "ioctl_wrappers.h"
 
 #include "i915/gem_engine_topology.h"
+/**
+ * SECTION:gem_engine_topology
+ * @short_description: Helpers for dealing engine topology
+ * @title: GEM Engine Topology
+ *
+ * This helper library contains functions used for querying and dealing
+ * with engines in GEM contexts.
+ *
+ * Combined with intel_ctx_t, these helpers give a pretty standard pattern
+ * for testing every engine in a device:
+ * |[<!-- language="C" -->
+ *	const struct intel_execution_engine2 *e;
+ *	const intel_ctx_t *ctx = intel_ctx_create_all_physical(fd);
+ *
+ *	igt_subtest_with_dynamic("basic") {
+ *		for_each_ctx_engine(fd, ctx, e) {
+ *			igt_dynamic_f("%s", e->name)
+ *			run_ctx_test(fd, ctx, e);
+ *		}
+ *	}
+ * ]|
+ * This pattern works regardless of whether or not the engines topology API
+ * is available and regardless of whether or not your platform supports
+ * contexts.  If engines are unavailable, it falls back to a legacy context
+ * and if contexts are unavailable, intel_ctx_create_all_physical() will
+ * return a wrapper around ctx0.
+ *
+ * If, for some reason, you want to create a second identical context to
+ * use with your engine iterator, duplicating the context is easy:
+ * |[<!-- language="C" -->
+ *	const intel_ctx_t *ctx2 = intel_ctx_create(fd, &ctx->cfg);
+ * ]|
+ *
+ * If you want each subtest to always create its own contexts, there are
+ * also iterators which work only on a context config.  As long as all
+ * contexts are created from that config, or from one with an identical set
+ * of engines, the iterator will be valid for those contexts.
+ * |[<!-- language="C" -->
+ *	const struct intel_execution_engine2 *e;
+ *	intel_ctx_cfg_t cfg = intel_ctx_cfg_all_physical(fd);
+ *
+ *	igt_subtest_with_dynamic("basic") {
+ *		for_each_ctx_cfg_engine(fd, &cfg, e) {
+ *			igt_dynamic_f("%s", e->name)
+ *			run_ctx_cfg_test(fd, &cfg, e);
+ *		}
+ *	}
+ * ]|
+ */
 
 /*
  * Limit what we support for simplicity due limitation in how much we
  * can address via execbuf2.
  */
-#define SIZEOF_CTX_PARAM	offsetof(struct i915_context_param_engines, \
-					 engines[GEM_MAX_ENGINES])
 #define SIZEOF_QUERY		offsetof(struct drm_i915_query_engine_info, \
 					 engines[GEM_MAX_ENGINES])
-
-#define DEFINE_CONTEXT_ENGINES_PARAM(e__, p__, c__, N__) \
-		I915_DEFINE_CONTEXT_PARAM_ENGINES(e__, N__); \
-		struct drm_i915_gem_context_param p__ = { \
-			.param = I915_CONTEXT_PARAM_ENGINES, \
-			.ctx_id = c__, \
-			.size = SIZEOF_CTX_PARAM, \
-			.value = to_user_pointer(memset(&e__, 0, sizeof(e__))), \
-		}
 
 static int __gem_query(int fd, struct drm_i915_query *q)
 {
@@ -62,14 +100,17 @@ static int __gem_query(int fd, struct drm_i915_query *q)
 	return err;
 }
 
-static void gem_query(int fd, struct drm_i915_query *q)
-{
-	igt_assert_eq(__gem_query(fd, q), 0);
-}
-
-static void query_engines(int fd,
-			  struct drm_i915_query_engine_info *query_engines,
-			  int length)
+/**
+ * __gem_query_engines:
+ * @fd: open i915 drm file descriptor
+ * @query_engines: Returned engine query info
+ * @length: Size of query_engines, including room for the engines array
+ *
+ * Queries the set of engines available on this device.
+ */
+int __gem_query_engines(int fd,
+			struct drm_i915_query_engine_info *query_engines,
+			int length)
 {
 	struct drm_i915_query_item item = { };
 	struct drm_i915_query query = { };
@@ -81,26 +122,7 @@ static void query_engines(int fd,
 
 	item.data_ptr = to_user_pointer(query_engines);
 
-	gem_query(fd, &query);
-}
-
-static void ctx_map_engines(int fd, struct intel_engine_data *ed,
-			    struct drm_i915_gem_context_param *param)
-{
-	struct i915_context_param_engines *engines =
-			from_user_pointer(param->value);
-	int i = 0;
-
-	for (typeof(engines->engines[0]) *p = &engines->engines[0];
-	     i < ed->nengines; i++, p++) {
-		p->engine_class = ed->engines[i].class;
-		p->engine_instance = ed->engines[i].instance;
-	}
-
-	param->size = offsetof(typeof(*engines), engines[i]);
-	engines->extensions = 0;
-
-	gem_context_set_param(fd, param);
+	return __gem_query(fd, &query);
 }
 
 static const char *class_names[] = {
@@ -108,6 +130,7 @@ static const char *class_names[] = {
 	[I915_ENGINE_CLASS_COPY]	  = "bcs",
 	[I915_ENGINE_CLASS_VIDEO]	  = "vcs",
 	[I915_ENGINE_CLASS_VIDEO_ENHANCE] = "vecs",
+	[I915_ENGINE_CLASS_COMPUTE]       = "ccs",
 };
 
 static void init_engine(struct intel_execution_engine2 *e2,
@@ -142,14 +165,16 @@ static void init_engine(struct intel_execution_engine2 *e2,
 	igt_assert(ret < sizeof(e2->name));
 }
 
-static void query_engine_list(int fd, struct intel_engine_data *ed)
+static int __query_engine_list(int fd, struct intel_engine_data *ed)
 {
 	uint8_t buff[SIZEOF_QUERY] = { };
 	struct drm_i915_query_engine_info *query_engine =
 			(struct drm_i915_query_engine_info *) buff;
-	int i;
+	int i, err;
 
-	query_engines(fd, query_engine, SIZEOF_QUERY);
+	err = __gem_query_engines(fd, query_engine, SIZEOF_QUERY);
+	if (err)
+		return err;
 
 	for (i = 0; i < query_engine->num_engines; i++)
 		init_engine(&ed->engines[i],
@@ -157,6 +182,8 @@ static void query_engine_list(int fd, struct intel_engine_data *ed)
 			    query_engine->engines[i].engine.engine_instance, i);
 
 	ed->nengines = query_engine->num_engines;
+
+	return 0;
 }
 
 struct intel_execution_engine2 *
@@ -192,97 +219,109 @@ intel_get_current_physical_engine(struct intel_engine_data *ed)
 	return e;
 }
 
-static int gem_topology_get_param(int fd,
-				  struct drm_i915_gem_context_param *p)
+static struct intel_engine_data intel_engine_list_for_static(int fd)
 {
-	if (igt_only_list_subtests())
-		return -ENODEV;
-
-	if (__gem_context_get_param(fd, p))
-		return -1; /* using default engine map */
-
-	return 0;
-}
-
-struct intel_engine_data intel_init_engine_list(int fd, uint32_t ctx_id)
-{
-	DEFINE_CONTEXT_ENGINES_PARAM(engines, param, ctx_id, GEM_MAX_ENGINES);
+	const struct intel_execution_engine2 *e2;
 	struct intel_engine_data engine_data = { };
-	int i;
 
-	if (gem_topology_get_param(fd, &param)) {
-		/* if kernel does not support engine/context mapping */
-		const struct intel_execution_engine2 *e2;
+	igt_debug("using pre-allocated engine list\n");
 
-		igt_debug("using pre-allocated engine list\n");
+	__for_each_static_engine(e2) {
+		if (igt_only_list_subtests() ||
+		    (fd < 0) ||
+		    gem_has_ring(fd, e2->flags)) {
+			struct intel_execution_engine2 *__e2 =
+				&engine_data.engines[
+				engine_data.nengines];
 
-		__for_each_static_engine(e2) {
-			if (igt_only_list_subtests() ||
-			    (fd < 0) ||
-			    gem_has_ring(fd, e2->flags)) {
-				struct intel_execution_engine2 *__e2 =
-					&engine_data.engines[
-					engine_data.nengines];
+			strcpy(__e2->name, e2->name);
+			__e2->instance   = e2->instance;
+			__e2->class      = e2->class;
+			__e2->flags      = e2->flags;
+			__e2->is_virtual = false;
 
-				strcpy(__e2->name, e2->name);
-				__e2->instance   = e2->instance;
-				__e2->class      = e2->class;
-				__e2->flags      = e2->flags;
-				__e2->is_virtual = false;
-
-				engine_data.nengines++;
-                        }
-		}
-		return engine_data;
-	}
-
-	if (!param.size) {
-		query_engine_list(fd, &engine_data);
-		ctx_map_engines(fd, &engine_data, &param);
-	} else {
-		/* engine count can be inferred from size */
-		param.size -= sizeof(struct i915_context_param_engines);
-		param.size /= sizeof(struct i915_engine_class_instance);
-
-		igt_assert_f(param.size <= GEM_MAX_ENGINES,
-			     "unsupported engine count\n");
-
-		for (i = 0; i < param.size; i++)
-			init_engine(&engine_data.engines[i],
-				    engines.engines[i].engine_class,
-				    engines.engines[i].engine_instance,
-				    i);
-
-		engine_data.nengines = i;
+			engine_data.nengines++;
+                }
 	}
 
 	return engine_data;
 }
 
-int gem_context_lookup_engine(int fd, uint64_t engine, uint32_t ctx_id,
-			      struct intel_execution_engine2 *e)
+/**
+ * intel_engine_list_of_physical:
+ * @fd: open i915 drm file descriptor
+ *
+ * Returns the list of all physical engines in the device
+ */
+struct intel_engine_data intel_engine_list_of_physical(int fd)
 {
-	DEFINE_CONTEXT_ENGINES_PARAM(engines, param, ctx_id, GEM_MAX_ENGINES);
+	struct intel_engine_data engine_data = { };
 
-	/* a bit paranoic */
-	igt_assert(e);
+	if (__query_engine_list(fd, &engine_data) == 0)
+		return engine_data;
 
-	if (gem_topology_get_param(fd, &param) || !param.size)
-		return -EINVAL;
-
-	e->class = engines.engines[engine].engine_class;
-	e->instance = engines.engines[engine].engine_instance;
-
-	return 0;
+	return intel_engine_list_for_static(fd);
 }
 
+/**
+ * intel_engine_list_for_ctx_cfg:
+ * @fd: open i915 drm file descriptor
+ * @cfg: Context config
+ *
+ * Returns the list of all engines in the context config
+ */
+struct intel_engine_data
+intel_engine_list_for_ctx_cfg(int fd, const intel_ctx_cfg_t *cfg)
+{
+	igt_assert(cfg);
+	if (fd >= 0 && cfg->num_engines) {
+		struct intel_engine_data engine_data = { };
+		int i;
+
+		if (cfg->load_balance) {
+			engine_data.nengines = cfg->num_engines + 1;
+
+			init_engine(&engine_data.engines[0],
+				    I915_ENGINE_CLASS_INVALID,
+				    I915_ENGINE_CLASS_INVALID_NONE,
+				    0);
+
+			for (i = 0; i < cfg->num_engines; i++)
+				init_engine(&engine_data.engines[i + 1],
+					    cfg->engines[i].engine_class,
+					    cfg->engines[i].engine_instance,
+					    i + 1);
+		} else {
+			engine_data.nengines = cfg->num_engines;
+			for (i = 0; i < cfg->num_engines; i++)
+				init_engine(&engine_data.engines[i],
+					    cfg->engines[i].engine_class,
+					    cfg->engines[i].engine_instance,
+					    i);
+		}
+
+		return engine_data;
+	} else {
+		/* This is a legacy context */
+		return intel_engine_list_for_static(fd);
+	}
+}
+
+/**
+ * gem_has_engine_topology:
+ * @fd: open i915 drm file descriptor
+ *
+ * Queries whether the engine topology API is supported or not.  Every
+ * kernel that has the global engines query should have the
+ * CONTEXT_PARAM_ENGINES and vice versa so this one check can be used for
+ * either.
+ *
+ * Returns: Engine topology API availability.
+ */
 bool gem_has_engine_topology(int fd)
 {
-	struct drm_i915_gem_context_param param = {
-		.param = I915_CONTEXT_PARAM_ENGINES,
-	};
-
-	return !__gem_context_get_param(fd, &param);
+	struct intel_engine_data ed;
+	return !__query_engine_list(fd, &ed);
 }
 
 struct intel_execution_engine2 gem_eb_flags_to_engine(unsigned int flags)
@@ -309,23 +348,6 @@ struct intel_execution_engine2 gem_eb_flags_to_engine(unsigned int flags)
 	}
 
 	return e2__;
-}
-
-bool gem_context_has_engine_map(int fd, uint32_t ctx)
-{
-	struct drm_i915_gem_context_param param = {
-		.param = I915_CONTEXT_PARAM_ENGINES,
-		.ctx_id = ctx
-	};
-
-	/*
-	 * If the kernel is too old to support PARAM_ENGINES,
-	 * then naturally the context has no engine map.
-	 */
-	if (__gem_context_get_param(fd, &param))
-		return false;
-
-	return param.size;
 }
 
 bool gem_engine_is_equal(const struct intel_execution_engine2 *e1,
@@ -464,6 +486,91 @@ int gem_engine_property_printf(int i915, const char *engine, const char *attr,
 
 	fclose(file);
 	return ret;
+}
+
+/* Ensure fast hang detection */
+void gem_engine_properties_configure(int fd, struct gem_engine_properties *params)
+{
+	int ret;
+	struct gem_engine_properties write = *params;
+
+	ret = gem_engine_property_scanf(fd, write.engine->name,
+					"heartbeat_interval_ms",
+					"%d", &params->heartbeat_interval);
+	igt_assert_eq(ret, 1);
+
+	ret = gem_engine_property_printf(fd, write.engine->name,
+					 "heartbeat_interval_ms", "%d",
+					 write.heartbeat_interval);
+	igt_assert_lt(0, ret);
+
+	if (gem_scheduler_has_preemption(fd)) {
+		ret = gem_engine_property_scanf(fd, write.engine->name,
+						"preempt_timeout_ms",
+						"%d", &params->preempt_timeout);
+		igt_assert_eq(ret, 1);
+
+		ret = gem_engine_property_printf(fd, write.engine->name,
+						 "preempt_timeout_ms", "%d",
+						 write.preempt_timeout);
+		igt_assert_lt(0, ret);
+	}
+}
+
+void gem_engine_properties_restore(int fd, const struct gem_engine_properties *saved)
+{
+	int ret;
+
+	ret = gem_engine_property_printf(fd, saved->engine->name,
+					 "heartbeat_interval_ms", "%d",
+					 saved->heartbeat_interval);
+	igt_assert_lt(0, ret);
+
+	if (gem_scheduler_has_preemption(fd)) {
+		ret = gem_engine_property_printf(fd, saved->engine->name,
+						 "preempt_timeout_ms", "%d",
+						 saved->preempt_timeout);
+		igt_assert_lt(0, ret);
+	}
+}
+
+static bool
+__gem_engine_has_capability(int i915, const char *engine,
+			    const char *attr, const char *cap)
+{
+	char buf[4096] = {};
+	FILE *file;
+
+	file = __open_attr(igt_sysfs_open(i915), "r",
+			   "engine", engine, attr, NULL);
+	if (!file)
+		return NULL;
+
+	fread(buf, 1, sizeof(buf) - 1, file);
+	fclose(file);
+
+	return strstr(buf, cap);
+}
+
+bool gem_engine_has_capability(int i915, const char *engine, const char *cap)
+{
+	return __gem_engine_has_capability(i915, engine, "capabilities", cap);
+}
+
+bool gem_engine_has_known_capability(int i915, const char *engine, const char *cap)
+{
+	return __gem_engine_has_capability(i915, engine, "known_capabilities", cap);
+}
+
+bool gem_engine_can_block_copy(int i915, const struct intel_execution_engine2 *engine)
+{
+	if (engine->class != I915_ENGINE_CLASS_COPY)
+		return false;
+
+	if (!gem_engine_has_known_capability(i915, engine->name, "block_copy"))
+		return intel_gen(intel_get_drm_devid(i915)) >= 12;
+
+	return gem_engine_has_capability(i915, engine->name, "block_copy");
 }
 
 uint32_t gem_engine_mmio_base(int i915, const char *engine)

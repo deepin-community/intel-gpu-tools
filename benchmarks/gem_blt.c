@@ -41,7 +41,7 @@
 #include <time.h>
 
 #include "drm.h"
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 
 #define COPY_BLT_CMD		(2<<29|0x53<<22|0x6)
 #define BLT_WRITE_ALPHA		(1<<21)
@@ -57,29 +57,21 @@ elapsed(const struct timespec *start, const struct timespec *end)
 	return (end->tv_sec - start->tv_sec) + 1e-9*(end->tv_nsec - start->tv_nsec);
 }
 
-static int baseline(uint64_t bytes, int milliseconds)
+static int baseline(int fd, struct drm_i915_gem_execbuffer2 execbuf, int milliseconds)
 {
 	struct timespec start, end;
-	const int size = 64*1024*1024;
 	int count = 0;
-	void *mem;
-
-	mem = malloc(size);
-	if (mem == NULL)
-		return 1;
 
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	do {
-		memset(mem, count, size);
+		gem_execbuf(fd, &execbuf);
 		count++;
 		clock_gettime(CLOCK_MONOTONIC, &end);
-		if (elapsed(&start, &end) > 0.1)
+		if (elapsed(&start, &end) > (milliseconds / 1000.))
 			break;
 	} while (1);
 
-	free(mem);
-
-	return ceil(1e-3*milliseconds/elapsed(&start, &end) * count * size / bytes);
+	return count;
 }
 
 static int gem_linear_blt(int fd,
@@ -260,7 +252,7 @@ static int run(int object, int batch, int time, int reps, int ncpus, unsigned fl
 		execbuf.flags |= I915_EXEC_NO_RELOC;
 
 	/* Guess how many loops we need for 0.1s */
-	count = baseline((uint64_t)object * batch, 100) / ncpus;
+	count = baseline(fd, execbuf, 100) / ncpus;
 	if (flags & SYNC) {
 		time *= count / 2;
 		count = 1;

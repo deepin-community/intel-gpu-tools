@@ -24,10 +24,13 @@
 
 #include "i915/gem.h"
 #include "igt.h"
+#include "igt_hwmon.h"
 #include "igt_sysfs.h"
 #include <fcntl.h>
 #include <sys/types.h>
 #include <dirent.h>
+
+IGT_TEST_DESCRIPTION("Read entries from debugfs, hwmon and sysfs paths.");
 
 static void read_and_discard_sysfs_entries(int path_fd, int indent)
 {
@@ -98,12 +101,14 @@ static void kms_tests(int fd, int debugfs)
 	igt_display_t display;
 	struct igt_fb fb[IGT_MAX_PIPES];
 	enum pipe pipe;
+	int ret;
 
 	igt_fixture
 		igt_display_require(&display, fd);
 
 	igt_subtest("read_all_entries_display_on") {
 		/* try to light all pipes */
+retry:
 		for_each_pipe(&display, pipe) {
 			igt_output_t *output;
 
@@ -120,12 +125,31 @@ static void kms_tests(int fd, int debugfs)
 				igt_create_pattern_fb(display.drm_fd,
 						      mode->hdisplay, mode->vdisplay,
 						      DRM_FORMAT_XRGB8888,
-						      LOCAL_DRM_FORMAT_MOD_NONE, &fb[pipe]);
+						      DRM_FORMAT_MOD_LINEAR, &fb[pipe]);
 
 				/* Set a valid fb as some debugfs like to inspect it on a active pipe */
 				igt_plane_set_fb(primary, &fb[pipe]);
 				break;
 			}
+		}
+
+		if (display.is_atomic)
+			ret = igt_display_try_commit_atomic(&display,
+					DRM_MODE_ATOMIC_TEST_ONLY |
+					DRM_MODE_ATOMIC_ALLOW_MODESET,
+					NULL);
+		else
+			ret = igt_display_try_commit2(&display, COMMIT_LEGACY);
+
+		if (ret) {
+			igt_output_t *output;
+			bool found = igt_override_all_active_output_modes_to_fit_bw(&display);
+			igt_require_f(found, "No valid mode combo found.\n");
+
+			for_each_connected_output(&display, output)
+				igt_output_set_pipe(output, PIPE_NONE);
+
+			goto retry;
 		}
 
 		igt_display_commit2(&display, display.is_atomic ? COMMIT_ATOMIC : COMMIT_LEGACY);
@@ -155,7 +179,7 @@ static void kms_tests(int fd, int debugfs)
 
 igt_main
 {
-	int fd = -1, debugfs, sysfs;
+	int fd = -1, debugfs, sysfs, hwmon_fd;
 
 	igt_fixture {
 		fd = drm_open_driver_master(DRIVER_INTEL);
@@ -166,11 +190,23 @@ igt_main
 		kmstest_set_vt_graphics_mode();
 	}
 
+	igt_describe("Read all entries from sysfs path.");
 	igt_subtest("sysfs")
 		read_and_discard_sysfs_entries(sysfs, 0);
+	igt_describe("Read all entries from debugfs path.");
 	igt_subtest("read_all_entries")
 		read_and_discard_sysfs_entries(debugfs, 0);
 
+	igt_describe("Read all entries from hwmon path");
+	igt_subtest("basic-hwmon") {
+		igt_require_f(gem_has_lmem(fd), "Test applicable only for dgfx\n");
+		hwmon_fd = igt_hwmon_open(fd);
+		igt_assert(hwmon_fd >= 0);
+		read_and_discard_sysfs_entries(hwmon_fd, 0);
+		close(hwmon_fd);
+	}
+
+	igt_describe("Read all debugfs entries with display on/off.");
 	igt_subtest_group
 		kms_tests(fd, debugfs);
 

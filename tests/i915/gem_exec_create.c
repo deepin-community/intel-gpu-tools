@@ -40,8 +40,16 @@
 
 #include "drm.h"
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_ring.h"
 #include "igt.h"
+
+#include "i915_drm.h"
+#include "i915/intel_memory_region.h"
+
+IGT_TEST_DESCRIPTION("This test overloads the driver with transient active objects"
+		     " and checks if we don't kill the system under the memory pressure"
+		     " some of the symptoms this test look for include mysterious hangs.");
 
 #define ENGINE_FLAGS  (I915_EXEC_RING_MASK | I915_EXEC_BSD_MASK)
 
@@ -54,29 +62,34 @@ static double elapsed(const struct timespec *start, const struct timespec *end)
 #define ENGINES (1 << 0)
 #define LEAK (1 << 1)
 
-static void all(int fd, unsigned flags, int timeout, int ncpus)
+static void all(int fd, unsigned flags, int timeout, int ncpus, uint32_t region)
 {
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
 	struct drm_i915_gem_execbuffer2 execbuf;
 	struct drm_i915_gem_exec_object2 obj;
 	unsigned engines[I915_EXEC_RING_MASK + 1], nengine;
+	const intel_ctx_t *ctx;
 
 	nengine = 0;
 	if (flags & ENGINES) { /* Modern API to iterate over *all* engines */
 		const struct intel_execution_engine2 *e;
 
-		__for_each_physical_engine(fd, e)
+		ctx = intel_ctx_create_all_physical(fd);
+
+		for_each_ctx_engine(fd, ctx, e)
 			engines[nengine++] = e->flags;
 
 		/* Note: modifies engine map on context 0 */
 	} else {
+		ctx = intel_ctx_0(fd);
+
 		for_each_physical_ring(e, fd)
 			engines[nengine++] = eb_ring(e);
 	}
 	igt_require(nengine);
 
 	memset(&obj, 0, sizeof(obj));
-	obj.handle =  gem_create(fd, 4096);
+	obj.handle = gem_create_in_memory_regions(fd, 4096, region);
 	gem_write(fd, obj.handle, 0, &bbe, sizeof(bbe));
 
 	memset(&execbuf, 0, sizeof(execbuf));
@@ -84,6 +97,7 @@ static void all(int fd, unsigned flags, int timeout, int ncpus)
 	execbuf.buffer_count = 1;
 	execbuf.flags |= I915_EXEC_HANDLE_LUT;
 	execbuf.flags |= I915_EXEC_NO_RELOC;
+	execbuf.rsvd1 = ctx->id;
 	if (__gem_execbuf(fd, &execbuf)) {
 		execbuf.flags = 0;
 		gem_execbuf(fd, &execbuf);
@@ -101,7 +115,7 @@ static void all(int fd, unsigned flags, int timeout, int ncpus)
 		clock_gettime(CLOCK_MONOTONIC, &start);
 		do {
 			for (int n = 0; n < nengine; n++) {
-				obj.handle = gem_create(fd, 4096);
+				obj.handle = gem_create_in_memory_regions(fd, 4096, region);
 				gem_write(fd, obj.handle, 0, &bbe, sizeof(bbe));
 				execbuf.flags &= ~ENGINE_FLAGS;
 				execbuf.flags |= engines[n];
@@ -114,7 +128,7 @@ static void all(int fd, unsigned flags, int timeout, int ncpus)
 			count += nengine;
 			clock_gettime(CLOCK_MONOTONIC, &now);
 		} while (elapsed(&start, &now) < timeout); /* Hang detection ~120s */
-		obj.handle = gem_create(fd, 4096);
+		obj.handle = gem_create_in_memory_regions(fd, 4096, region);
 		gem_write(fd, obj.handle, 0, &bbe, sizeof(bbe));
 		for (int n = 0; n < nengine; n++) {
 			execbuf.flags &= ~ENGINE_FLAGS;
@@ -131,11 +145,15 @@ static void all(int fd, unsigned flags, int timeout, int ncpus)
 	}
 	igt_waitchildren();
 	igt_assert_eq(intel_detect_and_clear_missed_interrupts(fd), 0);
+	intel_ctx_destroy(fd, ctx);
 }
 
 igt_main
 {
 	const int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+	struct drm_i915_query_memory_regions *query_info;
+	struct igt_collection *regions, *set;
+	uint32_t region;
 	int device = -1;
 
 	igt_fixture {
@@ -143,18 +161,67 @@ igt_main
 		igt_require_gem(device);
 
 		igt_fork_hang_detector(device);
+
+		query_info = gem_get_query_memory_regions(device);
+		igt_assert(query_info);
+
+		set = get_memory_region_set(query_info,
+					    I915_SYSTEM_MEMORY,
+					    I915_DEVICE_MEMORY);
 	}
 
-	igt_subtest("legacy")
-		all(device, 0, 2, 1);
-	igt_subtest("basic")
-		all(device, ENGINES, 2, 1);
-	igt_subtest("forked")
-		all(device, ENGINES, 20, ncpus);
+	igt_describe("Check if we kill the system by overloading it with active objects"
+		     " iterating over legacy engines.");
+	igt_subtest_with_dynamic("legacy")
+		for_each_combination(regions, 1, set) {
+			char *sub_name = memregion_dynamic_subtest_name(regions);
+			region = igt_collection_get_value(regions, 0);
 
-	igt_subtest("madvise")
-		all(device, ENGINES | LEAK, 20, 1);
+			igt_dynamic_f("%s", sub_name)
+				all(device, 0, 2, 1, region);
 
+			free(sub_name);
+		}
+
+	igt_describe("Check if we kill system by overloading it with active objects"
+		     " iterating over all engines.");
+	igt_subtest_with_dynamic("basic")
+		for_each_combination(regions, 1, set) {
+			char *sub_name = memregion_dynamic_subtest_name(regions);
+			region = igt_collection_get_value(regions, 0);
+
+			igt_dynamic_f("%s", sub_name)
+				all(device, ENGINES, 2, 1, region);
+
+			free(sub_name);
+		}
+
+	igt_describe("Concurrently overloads system with active objects and checks"
+		     " if we kill system.");
+	igt_subtest_with_dynamic("forked")
+		for_each_combination(regions, 1, set) {
+			char *sub_name = memregion_dynamic_subtest_name(regions);
+			region = igt_collection_get_value(regions, 0);
+
+			igt_dynamic_f("%s", sub_name)
+				all(device, ENGINES, 20, ncpus, region);
+
+			free(sub_name);
+		}
+
+
+	igt_describe("This test does a forced reclaim, behaving like a bad application"
+		     " leaking its bo cache.");
+	igt_subtest_with_dynamic("madvise")
+		for_each_combination(regions, 1, set) {
+			char *sub_name = memregion_dynamic_subtest_name(regions);
+			region = igt_collection_get_value(regions, 0);
+
+			igt_dynamic_f("%s", sub_name)
+				all(device, ENGINES | LEAK, 20, 1, region);
+
+			free(sub_name);
+		}
 
 	igt_fixture {
 		igt_stop_hang_detector();

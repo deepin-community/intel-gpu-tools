@@ -47,69 +47,6 @@
 
 IGT_TEST_DESCRIPTION("Test of CreateLease.");
 
-struct local_drm_mode_create_lease {
-        /** Pointer to array of object ids (__u32) */
-        __u64 object_ids;
-        /** Number of object ids */
-        __u32 object_count;
-        /** flags for new FD (O_CLOEXEC, etc) */
-        __u32 flags;
-
-        /** Return: unique identifier for lessee. */
-        __u32 lessee_id;
-        /** Return: file descriptor to new drm_master file */
-        __u32 fd;
-};
-
-struct local_drm_mode_list_lessees {
-        /** Number of lessees.
-         * On input, provides length of the array.
-         * On output, provides total number. No
-         * more than the input number will be written
-         * back, so two calls can be used to get
-         * the size and then the data.
-         */
-        __u32 count_lessees;
-        __u32 pad;
-
-        /** Pointer to lessees.
-         * pointer to __u64 array of lessee ids
-         */
-        __u64 lessees_ptr;
-};
-
-struct local_drm_mode_get_lease {
-        /** Number of leased objects.
-         * On input, provides length of the array.
-         * On output, provides total number. No
-         * more than the input number will be written
-         * back, so two calls can be used to get
-         * the size and then the data.
-         */
-        __u32 count_objects;
-        __u32 pad;
-
-        /** Pointer to objects.
-         * pointer to __u32 array of object ids
-         */
-        __u64 objects_ptr;
-};
-
-/**
- * Revoke lease
- */
-struct local_drm_mode_revoke_lease {
-        /** Unique ID of lessee
-         */
-        __u32 lessee_id;
-};
-
-
-#define LOCAL_DRM_IOCTL_MODE_CREATE_LEASE     DRM_IOWR(0xC6, struct local_drm_mode_create_lease)
-#define LOCAL_DRM_IOCTL_MODE_LIST_LESSEES     DRM_IOWR(0xC7, struct local_drm_mode_list_lessees)
-#define LOCAL_DRM_IOCTL_MODE_GET_LEASE        DRM_IOWR(0xC8, struct local_drm_mode_get_lease)
-#define LOCAL_DRM_IOCTL_MODE_REVOKE_LEASE     DRM_IOWR(0xC9, struct local_drm_mode_revoke_lease)
-
 typedef struct {
 	int fd;
 	uint32_t lessee_id;
@@ -127,22 +64,6 @@ typedef struct {
 	uint32_t plane_id;
 } data_t;
 
-static uint32_t pipe_to_crtc_id(igt_display_t *display, enum pipe pipe)
-{
-	return display->pipes[pipe].crtc_id;
-}
-
-static enum pipe crtc_id_to_pipe(igt_display_t *display, uint32_t crtc_id)
-{
-	enum pipe pipe;
-
-	for_each_pipe(display, pipe) {
-		if(display->pipes[pipe].crtc_id == crtc_id)
-			return pipe;
-	}
-	return -1;
-}
-
 static igt_output_t *connector_id_to_output(igt_display_t *display, uint32_t connector_id)
 {
 	drmModeConnector		connector;
@@ -151,12 +72,12 @@ static igt_output_t *connector_id_to_output(igt_display_t *display, uint32_t con
 	return igt_output_from_connector(display, &connector);
 }
 
-static int prepare_crtc(lease_t *lease, uint32_t connector_id, uint32_t crtc_id)
+static int prepare_crtc(lease_t *lease, data_t *data)
 {
 	drmModeModeInfo *mode;
 	igt_display_t *display = &lease->display;
-	igt_output_t *output = connector_id_to_output(display, connector_id);
-	enum pipe pipe = crtc_id_to_pipe(display, crtc_id);
+	igt_output_t *output = connector_id_to_output(display, data->connector_id);
+	enum pipe pipe = data->pipe;
 	igt_plane_t *primary;
 	int ret;
 
@@ -170,7 +91,7 @@ static int prepare_crtc(lease_t *lease, uint32_t connector_id, uint32_t crtc_id)
 	mode = igt_output_get_mode(output);
 	igt_create_color_fb(lease->fd, mode->hdisplay, mode->vdisplay,
 			    DRM_FORMAT_XRGB8888,
-			    LOCAL_DRM_FORMAT_MOD_NONE,
+			    DRM_FORMAT_MOD_LINEAR,
 			    0.0, 0.0, 0.0,
 			    &lease->primary_fb);
 
@@ -199,42 +120,42 @@ static void cleanup_crtc(lease_t *lease, igt_output_t *output)
 	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
 	igt_plane_set_fb(primary, NULL);
 
-	igt_output_set_pipe(output, PIPE_ANY);
+	igt_output_set_pipe(output, PIPE_NONE);
 	igt_display_commit(display);
 }
 
-static int create_lease(int fd, struct local_drm_mode_create_lease *mcl)
+static int create_lease(int fd, struct drm_mode_create_lease *mcl)
 {
 	int err = 0;
 
-	if (igt_ioctl(fd, LOCAL_DRM_IOCTL_MODE_CREATE_LEASE, mcl))
+	if (igt_ioctl(fd, DRM_IOCTL_MODE_CREATE_LEASE, mcl))
 		err = -errno;
 	return err;
 }
 
-static int revoke_lease(int fd, struct local_drm_mode_revoke_lease *mrl)
+static int revoke_lease(int fd, struct drm_mode_revoke_lease *mrl)
 {
 	int err = 0;
 
-	if (igt_ioctl(fd, LOCAL_DRM_IOCTL_MODE_REVOKE_LEASE, mrl))
+	if (igt_ioctl(fd, DRM_IOCTL_MODE_REVOKE_LEASE, mrl))
 		err = -errno;
 	return err;
 }
 
-static int list_lessees(int fd, struct local_drm_mode_list_lessees *mll)
+static int list_lessees(int fd, struct drm_mode_list_lessees *mll)
 {
 	int err = 0;
 
-	if (igt_ioctl(fd, LOCAL_DRM_IOCTL_MODE_LIST_LESSEES, mll))
+	if (igt_ioctl(fd, DRM_IOCTL_MODE_LIST_LESSEES, mll))
 		err = -errno;
 	return err;
 }
 
-static int get_lease(int fd, struct local_drm_mode_get_lease *mgl)
+static int get_lease(int fd, struct drm_mode_get_lease *mgl)
 {
 	int err = 0;
 
-	if (igt_ioctl(fd, LOCAL_DRM_IOCTL_MODE_GET_LEASE, mgl))
+	if (igt_ioctl(fd, DRM_IOCTL_MODE_GET_LEASE, mgl))
 		err = -errno;
 	return err;
 }
@@ -242,7 +163,7 @@ static int get_lease(int fd, struct local_drm_mode_get_lease *mgl)
 static int make_lease(data_t *data, lease_t *lease)
 {
 	uint32_t object_ids[3];
-	struct local_drm_mode_create_lease mcl;
+	struct drm_mode_create_lease mcl;
 	int ret;
 
 	mcl.object_ids = (uint64_t) (uintptr_t) &object_ids[0];
@@ -293,6 +214,8 @@ static int paint_fb(int drm_fd, struct igt_fb *fb, const char *test_name,
 
 static void simple_lease(data_t *data)
 {
+	enum pipe pipe = data->pipe;
+
 	lease_t lease;
 
 	/* Create a valid lease */
@@ -301,11 +224,11 @@ static void simple_lease(data_t *data)
 	igt_display_require(&lease.display, lease.fd);
 
 	/* Set a mode on the leased output */
-	igt_assert_eq(0, prepare_crtc(&lease, data->connector_id, data->crtc_id));
+	igt_assert_eq(0, prepare_crtc(&lease, data));
 
 	/* Paint something attractive */
 	paint_fb(lease.fd, &lease.primary_fb, "simple_lease",
-		 lease.mode->name, igt_output_name(lease.output), kmstest_pipe_name(data->pipe));
+		 lease.mode->name, igt_output_name(lease.output), kmstest_pipe_name(pipe));
 	igt_debug_wait_for_keypress("lease");
 	cleanup_crtc(&lease,
 		     connector_id_to_output(&lease.display, data->connector_id));
@@ -313,15 +236,24 @@ static void simple_lease(data_t *data)
 	terminate_lease(&lease);
 }
 
+static void empty_lease(data_t *data)
+{
+	struct drm_mode_create_lease mcl = {0};
+
+	igt_assert_eq(create_lease(data->master.fd, &mcl), 0);
+
+	close(mcl.fd);
+}
+
 static void page_flip_implicit_plane(data_t *data)
 {
 	uint32_t object_ids[3];
-	struct local_drm_mode_create_lease mcl;
+	struct drm_mode_create_lease mcl;
 	drmModePlaneRes *plane_resources;
 	uint32_t wrong_plane_id = 0;
 	int i;
-	enum pipe pipe;
 	igt_display_t *display;
+	enum pipe pipe = data->pipe;
 
 	/* find a plane which isn't the primary one for us */
 	plane_resources = drmModeGetPlaneResources(data->master.fd);
@@ -346,7 +278,7 @@ static void page_flip_implicit_plane(data_t *data)
 	drmSetClientCap(data->master.fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 
 	/* Set a mode on the leased output */
-	igt_assert_eq(0, prepare_crtc(&data->master, data->connector_id, data->crtc_id));
+	igt_assert_eq(0, prepare_crtc(&data->master, data));
 
 	/* sanity check */
 	do_or_die(drmModePageFlip(data->master.fd, data->crtc_id,
@@ -354,7 +286,6 @@ static void page_flip_implicit_plane(data_t *data)
 			      0, NULL));
 
 	display = &data->master.display;
-	pipe = crtc_id_to_pipe(display, data->crtc_id);
 
 	igt_wait_for_vblank(data->master.fd,
 			display->pipes[pipe].crtc_offset);
@@ -366,8 +297,6 @@ static void page_flip_implicit_plane(data_t *data)
 
 	object_ids[mcl.object_count++] = wrong_plane_id;
 	do_or_die(create_lease(data->master.fd, &mcl));
-
-	pipe = crtc_id_to_pipe(display, data->crtc_id);
 
 	igt_wait_for_vblank(data->master.fd,
 			display->pipes[pipe].crtc_offset);
@@ -385,7 +314,7 @@ static void page_flip_implicit_plane(data_t *data)
 static void setcrtc_implicit_plane(data_t *data)
 {
 	uint32_t object_ids[3];
-	struct local_drm_mode_create_lease mcl;
+	struct drm_mode_create_lease mcl;
 	drmModePlaneRes *plane_resources;
 	uint32_t wrong_plane_id = 0;
 	igt_output_t *output =
@@ -417,7 +346,7 @@ static void setcrtc_implicit_plane(data_t *data)
 	drmSetClientCap(data->master.fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 
 	/* Set a mode on the leased output */
-	igt_assert_eq(0, prepare_crtc(&data->master, data->connector_id, data->crtc_id));
+	igt_assert_eq(0, prepare_crtc(&data->master, data));
 
 	/* sanity check */
 	do_or_die(drmModeSetCrtc(data->master.fd, data->crtc_id, -1,
@@ -444,7 +373,7 @@ static void setcrtc_implicit_plane(data_t *data)
 static void cursor_implicit_plane(data_t *data)
 {
 	uint32_t object_ids[3];
-	struct local_drm_mode_create_lease mcl;
+	struct drm_mode_create_lease mcl;
 
 	mcl.object_ids = (uint64_t) (uintptr_t) &object_ids[0];
 	mcl.object_count = 0;
@@ -458,7 +387,7 @@ static void cursor_implicit_plane(data_t *data)
 	drmSetClientCap(data->master.fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 
 	/* Set a mode on the leased output */
-	igt_assert_eq(0, prepare_crtc(&data->master, data->connector_id, data->crtc_id));
+	igt_assert_eq(0, prepare_crtc(&data->master, data));
 
 	/* sanity check */
 	do_or_die(drmModeSetCursor(data->master.fd, data->crtc_id, 0, 0, 0));
@@ -480,7 +409,7 @@ static void cursor_implicit_plane(data_t *data)
 static void atomic_implicit_crtc(data_t *data)
 {
 	uint32_t object_ids[3];
-	struct local_drm_mode_create_lease mcl;
+	struct drm_mode_create_lease mcl;
 	drmModeRes *resources;
 	drmModeObjectPropertiesPtr props;
 	uint32_t wrong_crtc_id = 0;
@@ -569,7 +498,7 @@ static void atomic_implicit_crtc(data_t *data)
 static void lessee_list(data_t *data)
 {
 	lease_t lease;
-	struct local_drm_mode_list_lessees mll;
+	struct drm_mode_list_lessees mll;
 	uint32_t lessees[1];
 
 	mll.pad = 0;
@@ -620,7 +549,7 @@ static void lessee_list(data_t *data)
 static void lease_get(data_t *data)
 {
 	lease_t lease;
-	struct local_drm_mode_get_lease mgl;
+	struct drm_mode_get_lease mgl;
 	int num_leased_obj = 3;
 	uint32_t objects[num_leased_obj];
 	int o;
@@ -696,8 +625,8 @@ static void lease_unleased_crtc(data_t *data)
 	for_each_pipe(&data->master.display, p) {
 		if (bad_crtc_id != 0)
 			break;
-		if (pipe_to_crtc_id(&data->master.display, p) != data->crtc_id)
-			bad_crtc_id = pipe_to_crtc_id(&data->master.display, p);
+		if (data->master.display.pipes[p].crtc_id != data->crtc_id)
+			bad_crtc_id = data->master.display.pipes[p].crtc_id;
 	}
 
 	/* Give up if there isn't another crtc */
@@ -762,7 +691,7 @@ static void lease_unleased_connector(data_t *data)
 static void lease_revoke(data_t *data)
 {
 	lease_t lease;
-	struct local_drm_mode_revoke_lease mrl;
+	struct drm_mode_revoke_lease mrl;
 	int ret;
 
 	/* Create a valid lease */
@@ -783,7 +712,7 @@ static void lease_revoke(data_t *data)
 	igt_assert_eq(revoke_lease(data->master.fd, &mrl), 0);
 
 	/* Try to use the leased objects */
-	ret = prepare_crtc(&lease, data->connector_id, data->crtc_id);
+	ret = prepare_crtc(&lease, data);
 
 	/* Ensure that the expected error is returned */
 	igt_assert_eq(ret, -ENOENT);
@@ -862,42 +791,6 @@ static void lease_invalid_plane(data_t *data)
 	assert_unleased(ret);
 }
 
-
-static void run_test(data_t *data, void (*testfunc)(data_t *))
-{
-	lease_t *master = &data->master;
-	igt_display_t *display = &master->display;
-	igt_output_t *output;
-	enum pipe p;
-	unsigned int valid_tests = 0;
-
-	for_each_pipe_with_valid_output(display, p, output) {
-		igt_info("Beginning %s on pipe %s, connector %s\n",
-			 igt_subtest_name(),
-			 kmstest_pipe_name(p),
-			 igt_output_name(output));
-
-		data->pipe = p;
-		data->crtc_id = pipe_to_crtc_id(display, p);
-		data->connector_id = output->id;
-		data->plane_id =
-			igt_pipe_get_plane_type(&data->master.display.pipes[data->pipe],
-						DRM_PLANE_TYPE_PRIMARY)->drm_plane->plane_id;
-
-		testfunc(data);
-
-		igt_info("\n%s on pipe %s, connector %s: PASSED\n\n",
-			 igt_subtest_name(),
-			 kmstest_pipe_name(p),
-			 igt_output_name(output));
-
-		valid_tests++;
-	}
-
-	igt_require_f(valid_tests,
-		      "no valid crtc/connector combinations found\n");
-}
-
 #define assert_double_id_err(ret) \
 	igt_assert_f((ret) == -EBUSY || (ret) == -ENOSPC, \
 		     "wrong return code %i, %s\n", ret, \
@@ -905,15 +798,9 @@ static void run_test(data_t *data, void (*testfunc)(data_t *))
 static void invalid_create_leases(data_t *data)
 {
 	uint32_t object_ids[4];
-	struct local_drm_mode_create_lease mcl;
+	struct drm_mode_create_lease mcl = {0};
 	drmModeRes *resources;
 	int tmp_fd, ret;
-
-	/* empty lease */
-	mcl.object_ids = 0;
-	mcl.object_count = 0;
-	mcl.flags = 0;
-	igt_assert_eq(create_lease(data->master.fd, &mcl), -EINVAL);
 
 	/* NULL array pointer */
 	mcl.object_count = 1;
@@ -1054,7 +941,7 @@ static void check_crtc_masks(int master_fd, int lease_fd, uint32_t crtc_mask)
 static void possible_crtcs_filtering(data_t *data)
 {
 	uint32_t *object_ids;
-	struct local_drm_mode_create_lease mcl;
+	struct drm_mode_create_lease mcl;
 	drmModeRes *resources;
 	drmModePlaneRes *plane_resources;
 	int i;
@@ -1109,7 +996,7 @@ static bool is_master(int fd)
 static int _create_simple_lease(int master_fd, data_t *data, int expected_ret)
 {
 	uint32_t object_ids[3];
-	struct local_drm_mode_create_lease mcl;
+	struct drm_mode_create_lease mcl;
 
 	object_ids[0] = data->master.display.pipes[0].crtc_id;
 	object_ids[1] = data->master.display.outputs[0].id;
@@ -1198,8 +1085,8 @@ static void multimaster_lease(data_t *data)
 static void implicit_plane_lease(data_t *data)
 {
 	uint32_t object_ids[3];
-	struct local_drm_mode_create_lease mcl;
-	struct local_drm_mode_get_lease mgl;
+	struct drm_mode_create_lease mcl;
+	struct drm_mode_get_lease mgl;
 	int ret;
 	uint32_t cursor_id = igt_pipe_get_plane_type(&data->master.display.pipes[0],
 						     DRM_PLANE_TYPE_CURSOR)->drm_plane->plane_id;
@@ -1247,7 +1134,7 @@ static void implicit_plane_lease(data_t *data)
 static void lease_uevent(data_t *data)
 {
 	int lease_fd;
-	struct local_drm_mode_list_lessees mll;
+	struct drm_mode_list_lessees mll;
 	struct udev_monitor *uevent_monitor;
 
 	uevent_monitor = igt_watch_uevents();
@@ -1278,65 +1165,104 @@ static void lease_uevent(data_t *data)
 igt_main
 {
 	data_t data;
-	const struct {
-		const char *name;
-		void (*func)(data_t *);
-	} funcs[] = {
-		{ "simple_lease", simple_lease },
-		{ "lessee_list", lessee_list },
-		{ "lease_get", lease_get },
-		{ "lease_unleased_connector", lease_unleased_connector },
-		{ "lease_unleased_crtc", lease_unleased_crtc },
-		{ "lease_revoke", lease_revoke },
-		{ "lease_again", lease_again },
-		{ "lease_invalid_connector", lease_invalid_connector },
-		{ "lease_invalid_crtc", lease_invalid_crtc },
-		{ "lease_invalid_plane", lease_invalid_plane },
-		{ "page_flip_implicit_plane", page_flip_implicit_plane },
-		{ "setcrtc_implicit_plane", setcrtc_implicit_plane },
-		{ "cursor_implicit_plane", cursor_implicit_plane },
-		{ "atomic_implicit_crtc", atomic_implicit_crtc },
-		{ }
-	}, *f;
+	igt_output_t *output;
+	igt_display_t *display = &data.master.display;
 
 	igt_fixture {
 		data.master.fd = drm_open_driver_master(DRIVER_ANY);
 		kmstest_set_vt_graphics_mode();
-		igt_display_require(&data.master.display, data.master.fd);
+		igt_display_require(display, data.master.fd);
 	}
 
-	for (f = funcs; f->name; f++) {
+	//Display dependent subtests
+	igt_subtest_group {
 
-		igt_subtest_f("%s", f->name) {
-			run_test(&data, f->func);
+		const struct {
+			const char *name;
+			void (*func)(data_t *);
+			const char *desc;
+		} funcs[] = {
+			{ "simple_lease", simple_lease, "Check if create lease ioctl call works" },
+			{ "empty_lease", empty_lease, "Check that creating an empty lease works" },
+			{ "lessee_list", lessee_list, "Check if listed lease is same as created one" },
+			{ "lease_get", lease_get, "Tests getting the required contents of a lease" },
+			{ "lease_unleased_connector", lease_unleased_connector, "Negative test by trying to"
+				" use an unleased connector " },
+			{ "lease_unleased_crtc", lease_unleased_crtc, "Negative test by trying to use an unleased crtc" },
+			{ "lease_revoke", lease_revoke, "Tests revocation of lease" },
+			{ "lease_again", lease_again, "Tests leasing objects more than once" },
+			{ "lease_invalid_connector", lease_invalid_connector, "Tests leasing an invalid connector" },
+			{ "lease_invalid_crtc", lease_invalid_crtc, "Tests leasing an invalid crtc" },
+			{ "lease_invalid_plane", lease_invalid_plane, "Tests leasing an invalid plane" },
+			{ "page_flip_implicit_plane", page_flip_implicit_plane, "Negative test by using a "
+				"non-primary plane with the page flip ioctl" },
+			{ "setcrtc_implicit_plane", setcrtc_implicit_plane, "Negative test by using a "
+				"non-primary plane with the setcrtc ioctl" },
+			{ "cursor_implicit_plane", cursor_implicit_plane, "Negative test by using a non-primary"
+				" plane with setcursor ioctl" },
+			{ "atomic_implicit_crtc", atomic_implicit_crtc, "Negative test by using a different"
+				" crtc with atomic ioctl" },
+			{ }
+		}, *f;
+
+		igt_fixture
+			igt_display_require_output(display);
+
+		for (f = funcs; f->name; f++) {
+
+			igt_describe(f->desc);
+			igt_subtest_with_dynamic_f("%s", f->name) {
+				for_each_pipe_with_valid_output(display, data.pipe, output) {
+					igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(data.pipe),
+						      igt_output_name(output)) {
+						igt_display_reset(display);
+						igt_display_commit(display);
+						data.crtc_id = display->pipes[data.pipe].crtc_id;
+						data.connector_id = output->id;
+						data.plane_id =
+							igt_pipe_get_plane_type(&data.master.display.pipes[data.pipe],
+									DRM_PLANE_TYPE_PRIMARY)->drm_plane->plane_id;
+						f->func(&data);
+					}
+				}
+			}
 		}
 	}
 
-	igt_describe("Tests error handling while creating invalid corner-cases for "
-		     "create-lease ioctl");
-	igt_subtest("invalid-create-leases")
-		invalid_create_leases(&data);
+	//Display independent subtests
+	igt_subtest_group {
 
-	igt_describe("Tests that  possible_crtcs logically match between master and "
-		     "lease, and that the values are correctly renumbered on the lease side.");
-	igt_subtest("possible-crtcs-filtering")
-		possible_crtcs_filtering(&data);
+		igt_describe("Tests error handling while creating invalid corner-cases for "
+			     "create-lease ioctl");
+		igt_subtest("invalid-create-leases")
+			invalid_create_leases(&data);
 
-	igt_describe("Tests the drop/set_master interactions.");
-	igt_subtest("master-vs-lease")
-		master_vs_lease(&data);
+		igt_describe("Tests that  possible_crtcs logically match between master and "
+			     "lease, and that the values are correctly renumbered on the lease side.");
+		igt_subtest("possible-crtcs-filtering")
+			possible_crtcs_filtering(&data);
 
-	igt_describe("Tests that the 2nd master can only create leases while being active "
-		     "master, and that leases on the first master don't prevent lease creation "
-		     "for the 2nd master.");
-	igt_subtest("multimaster-lease")
-		multimaster_lease(&data);
+		igt_describe("Tests the drop/set_master interactions.");
+		igt_subtest("master-vs-lease")
+			master_vs_lease(&data);
 
-	igt_describe("Tests the implicitly added planes.");
-	igt_subtest("implicit-plane-lease")
-		implicit_plane_lease(&data);
+		igt_describe("Tests that the 2nd master can only create leases while being active "
+			     "master, and that leases on the first master don't prevent lease creation "
+			     "for the 2nd master.");
+		igt_subtest("multimaster-lease")
+			multimaster_lease(&data);
 
-	igt_describe("Tests all the uevent cases");
-	igt_subtest("lease-uevent")
-		lease_uevent(&data);
+		igt_describe("Tests the implicitly added planes.");
+		igt_subtest("implicit-plane-lease")
+			implicit_plane_lease(&data);
+
+		igt_describe("Tests all the uevent cases");
+		igt_subtest("lease-uevent")
+			lease_uevent(&data);
+	}
+
+	igt_fixture {
+		igt_display_fini(display);
+		close(data.master.fd);
+	}
 }

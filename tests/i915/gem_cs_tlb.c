@@ -50,6 +50,7 @@
 #include <drm.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 
 IGT_TEST_DESCRIPTION("Check whether we correctly invalidate the cs tlb.");
@@ -90,7 +91,8 @@ mmap_coherent(int fd, uint32_t handle, int size)
 	return ptr;
 }
 
-static void run_on_ring(int fd, unsigned ring_id, const char *ring_name)
+static void run_on_ring(int fd, const intel_ctx_t *ctx,
+			unsigned ring_id, const char *ring_name)
 {
 	struct drm_i915_gem_execbuffer2 execbuf;
 	struct drm_i915_gem_exec_object2 execobj;
@@ -100,7 +102,6 @@ static void run_on_ring(int fd, unsigned ring_id, const char *ring_name)
 	} obj[2];
 	unsigned i;
 
-	gem_require_ring(fd, ring_id);
 	igt_require(has_softpin(fd));
 
 	for (i = 0; i < 2; i++) {
@@ -116,6 +117,7 @@ static void run_on_ring(int fd, unsigned ring_id, const char *ring_name)
 	memset(&execbuf, 0, sizeof(execbuf));
 	execbuf.buffers_ptr = to_user_pointer(&execobj);
 	execbuf.buffer_count = 1;
+	execbuf.rsvd1 = ctx->id;
 	execbuf.flags = ring_id;
 
 	/* Execute once to allocate a gtt-offset */
@@ -143,17 +145,19 @@ static void run_on_ring(int fd, unsigned ring_id, const char *ring_name)
 igt_main
 {
 	const struct intel_execution_engine2 *e;
+	const intel_ctx_t *ctx;
 	int fd = -1;
 
 	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
 		igt_require_gem(fd);
+		ctx = intel_ctx_create_all_physical(fd);
 	}
 
 	igt_subtest_with_dynamic("engines") {
-		__for_each_physical_engine(fd, e) {
+		for_each_ctx_engine(fd, ctx, e) {
 			igt_dynamic_f("%s", e->name)
-				run_on_ring(fd, e->flags, e->name);
+				run_on_ring(fd, ctx, e->flags, e->name);
 		}
 	}
 

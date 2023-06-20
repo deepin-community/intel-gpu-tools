@@ -45,7 +45,7 @@
 #include "intel_chipset.h"
 #include "intel_reg.h"
 #include "igt_stats.h"
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_mman.h"
 
 #define ENGINE_FLAGS  (I915_EXEC_RING_MASK | I915_EXEC_BSD_MASK)
@@ -114,13 +114,10 @@ static int sync_merge(int fd1, int fd2)
 
 static uint32_t __syncobj_create(int fd)
 {
-	struct local_syncobj_create {
-		uint32_t handle, flags;
-	} arg;
-#define LOCAL_IOCTL_SYNCOBJ_CREATE        DRM_IOWR(0xBF, struct local_syncobj_create)
+	struct drm_syncobj_create arg;
 
 	memset(&arg, 0, sizeof(arg));
-	ioctl(fd, LOCAL_IOCTL_SYNCOBJ_CREATE, &arg);
+	ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &arg);
 
 	return arg.handle;
 }
@@ -134,22 +131,10 @@ static uint32_t syncobj_create(int fd)
 	return ret;
 }
 
-#define LOCAL_SYNCOBJ_WAIT_FLAGS_WAIT_ALL (1 << 0)
-#define LOCAL_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT (1 << 1)
-struct local_syncobj_wait {
-       __u64 handles;
-       /* absolute timeout */
-       __s64 timeout_nsec;
-       __u32 count_handles;
-       __u32 flags;
-       __u32 first_signaled; /* only valid when not waiting all */
-       __u32 pad;
-};
-#define LOCAL_IOCTL_SYNCOBJ_WAIT	DRM_IOWR(0xC3, struct local_syncobj_wait)
-static int __syncobj_wait(int fd, struct local_syncobj_wait *args)
+static int __syncobj_wait(int fd, struct drm_syncobj_wait *args)
 {
 	int err = 0;
-	if (drmIoctl(fd, LOCAL_IOCTL_SYNCOBJ_WAIT, args))
+	if (drmIoctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, args))
 		err = -errno;
 	return err;
 }
@@ -288,7 +273,7 @@ static int loop(unsigned ring, int reps, int ncpus, unsigned flags)
 					for (int inner = 0; inner < 1024; inner++)
 						poll(&pfd, 1, 0);
 				} else if (flags & SYNCOBJ) {
-					struct local_syncobj_wait arg = {
+					struct drm_syncobj_wait arg = {
 						.handles = to_user_pointer(&syncobj.handle),
 						.count_handles = 1,
 					};

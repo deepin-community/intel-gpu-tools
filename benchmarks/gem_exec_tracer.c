@@ -41,6 +41,10 @@
 #include "intel_aub.h"
 #include "intel_chipset.h"
 
+#ifdef __FreeBSD__
+#include "igt_freebsd.h"
+#endif
+
 static int (*libc_close)(int fd);
 static int (*libc_ioctl)(int fd, unsigned long request, void *argp);
 
@@ -266,9 +270,6 @@ static int is_i915(int fd)
 	return strcmp(name, "i915") == 0;
 }
 
-#define LOCAL_IOCTL_I915_GEM_EXECBUFFER2_WR \
-    DRM_IOWR(DRM_COMMAND_BASE + DRM_I915_GEM_EXECBUFFER2, struct drm_i915_gem_execbuffer2)
-
 int
 ioctl(int fd, unsigned long request, ...)
 {
@@ -327,7 +328,7 @@ ioctl(int fd, unsigned long request, ...)
 
 	switch (request) {
 	case DRM_IOCTL_I915_GEM_EXECBUFFER2:
-	case LOCAL_IOCTL_I915_GEM_EXECBUFFER2_WR:
+	case DRM_IOCTL_I915_GEM_EXECBUFFER2_WR:
 		trace_exec(t, argp);
 		break;
 

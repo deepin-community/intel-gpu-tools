@@ -34,19 +34,22 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 # include <sys/syscall.h>
 #endif
 
 #include <i915/gem_submission.h>
+
+#include "igt_core.h"
+#include "igt_os.h"
 
 /* signal interrupt helpers */
 #ifdef __linux__
 # ifndef HAVE_GETTID
 #  define gettid() (pid_t)(syscall(__NR_gettid))
 # endif
+# define sigev_notify_thread_id _sigev_un._tid
 #endif
-#define sigev_notify_thread_id _sigev_un._tid
 
 /* auxialiary igt helpers from igt_aux.c */
 /* generally useful helpers */
@@ -132,13 +135,19 @@ bool igt_aub_dump_enabled(void);
 
 /**
  *  igt_suspend_state:
- *  @SUSPEND_STATE_FREEZE: suspend-to-idle target state, aka S0ix or freeze,
+ *  @SUSPEND_STATE_FREEZE: Suspend-To-Idle target state, aka S0ix or freeze,
  *			   first non-hibernation state
- *  @SUSPEND_STATE_STANDBY: standby target state, aka S1, second
+ *  @SUSPEND_STATE_STANDBY: "Power-On Suspend" target state, aka S1, second
  *			    non-hibernation state
- *  @SUSPEND_STATE_MEM: suspend-to-mem target state aka S3, third
- *			non-hibernation state
- *  @SUSPEND_STATE_DISK: suspend-to-disk target state, aka S4 or hibernation
+ *  @SUSPEND_STATE_S3: Suspend-To-RAM: It enforces a "deep" state to mem_sleep,
+ *		       what forces the system to go to the third
+ *		       non-hibernation state, aka S3.
+ *  @SUSPEND_STATE_MEM: A memory sleep (non-hibernation) target state,
+ *			respecting the system's mem_sleep default:
+ *				s2idle: Suspend-To-Idle target state
+ *				shallow: "Power-On Suspend"
+ *				deep: Suspend-To-RAM
+ *  @SUSPEND_STATE_DISK: Suspend-To-Disk target state, aka S4 or hibernation
  *
  *  Target suspend states used with igt_system_suspend_autoresume().
  *  See /sys/power/state for the available states on a given machine.
@@ -146,7 +155,8 @@ bool igt_aub_dump_enabled(void);
 enum igt_suspend_state {
 	SUSPEND_STATE_FREEZE,
 	SUSPEND_STATE_STANDBY,
-	SUSPEND_STATE_MEM,
+	SUSPEND_STATE_S3, /* Forces Suspend-to-Ram (S3) */
+	SUSPEND_STATE_MEM, /* Respects system default */
 	SUSPEND_STATE_DISK,
 
 	/*< private >*/
@@ -184,6 +194,23 @@ enum igt_suspend_test {
 	SUSPEND_TEST_NUM,
 };
 
+/**
+ * igt_mem_sleep:
+ * @MEM_SLEEP_NONE: no support
+ * @MEM_SLEEP_S2IDLE: suspend-to-idle target state, aka S0ix or freeze,
+ * @MEM_SLEEP_SHALLOW: standby target state, aka S1
+ * @MEM_SLEEP_DEEP: suspend-to-mem target state aka S3
+ */
+enum igt_mem_sleep {
+	MEM_SLEEP_NONE,
+	MEM_SLEEP_S2IDLE,
+	MEM_SLEEP_SHALLOW,
+	MEM_SLEEP_DEEP,
+
+	/*<private>*/
+	MEM_SLEEP_NUM,
+};
+
 void igt_system_suspend_autoresume(enum igt_suspend_state state,
 				   enum igt_suspend_test test);
 void igt_set_autoresume_delay(int delay_secs);
@@ -193,45 +220,44 @@ int igt_get_autoresume_delay(enum igt_suspend_state state);
 void igt_drop_root(void);
 
 void igt_debug_wait_for_keypress(const char *var);
-void igt_debug_manual_check(const char *var, const char *expected);
+void igt_debug_interactive_mode_check(const char *var, const char *expected);
 
-/* sysinfo cross-arch wrappers from intel_os.c */
+#define __typecheck(x, y) \
+        (!!(sizeof((typeof(x) *)1 == (typeof(y) *)1)))
 
-/* These are separate to allow easier testing when porting, see the comment at
- * the bottom of intel_os.c. */
-void intel_purge_vm_caches(int fd);
-uint64_t intel_get_avail_ram_mb(void);
-uint64_t intel_get_total_ram_mb(void);
-uint64_t intel_get_total_swap_mb(void);
-void *intel_get_total_pinnable_mem(size_t *pinned);
+#define __cmp(x, y, op) ((x) op (y) ? (x) : (y))
 
-int __intel_check_memory(uint64_t count, uint64_t size, unsigned mode,
-			 uint64_t *out_required, uint64_t *out_total);
-void intel_require_memory(uint64_t count, uint64_t size, unsigned mode);
-void intel_require_files(uint64_t count);
-#define CHECK_RAM 0x1
-#define CHECK_SWAP 0x2
-
-#define min(a, b) ({			\
-	typeof(a) _a = (a);		\
-	typeof(b) _b = (b);		\
-	_a < _b ? _a : _b;		\
-})
-#define max(a, b) ({			\
-	typeof(a) _a = (a);		\
-	typeof(b) _b = (b);		\
-	_a > _b ? _a : _b;		\
+#define __cmp_once(x, y, unique_x, unique_y, op) ({     \
+	typeof(x) unique_x = (x);               \
+	typeof(y) unique_y = (y);               \
+	__cmp(unique_x, unique_y, op);		\
 })
 
-#define clamp(x, min, max) ({		\
-	typeof(min) _min = (min);	\
-	typeof(max) _max = (max);	\
-	typeof(x) _x = (x);		\
-	_x < _min ? _min : _x > _max ? _max : _x;	\
-})
+#define __is_constexpr(x) \
+	(sizeof(int) == sizeof(*(8 ? ((void *)((long)(x) * 0l)) : (int *)8)))
+
+#define __no_side_effects(x, y) \
+	(__is_constexpr(x) && __is_constexpr(y))
+
+#define __safe_cmp(x, y) \
+	(__typecheck(x, y) && __no_side_effects(x, y))
+
+#define __careful_cmp(x, y, op, prefix) \
+	__builtin_choose_expr(__safe_cmp(x, y), \
+			      __cmp(x, y, op), \
+			      __cmp_once(x, y, igt_unique(igt_tokencat(prefix, __x)), igt_unique(igt_tokencat(prefix, __y)), op))
+
+#define min(x, y)	__careful_cmp(x, y, <, min)
+#define max(x, y)	__careful_cmp(x, y, >, max)
+
+#define clamp(val, lo, hi) min(max(val, lo), hi)
+
+#define min_t(t, x, y)	__careful_cmp((typeof(t))x, (typeof(t))y, <, min_t)
+#define max_t(t, x, y)	__careful_cmp((typeof(t))x, (typeof(t))y, >, max_t)
 
 #define igt_swap(a, b) do {	\
 	typeof(a) _tmp = (a);	\
+	_Static_assert(__typecheck(a, b), "type mismatch for swap"); \
 	(a) = (b);		\
 	(b) = _tmp;		\
 } while (0)
@@ -288,6 +314,9 @@ bool igt_allow_unlimited_files(void);
 int igt_is_process_running(const char *comm);
 int igt_terminate_process(int sig, const char *comm);
 void igt_lsof(const char *dpath);
+int igt_lsof_kill_audio_processes(void);
+int pipewire_pulse_start_reserve(void);
+void pipewire_pulse_stop_reserve(void);
 
 #define igt_hweight(x) \
 	__builtin_choose_expr(sizeof(x) == 8, \
@@ -305,5 +334,7 @@ void igt_lsof(const char *dpath);
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 
 uint64_t vfs_file_max(void);
+
+void *igt_memdup(const void *ptr, size_t len);
 
 #endif /* IGT_AUX_H */

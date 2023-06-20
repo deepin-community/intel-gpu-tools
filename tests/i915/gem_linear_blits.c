@@ -45,7 +45,9 @@
 #include <drm.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
+#include "igt_types.h"
 
 IGT_TEST_DESCRIPTION("Test doing many blits with a working set larger than the"
 		     " aperture size.");
@@ -235,7 +237,7 @@ igt_main
 	const int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
 	uint64_t count = 0;
 	bool do_relocs;
-	int fd = -1;
+	igt_fd_t(fd);
 
 	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
@@ -251,15 +253,18 @@ igt_main
 
 		count = 3 + count / (1024*1024);
 		igt_require(count > 1);
-		intel_require_memory(count, sizeof(linear), CHECK_RAM);
+		igt_require_memory(count, sizeof(linear), CHECK_RAM);
 
 		igt_debug("Using %'"PRIu64" 1MiB buffers\n", count);
 		count = (count + ncpus - 1) / ncpus;
 	}
 
+	igt_describe("Basic blitter functionality check with 2 buffers");
 	igt_subtest("basic")
 		run_test(fd, 2, do_relocs);
 
+	igt_describe("The intent is to push beyond the working GTT size to force"
+			" the driver to rebind the buffers");
 	igt_subtest("normal") {
 		intel_allocator_multiprocess_start();
 		igt_fork(child, ncpus)
@@ -268,6 +273,7 @@ igt_main
 		intel_allocator_multiprocess_stop();
 	}
 
+	igt_describe("Test with interrupts in between the parent process");
 	igt_subtest("interruptible") {
 		intel_allocator_multiprocess_start();
 		igt_fork_signal_helper();

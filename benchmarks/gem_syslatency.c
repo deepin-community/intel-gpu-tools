@@ -42,12 +42,17 @@
 #include <limits.h>
 #include "drm.h"
 
+#ifdef __linux__
 #include <linux/unistd.h>
+#endif
 
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_ring.h"
+#include "igt_aux.h"
 
-#define sigev_notify_thread_id _sigev_un._tid
+#ifdef __FreeBSD__
+#include "igt_freebsd.h"
+#endif
 
 static volatile int done;
 

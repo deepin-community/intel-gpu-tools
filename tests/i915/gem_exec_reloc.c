@@ -25,6 +25,7 @@
 #include <sys/ioctl.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_device.h"
 #include "igt_dummyload.h"
@@ -133,7 +134,7 @@ static void from_mmap(int fd, uint64_t size, enum mode mode)
 	/* Worst case is that the kernel has to copy the entire incoming
 	 * reloc[], so double the memory requirements.
 	 */
-	intel_require_memory(2, size, CHECK_RAM);
+	igt_require_memory(2, size, CHECK_RAM);
 
 	memset(&obj, 0, sizeof(obj));
 	obj.handle = gem_create(fd, 4096);
@@ -266,7 +267,7 @@ static void check_bo(int fd, uint32_t handle)
 	munmap(map, 4096);
 }
 
-static void active(int fd, unsigned engine)
+static void active(int fd, const intel_ctx_t *ctx, unsigned engine)
 {
 	const unsigned int gen = intel_gen(intel_get_drm_devid(fd));
 	struct drm_i915_gem_relocation_entry reloc;
@@ -280,7 +281,7 @@ static void active(int fd, unsigned engine)
 	if (engine == ALL_ENGINES) {
 		const struct intel_execution_engine2 *e;
 
-		__for_each_physical_engine(fd, e) {
+		for_each_ctx_engine(fd, ctx, e) {
 			if (gem_class_can_store_dword(fd, e->class))
 				engines[nengine++] = e->flags;
 		}
@@ -308,6 +309,7 @@ static void active(int fd, unsigned engine)
 	execbuf.buffer_count = 2;
 	if (gen < 6)
 		execbuf.flags |= I915_EXEC_SECURE;
+	execbuf.rsvd1 = ctx->id;
 
 	for (pass = 0; pass < 1024; pass++) {
 		uint32_t batch[16];
@@ -342,269 +344,6 @@ static void active(int fd, unsigned engine)
 
 	check_bo(fd, obj[0].handle);
 	gem_close(fd, obj[0].handle);
-}
-
-static uint64_t many_relocs(unsigned long count, unsigned long *out)
-{
-	struct drm_i915_gem_relocation_entry *reloc;
-	unsigned long sz;
-	int i;
-
-	sz = count * sizeof(*reloc);
-	sz = ALIGN(sz, 4096);
-
-	reloc = mmap(0, sz, PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-	igt_assert(reloc != MAP_FAILED);
-	for (i = 0; i < count; i++) {
-		reloc[i].target_handle = 0;
-		reloc[i].presumed_offset = ~0ull;
-		reloc[i].offset = 8 * i;
-		reloc[i].delta = 8 * i;
-	}
-	mprotect(reloc, sz, PROT_READ);
-
-	*out = sz;
-	return to_user_pointer(reloc);
-}
-
-static void __many_active(int i915, unsigned engine, unsigned long count)
-{
-	unsigned long reloc_sz;
-	struct drm_i915_gem_exec_object2 obj[2] = {{
-		.handle = gem_create(i915, count * sizeof(uint64_t)),
-		.relocs_ptr = many_relocs(count, &reloc_sz),
-		.relocation_count = count,
-	}};
-	struct drm_i915_gem_execbuffer2 execbuf = {
-		.buffers_ptr = to_user_pointer(obj),
-		.buffer_count = ARRAY_SIZE(obj),
-		.flags = engine | I915_EXEC_HANDLE_LUT,
-	};
-	igt_spin_t *spin;
-
-	spin = __igt_spin_new(i915,
-			      .engine = engine,
-			      .dependency = obj[0].handle,
-			      .flags = (IGT_SPIN_FENCE_OUT |
-					IGT_SPIN_NO_PREEMPTION));
-	obj[1] = spin->obj[1];
-	gem_execbuf(i915, &execbuf);
-	igt_assert_eq(sync_fence_status(spin->out_fence), 0);
-	igt_spin_free(i915, spin);
-
-	for (unsigned long i = 0; i < count; i++) {
-		uint64_t addr;
-
-		gem_read(i915, obj[0].handle, i * sizeof(addr),
-			 &addr, sizeof(addr));
-
-		igt_assert_eq_u64(addr, obj[0].offset + i * sizeof(addr));
-	}
-
-	munmap(from_user_pointer(obj[0].relocs_ptr), reloc_sz);
-	gem_close(i915, obj[0].handle);
-}
-
-static void many_active(int i915, unsigned engine)
-{
-	const uint64_t max = 2048;
-	unsigned long count = 256;
-
-	igt_until_timeout(2) {
-		uint64_t required, total;
-
-		if (!__intel_check_memory(1, 8 * count, CHECK_RAM,
-					  &required, &total))
-			break;
-
-		igt_debug("Testing count:%lu\n", count);
-		__many_active(i915, engine, count);
-
-		count <<= 1;
-		if (count >= max)
-			break;
-	}
-}
-
-static void __wide_active(int i915, unsigned engine, unsigned long count)
-{
-	struct drm_i915_gem_relocation_entry *reloc =
-		calloc(count, sizeof(*reloc));
-	struct drm_i915_gem_exec_object2 *obj =
-		calloc(count + 1, sizeof(*obj));
-	struct drm_i915_gem_execbuffer2 execbuf = {
-		.buffers_ptr = to_user_pointer(obj),
-		.buffer_count = count + 1,
-		.flags = engine | I915_EXEC_HANDLE_LUT,
-	};
-	igt_spin_t *spin;
-
-	for (unsigned long i = 0; i < count; i++) {
-		obj[i].handle = gem_create(i915, 4096);
-		obj[i].flags = EXEC_OBJECT_WRITE;
-		obj[i].flags |= EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
-	}
-
-	spin = __igt_spin_new(i915,
-			      .engine = engine,
-			      .flags = (IGT_SPIN_FENCE_OUT |
-					IGT_SPIN_NO_PREEMPTION));
-	obj[count] = spin->obj[1];
-	gem_execbuf(i915, &execbuf); /* mark all the objects as active */
-
-	for (unsigned long i = 0; i < count; i++) {
-		reloc[i].target_handle = i;
-		reloc[i].presumed_offset = ~0ull;
-		obj[i].relocs_ptr = to_user_pointer(&reloc[i]);
-		obj[i].relocation_count = 1;
-	}
-	gem_execbuf(i915, &execbuf); /* relocation onto active objects */
-
-	igt_assert_eq(sync_fence_status(spin->out_fence), 0);
-	igt_spin_free(i915, spin);
-
-	for (unsigned long i = 0; i < count; i++) {
-		uint64_t addr;
-
-		gem_read(i915, obj[i].handle, 0, &addr, sizeof(addr));
-		igt_assert_eq_u64(addr, obj[i].offset);
-
-		gem_close(i915, obj[i].handle);
-	}
-	free(obj);
-	free(reloc);
-}
-
-static void wide_active(int i915, unsigned engine)
-{
-	const uint64_t max = gem_aperture_size(i915) / 4096 / 2;
-	unsigned long count = 256;
-
-	igt_until_timeout(2) {
-		uint64_t required, total;
-
-		if (!__intel_check_memory(count, 4096, CHECK_RAM,
-					  &required, &total))
-			break;
-
-		igt_debug("Testing count:%lu\n", count);
-		__wide_active(i915, engine, count);
-
-		count <<= 1;
-		if (count >= max)
-			break;
-	}
-}
-
-static unsigned int offset_in_page(void *addr)
-{
-	return (uintptr_t)addr & 4095;
-}
-
-static void active_spin(int fd, unsigned engine)
-{
-	const uint32_t bbe = MI_BATCH_BUFFER_END;
-	struct drm_i915_gem_relocation_entry reloc;
-	struct drm_i915_gem_exec_object2 obj[2];
-	struct drm_i915_gem_execbuffer2 execbuf;
-	igt_spin_t *spin;
-
-	spin = igt_spin_new(fd,
-			    .engine = engine,
-			    .flags = IGT_SPIN_NO_PREEMPTION);
-
-	memset(obj, 0, sizeof(obj));
-	obj[0] = spin->obj[IGT_SPIN_BATCH];
-	obj[0].relocs_ptr = to_user_pointer(&reloc);
-	obj[0].relocation_count = 1;
-	obj[1].handle = gem_create(fd, 4096);
-	gem_write(fd, obj[1].handle, 0, &bbe, sizeof(bbe));
-
-	memset(&reloc, 0, sizeof(reloc));
-	reloc.presumed_offset = -1;
-	reloc.offset = offset_in_page(spin->condition);
-	reloc.target_handle = obj[0].handle;
-
-	memset(&execbuf, 0, sizeof(execbuf));
-	execbuf.buffers_ptr = to_user_pointer(obj);
-	execbuf.buffer_count = 2;
-	execbuf.flags = engine;
-
-	gem_execbuf(fd, &execbuf);
-	gem_close(fd, obj[1].handle);
-	igt_assert_eq(*spin->condition, spin->cmd_precondition);
-
-	igt_spin_end(spin);
-	gem_sync(fd, spin->handle);
-
-	igt_assert_eq(*spin->condition, obj[0].offset);
-	igt_spin_free(fd, spin);
-}
-
-static void others_spin(int i915, unsigned engine)
-{
-	struct drm_i915_gem_relocation_entry reloc = {};
-	struct drm_i915_gem_exec_object2 obj = {
-		.relocs_ptr = to_user_pointer(&reloc),
-		.relocation_count = 1,
-	};
-	struct drm_i915_gem_execbuffer2 execbuf = {
-		.buffers_ptr = to_user_pointer(&obj),
-		.buffer_count = 1,
-		.flags = engine,
-	};
-	const struct intel_execution_engine2 *e;
-	igt_spin_t *spin = NULL;
-	uint64_t addr;
-	int fence;
-
-	__for_each_physical_engine(i915, e) {
-		if (e->flags == engine)
-			continue;
-
-		if (!spin) {
-			spin = igt_spin_new(i915,
-					    .engine = e->flags,
-					    .flags = IGT_SPIN_FENCE_OUT);
-			fence = dup(spin->out_fence);
-		} else {
-			int old_fence;
-
-			spin->execbuf.flags &= ~I915_EXEC_RING_MASK;
-			spin->execbuf.flags |= e->flags;
-			gem_execbuf_wr(i915, &spin->execbuf);
-
-			old_fence = fence;
-			fence = sync_fence_merge(old_fence,
-						 spin->execbuf.rsvd2 >> 32);
-			close(spin->execbuf.rsvd2 >> 32);
-			close(old_fence);
-		}
-	}
-	igt_require(spin);
-
-	/* All other engines are busy, let's relocate! */
-	obj.handle = batch_create(i915);
-	reloc.target_handle = obj.handle;
-	reloc.presumed_offset = -1;
-	reloc.offset = 64;
-	gem_execbuf(i915, &execbuf);
-
-	/* Verify the relocation took place */
-	gem_read(i915, obj.handle, 64, &addr, sizeof(addr));
-	igt_assert_eq_u64(addr, obj.offset);
-	gem_close(i915, obj.handle);
-
-	/* Even if the spinner was harmed in the process */
-	igt_spin_end(spin);
-	igt_assert_eq(sync_fence_wait(fence, 200), 0);
-	igt_assert_neq(sync_fence_status(fence), 0);
-	if (sync_fence_status(fence) < 0)
-		igt_warn("Spinner was cancelled, %s\n",
-			 strerror(-sync_fence_status(fence)));
-	close(fence);
-
-	igt_spin_free(i915, spin);
 }
 
 static bool has_64b_reloc(int fd)
@@ -939,145 +678,6 @@ static void basic_softpin(int fd)
 	gem_close(fd, obj[1].handle);
 }
 
-static struct drm_i915_gem_relocation_entry *
-parallel_relocs(int count, unsigned long *out)
-{
-	struct drm_i915_gem_relocation_entry *reloc;
-	unsigned long sz;
-	int i;
-
-	sz = count * sizeof(*reloc);
-	sz = ALIGN(sz, 4096);
-
-	reloc = mmap(0, sz, PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-	igt_assert(reloc != MAP_FAILED);
-	for (i = 0; i < count; i++) {
-		reloc[i].target_handle = 0;
-		reloc[i].presumed_offset = ~0ull;
-		reloc[i].offset = 8 * i;
-		reloc[i].delta = i;
-		reloc[i].read_domains = I915_GEM_DOMAIN_INSTRUCTION;
-		reloc[i].write_domain = 0;
-	}
-	mprotect(reloc, sz, PROT_READ);
-
-	*out = sz;
-	return reloc;
-}
-
-static int __execbuf(int i915, struct drm_i915_gem_execbuffer2 *execbuf)
-{
-	int err;
-
-	err = 0;
-	if (ioctl(i915, DRM_IOCTL_I915_GEM_EXECBUFFER2, execbuf)) {
-		err = -errno;
-		igt_assume(err);
-	}
-
-	errno = 0;
-	return err;
-}
-
-static int stop;
-static void sighandler(int sig)
-{
-	stop = 1;
-}
-
-static void parallel_child(int i915,
-			   const struct intel_execution_engine2 *engine,
-			   struct drm_i915_gem_relocation_entry *reloc,
-			   uint32_t common)
-{
-	igt_spin_t *spin = __igt_spin_new(i915, .engine = engine->flags);
-	struct drm_i915_gem_exec_object2 reloc_target = {
-		.handle = gem_create(i915, 32 * 1024 * 8),
-		.relocation_count = 32 * 1024,
-		.relocs_ptr = to_user_pointer(reloc),
-	};
-	struct drm_i915_gem_exec_object2 obj[3] = {
-		reloc_target,
-		{ .handle = common },
-		spin->obj[1],
-	};
-	struct drm_i915_gem_execbuffer2 execbuf = {
-		.buffers_ptr = to_user_pointer(obj),
-		.buffer_count = ARRAY_SIZE(obj),
-		.flags = engine->flags | I915_EXEC_HANDLE_LUT,
-	};
-	struct sigaction act = {
-		.sa_handler = sighandler,
-	};
-	unsigned long count = 0;
-
-	sigaction(SIGINT, &act, NULL);
-	while (!READ_ONCE(stop)) {
-		int err = __execbuf(i915, &execbuf);
-		if (err == -EINTR)
-			break;
-
-		igt_assert_eq(err, 0);
-		count++;
-	}
-
-	igt_info("%s: count %lu\n", engine->name, count);
-	igt_spin_free(i915, spin);
-}
-
-static void kill_children(int sig)
-{
-	signal(sig, SIG_IGN);
-	kill(-getpgrp(), SIGINT);
-	signal(sig, SIG_DFL);
-}
-
-static void parallel(int i915)
-{
-	const struct intel_execution_engine2 *e;
-	struct drm_i915_gem_relocation_entry *reloc;
-	uint32_t common = gem_create(i915, 4096);
-	uint32_t batch = batch_create(i915);
-	unsigned long reloc_sz;
-
-	reloc = parallel_relocs(32 * 1024, &reloc_sz);
-
-	stop = 0;
-	__for_each_physical_engine(i915, e) {
-		igt_fork(child, 1)
-			parallel_child(i915, e, reloc, common);
-	}
-	sleep(2);
-
-	if (gem_scheduler_has_preemption(i915)) {
-		uint32_t ctx = gem_context_clone_with_engines(i915, 0);
-
-		__for_each_physical_engine(i915, e) {
-			struct drm_i915_gem_exec_object2 obj[2] = {
-				{ .handle = common },
-				{ .handle = batch },
-			};
-			struct drm_i915_gem_execbuffer2 execbuf = {
-				.buffers_ptr = to_user_pointer(obj),
-				.buffer_count = ARRAY_SIZE(obj),
-				.flags = e->flags,
-				.rsvd1 = ctx,
-			};
-			gem_execbuf(i915, &execbuf);
-		}
-
-		gem_context_destroy(i915, ctx);
-	}
-	gem_sync(i915, batch);
-	gem_close(i915, batch);
-
-	kill_children(SIGINT);
-	igt_waitchildren();
-
-	gem_close(i915, common);
-	munmap(reloc, reloc_sz);
-}
-
 #define CONCURRENT 1024
 
 static uint64_t concurrent_relocs(int i915, int idx, int count)
@@ -1120,7 +720,7 @@ static void xchg_u32(void *array, unsigned i, unsigned j)
 	u32[j] = tmp;
 }
 
-static void concurrent_child(int i915,
+static void concurrent_child(int i915, const intel_ctx_t *ctx,
 			     const struct intel_execution_engine2 *e,
 			     uint32_t *common, int num_common,
 			     int in, int out)
@@ -1133,6 +733,7 @@ static void concurrent_child(int i915,
 		.buffers_ptr = to_user_pointer(obj),
 		.buffer_count = ARRAY_SIZE(obj),
 		.flags = e->flags | I915_EXEC_HANDLE_LUT | (gen < 6 ? I915_EXEC_SECURE : 0),
+		.rsvd1 = ctx->id,
 	};
 	uint32_t *batch = &obj[num_common + 1].handle;
 	unsigned long count = 0;
@@ -1213,7 +814,7 @@ static uint32_t create_concurrent_batch(int i915, unsigned int count)
 	return handle;
 }
 
-static void concurrent(int i915, int num_common)
+static void concurrent(int i915, const intel_ctx_t *ctx, int num_common)
 {
 	const struct intel_execution_engine2 *e;
 	int in[2], out[2];
@@ -1239,12 +840,12 @@ static void concurrent(int i915, int num_common)
 		common[n] = gem_create(i915, 4 * 4 * CONCURRENT);
 
 	nchild = 0;
-	__for_each_physical_engine(i915, e) {
+	for_each_ctx_engine(i915, ctx, e) {
 		if (!gem_class_can_store_dword(i915, e->class))
 			continue;
 
 		igt_fork(child, 1)
-			concurrent_child(i915, e,
+			concurrent_child(i915, ctx, e,
 					 common, num_common,
 					 in[0], out[1]);
 
@@ -1296,7 +897,7 @@ pin_scanout(igt_display_t *dpy, igt_output_t *output, struct igt_fb *fb)
 
 	igt_create_pattern_fb(dpy->drm_fd, mode->hdisplay, mode->vdisplay,
 			      DRM_FORMAT_XRGB8888,
-			      LOCAL_I915_FORMAT_MOD_X_TILED, fb);
+			      I915_FORMAT_MOD_X_TILED, fb);
 
 	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
 	igt_plane_set_fb(primary, fb);
@@ -1308,6 +909,7 @@ pin_scanout(igt_display_t *dpy, igt_output_t *output, struct igt_fb *fb)
 
 static void scanout(int i915,
 		    igt_display_t *dpy,
+		    const intel_ctx_t *ctx,
 		    const struct intel_execution_engine2 *e)
 {
 	struct drm_i915_gem_relocation_entry reloc = {};
@@ -1318,6 +920,7 @@ static void scanout(int i915,
 		.buffers_ptr = to_user_pointer(obj),
 		.buffer_count = 2,
 		.flags = e->flags,
+		.rsvd1 = ctx->id,
 	};
 	igt_output_t *output;
 	struct igt_fb fb;
@@ -1437,6 +1040,7 @@ static void invalid_domains(int fd)
 
 igt_main
 {
+	const intel_ctx_t *ctx;
 	const struct intel_execution_engine2 *e;
 	const struct mode {
 		const char *name;
@@ -1480,6 +1084,7 @@ igt_main
 		igt_require_gem(fd);
 		/* Check if relocations supported by platform */
 		igt_require(gem_has_relocations(fd));
+		ctx = intel_ctx_create_all_physical(fd);
 	}
 
 	for (f = flags; f->name; f++) {
@@ -1540,53 +1145,22 @@ igt_main
 		from_gpu(fd);
 
 	igt_subtest_with_dynamic("basic-active") {
-		igt_dynamic("all")
-			active(fd, ALL_ENGINES);
+		igt_dynamic("all-engines")
+			active(fd, ctx, ALL_ENGINES);
 
-		__for_each_physical_engine(fd, e) {
+		for_each_ctx_engine(fd, ctx, e) {
 			if (!gem_class_can_store_dword(fd, e->class))
 				continue;
 
 			igt_dynamic_f("%s", e->name)
-				active(fd, e->flags);
+				active(fd, ctx, e->flags);
 		}
 	}
-
-	igt_subtest_with_dynamic("basic-spin") {
-		__for_each_physical_engine(fd, e) {
-			igt_dynamic_f("%s", e->name)
-				active_spin(fd, e->flags);
-		}
-	}
-
-	igt_subtest_with_dynamic("basic-spin-others") {
-		__for_each_physical_engine(fd, e) {
-			igt_dynamic_f("%s", e->name)
-				others_spin(fd, e->flags);
-		}
-	}
-
-	igt_subtest_with_dynamic("basic-many-active") {
-		__for_each_physical_engine(fd, e) {
-			igt_dynamic_f("%s", e->name)
-				many_active(fd, e->flags);
-		}
-	}
-
-	igt_subtest_with_dynamic("basic-wide-active") {
-		__for_each_physical_engine(fd, e) {
-			igt_dynamic_f("%s", e->name)
-				wide_active(fd, e->flags);
-		}
-	}
-
-	igt_subtest("basic-parallel")
-		parallel(fd);
 
 	igt_subtest("basic-concurrent0")
-		concurrent(fd, 0);
+		concurrent(fd, ctx, 0);
 	igt_subtest("basic-concurrent16")
-		concurrent(fd, 16);
+		concurrent(fd, ctx, 16);
 
 	igt_subtest("invalid-domains")
 		invalid_domains(fd);
@@ -1604,9 +1178,9 @@ igt_main
 		}
 
 		igt_subtest_with_dynamic("basic-scanout") {
-			__for_each_physical_engine(fd, e) {
+			for_each_ctx_engine(fd, ctx, e) {
 				igt_dynamic_f("%s", e->name)
-					scanout(fd, &display, e);
+					scanout(fd, &display, ctx, e);
 			}
 		}
 

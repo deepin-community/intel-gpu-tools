@@ -43,8 +43,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <termios.h>
+#include <sys/sysmacros.h>
 
 #include "igt_perf.h"
+#include "igt_drm_fdinfo.h"
 
 #define ARRAY_SIZE(arr) (sizeof(arr)/sizeof(arr[0]))
 
@@ -118,6 +120,8 @@ struct engines {
 	struct engine engine;
 
 };
+
+static struct termios termios_orig;
 
 __attribute__((format(scanf,3,4)))
 static int igt_sysfs_scanf(int dir, const char *attr, const char *fmt, ...)
@@ -309,7 +313,8 @@ static int engine_cmp(const void *__a, const void *__b)
 		return a->instance - b->instance;
 }
 
-#define is_igpu_pci(x) (strcmp(x, "0000:00:02.0") == 0)
+#define IGPU_PCI "0000:00:02.0"
+#define is_igpu_pci(x) (strcmp(x, IGPU_PCI) == 0)
 #define is_igpu(x) (strcmp(x, "i915") == 0)
 
 static struct engines *discover_engines(char *device)
@@ -376,6 +381,12 @@ static struct engines *discover_engines(char *device)
 			break;
 		}
 
+		/* Double check config is an engine config. */
+		if (engine->busy.config >= __I915_PMU_OTHER(0)) {
+			free((void *)engine->name);
+			continue;
+		}
+
 		engine->class = (engine->busy.config &
 				 (__I915_PMU_OTHER(0) - 1)) >>
 				I915_PMU_CLASS_SHIFT;
@@ -424,6 +435,36 @@ static struct engines *discover_engines(char *device)
 	engines->root = d;
 
 	return engines;
+}
+
+static void free_engines(struct engines *engines)
+{
+	struct pmu_counter **pmu, *free_list[] = {
+		&engines->r_gpu,
+		&engines->r_pkg,
+		&engines->imc_reads,
+		&engines->imc_writes,
+		NULL
+	};
+	unsigned int i;
+
+	for (pmu = &free_list[0]; *pmu; pmu++) {
+		if ((*pmu)->present)
+			free((char *)(*pmu)->units);
+	}
+
+	for (i = 0; i < engines->num_engines; i++) {
+		struct engine *engine = engine_ptr(engines, i);
+
+		free((char *)engine->name);
+		free((char *)engine->short_name);
+		free((char *)engine->display_name);
+	}
+
+	closedir(engines->root);
+
+	free(engines->class);
+	free(engines);
 }
 
 #define _open_pmu(type, cnt, pmu, fd) \
@@ -639,8 +680,6 @@ struct client {
 	struct clients *clients;
 
 	enum client_status status;
-	int sysfs_root;
-	int busy_root;
 	unsigned int id;
 	unsigned int pid;
 	char name[24];
@@ -648,7 +687,6 @@ struct client {
 	unsigned int samples;
 	unsigned long total_runtime;
 	unsigned long last_runtime;
-	struct engines *engines;
 	unsigned long *val;
 	uint64_t *last;
 };
@@ -660,7 +698,7 @@ struct clients {
 	unsigned int num_classes;
 	struct engine_class *class;
 
-	char sysfs_root[128];
+	char pci_slot[64];
 
 	struct client *client;
 };
@@ -669,12 +707,9 @@ struct clients {
 	for ((tmp) = (clients)->num_clients, c = (clients)->client; \
 	     (tmp > 0); (tmp)--, (c)++)
 
-static struct clients *init_clients(const char *drm_card)
+static struct clients *init_clients(const char *pci_slot)
 {
 	struct clients *clients;
-	const char *slash;
-	ssize_t ret;
-	int dir;
 
 	clients = malloc(sizeof(*clients));
 	if (!clients)
@@ -682,105 +717,9 @@ static struct clients *init_clients(const char *drm_card)
 
 	memset(clients, 0, sizeof(*clients));
 
-	if (drm_card) {
-		slash = rindex(drm_card, '/');
-		assert(slash);
-	} else {
-		slash = "card0";
-	}
-
-	ret = snprintf(clients->sysfs_root, sizeof(clients->sysfs_root),
-		       "/sys/class/drm/%s/clients/", slash);
-	assert(ret > 0 && ret < sizeof(clients->sysfs_root));
-
-	dir = open(clients->sysfs_root, O_DIRECTORY | O_RDONLY);
-	if (dir < 0) {
-		free(clients);
-		clients = NULL;
-	} else {
-		close(dir);
-	}
+	strncpy(clients->pci_slot, pci_slot, sizeof(clients->pci_slot));
 
 	return clients;
-}
-
-static int __read_to_buf(int fd, char *buf, unsigned int bufsize)
-{
-	ssize_t ret;
-	int err;
-
-	ret = read(fd, buf, bufsize - 1);
-	err = errno;
-	if (ret < 1) {
-		errno = ret < 0 ? err : ENOMSG;
-
-		return -1;
-	}
-
-	if (ret > 1 && buf[ret - 1] == '\n')
-		buf[ret - 1] = '\0';
-	else
-		buf[ret] = '\0';
-
-	return 0;
-}
-
-static int
-__read_client_field(int root, const char *field, char *buf, unsigned int bufsize)
-{
-	int fd, ret;
-
-	fd = openat(root, field, O_RDONLY);
-	if (fd < 0)
-		return -1;
-
-	ret = __read_to_buf(fd, buf, bufsize);
-
-	close(fd);
-
-	return ret;
-}
-
-static uint64_t
-read_client_busy(struct client *client, unsigned int class)
-{
-	const char *class_str[] = { "0", "1", "2", "3", "4", "5", "6", "7" };
-	char buf[256], *b;
-	int ret;
-
-	assert(class < ARRAY_SIZE(class_str));
-	if (class >= ARRAY_SIZE(class_str))
-		return 0;
-
-	assert(client->sysfs_root >= 0);
-	if (client->sysfs_root < 0)
-		return 0;
-
-	if (client->busy_root < 0)
-		client->busy_root = openat(client->sysfs_root, "busy",
-					   O_RDONLY | O_DIRECTORY);
-
-	assert(client->busy_root);
-	if (client->busy_root < 0)
-		return 0;
-
-	ret = __read_client_field(client->busy_root, class_str[class], buf,
-				  sizeof(buf));
-	if (ret) {
-		close(client->busy_root);
-		client->busy_root = -1;
-		return 0;
-	}
-
-	/*
-	 * Handle both single integer and key=value formats by skipping
-	 * leading non-digits.
-	 */
-	b = buf;
-	while (*b && !isdigit(*b))
-		b++;
-
-	return strtoull(b, NULL, 10);
 }
 
 static struct client *
@@ -803,9 +742,10 @@ find_client(struct clients *clients, enum client_status status, unsigned int id)
 	return NULL;
 }
 
-static void update_client(struct client *c, unsigned int pid, char *name)
+static void
+update_client(struct client *c, unsigned int pid, char *name,
+	      const struct drm_client_fdinfo *info)
 {
-	uint64_t val[c->clients->num_classes];
 	unsigned int i;
 
 	if (c->pid != pid)
@@ -825,20 +765,19 @@ static void update_client(struct client *c, unsigned int pid, char *name)
 		}
 	}
 
-	for (i = 0; i < c->clients->num_classes; i++)
-		val[i] = read_client_busy(c, c->clients->class[i].class);
-
 	c->last_runtime = 0;
 	c->total_runtime = 0;
 
 	for (i = 0; i < c->clients->num_classes; i++) {
-		if (val[i] < c->last[i])
+		assert(i < ARRAY_SIZE(info->busy));
+
+		if (info->busy[i] < c->last[i])
 			continue; /* It will catch up soon. */
 
-		c->total_runtime += val[i];
-		c->val[i] = val[i] - c->last[i];
+		c->total_runtime += info->busy[i];
+		c->val[i] = info->busy[i] - c->last[i];
 		c->last_runtime += c->val[i];
-		c->last[i] = val[i];
+		c->last[i] = info->busy[i];
 	}
 
 	c->samples++;
@@ -846,12 +785,12 @@ static void update_client(struct client *c, unsigned int pid, char *name)
 }
 
 static void
-add_client(struct clients *clients, unsigned int id, unsigned int pid,
-	   char *name, int sysfs_root)
+add_client(struct clients *clients, const struct drm_client_fdinfo *info,
+	   unsigned int pid, char *name)
 {
 	struct client *c;
 
-	assert(!find_client(clients, ALIVE, id));
+	assert(!find_client(clients, ALIVE, info->id));
 
 	c = find_client(clients, FREE, 0);
 	if (!c) {
@@ -866,50 +805,20 @@ add_client(struct clients *clients, unsigned int id, unsigned int pid,
 		memset(c, 0, (clients->num_clients - idx) * sizeof(*c));
 	}
 
-	c->sysfs_root = sysfs_root;
-	c->busy_root = -1;
-	c->id = id;
+	c->id = info->id;
 	c->clients = clients;
 	c->val = calloc(clients->num_classes, sizeof(c->val));
 	c->last = calloc(clients->num_classes, sizeof(c->last));
 	assert(c->val && c->last);
 
-	update_client(c, pid, name);
+	update_client(c, pid, name, info);
 }
 
 static void free_client(struct client *c)
 {
-	if (c->sysfs_root >= 0)
-		close(c->sysfs_root);
-	if (c->busy_root >= 0)
-		close(c->busy_root);
 	free(c->val);
 	free(c->last);
 	memset(c, 0, sizeof(*c));
-}
-
-static int
-read_client_sysfs(char *buf, int bufsize, const char *sysfs_root,
-		  unsigned int id, const char *field, int *client_root)
-{
-	ssize_t ret;
-
-	if (*client_root < 0) {
-		char namebuf[256];
-
-		ret = snprintf(namebuf, sizeof(namebuf), "%s/%u",
-			       sysfs_root, id);
-		assert(ret > 0 && ret < sizeof(namebuf));
-		if (ret <= 0 || ret == sizeof(namebuf))
-			return -1;
-
-		*client_root = open(namebuf, O_RDONLY | O_DIRECTORY);
-	}
-
-	if (*client_root < 0)
-		return -1;
-
-	return __read_client_field(*client_root, field, buf, bufsize);
 }
 
 static int client_last_cmp(const void *_a, const void *_b)
@@ -1061,7 +970,7 @@ static struct clients *display_clients(struct clients *clients)
 
 		assert(c->status == ALIVE);
 
-		if ((cp && c->pid != cp->pid) || !cp) {
+		if (!cp || c->pid != cp->pid) {
 			ac = &aggregated->client[num++];
 
 			/* New pid. */
@@ -1069,11 +978,8 @@ static struct clients *display_clients(struct clients *clients)
 			ac->status = ALIVE;
 			ac->id = -c->pid;
 			ac->pid = c->pid;
-			ac->busy_root = -1;
-			ac->sysfs_root = -1;
 			strcpy(ac->name, c->name);
 			strcpy(ac->print_name, c->print_name);
-			ac->engines = c->engines;
 			ac->val = calloc(clients->num_classes,
 					 sizeof(ac->val[0]));
 			assert(ac->val);
@@ -1116,13 +1022,83 @@ static void free_clients(struct clients *clients)
 	free(clients);
 }
 
-static struct clients *scan_clients(struct clients *clients)
+static bool is_drm_fd(int fd_dir, const char *name)
 {
-	struct dirent *dent;
+	struct stat stat;
+	int ret;
+
+	ret = fstatat(fd_dir, name, &stat, 0);
+
+	return ret == 0 &&
+	       (stat.st_mode & S_IFMT) == S_IFCHR &&
+	       major(stat.st_rdev) == 226;
+}
+
+static bool get_task_name(const char *buffer, char *out, unsigned long sz)
+{
+	char *s = index(buffer, '(');
+	char *e = rindex(buffer, ')');
+	unsigned int len;
+
+	if (!s || !e)
+		return false;
+	assert(e >= s);
+
+	len = e - ++s;
+	if(!len || (len + 1) >= sz)
+		return false;
+
+	strncpy(out, s, len);
+	out[len] = 0;
+
+	return true;
+}
+
+static DIR *opendirat(int at, const char *name)
+{
+	DIR *dir;
+	int fd;
+
+	fd = openat(at, name, O_DIRECTORY);
+	if (fd < 0)
+		return NULL;
+
+	dir = fdopendir(fd);
+	if (!dir)
+		close(fd);
+
+	return dir;
+}
+
+static size_t readat2buf(int at, const char *name, char *buf, const size_t sz)
+{
+	ssize_t count;
+	int fd;
+
+	fd = openat(at, name, O_RDONLY);
+	if (fd <= 0)
+		return 0;
+
+	count = read(fd, buf, sz - 1);
+	close(fd);
+
+	if (count > 0) {
+		buf[count] = 0;
+
+		return count;
+	} else {
+		buf[0] = 0;
+
+		return 0;
+	}
+}
+
+static struct clients *scan_clients(struct clients *clients, bool display)
+{
+	struct dirent *proc_dent;
 	struct client *c;
-	unsigned int id;
+	DIR *proc_dir;
 	int tmp;
-	DIR *d;
 
 	if (!clients)
 		return clients;
@@ -1135,43 +1111,90 @@ static struct clients *scan_clients(struct clients *clients)
 			break; /* Free block at the end of array. */
 	}
 
-	d = opendir(clients->sysfs_root);
-	if (!d)
+	proc_dir = opendir("/proc");
+	if (!proc_dir)
 		return clients;
 
-	while ((dent = readdir(d)) != NULL) {
-		char name[24], pid[24];
-		int ret, root = -1, *pr;
+	while ((proc_dent = readdir(proc_dir)) != NULL) {
+		int pid_dir = -1, fd_dir = -1;
+		struct dirent *fdinfo_dent;
+		char client_name[64] = { };
+		unsigned int client_pid;
+		DIR *fdinfo_dir = NULL;
+		char buf[4096];
+		size_t count;
 
-		if (dent->d_type != DT_DIR)
+		if (proc_dent->d_type != DT_DIR)
 			continue;
-		if (!isdigit(dent->d_name[0]))
+		if (!isdigit(proc_dent->d_name[0]))
 			continue;
 
-		id = atoi(dent->d_name);
+		pid_dir = openat(dirfd(proc_dir), proc_dent->d_name,
+				 O_DIRECTORY | O_RDONLY);
+		if (pid_dir < 0)
+			continue;
 
-		c = find_client(clients, PROBE, id);
+		count = readat2buf(pid_dir, "stat", buf, sizeof(buf));
+		if (!count)
+			goto next;
 
-		if (c)
-			pr = &c->sysfs_root;
-		else
-			pr = &root;
+		client_pid = atoi(buf);
+		if (!client_pid)
+			goto next;
 
-		ret = read_client_sysfs(name, sizeof(name), clients->sysfs_root,
-					id, "name", pr);
-		ret |= read_client_sysfs(pid, sizeof(pid), clients->sysfs_root,
-					id, "pid", pr);
-		if (!ret) {
+		if (!get_task_name(buf, client_name, sizeof(client_name)))
+			goto next;
+
+		fd_dir = openat(pid_dir, "fd", O_DIRECTORY | O_RDONLY);
+		if (fd_dir < 0)
+			goto next;
+
+		fdinfo_dir = opendirat(pid_dir, "fdinfo");
+		if (!fdinfo_dir)
+			goto next;
+
+		while ((fdinfo_dent = readdir(fdinfo_dir)) != NULL) {
+			struct drm_client_fdinfo info = { };
+
+			if (fdinfo_dent->d_type != DT_REG)
+				continue;
+			if (!isdigit(fdinfo_dent->d_name[0]))
+				continue;
+
+			if (!is_drm_fd(fd_dir, fdinfo_dent->d_name))
+				continue;
+
+			if (!__igt_parse_drm_fdinfo(dirfd(fdinfo_dir),
+						    fdinfo_dent->d_name,
+						    &info))
+				continue;
+
+			if (strcmp(info.driver, "i915"))
+				continue;
+			if (strcmp(info.pdev, clients->pci_slot))
+				continue;
+			if (find_client(clients, ALIVE, info.id))
+				continue; /* Skip duplicate fds. */
+
+			c = find_client(clients, PROBE, info.id);
 			if (!c)
-				add_client(clients, id, atoi(pid), name, root);
+				add_client(clients, &info, client_pid,
+					   client_name);
 			else
-				update_client(c, atoi(pid), name);
-		} else if (c) {
-			c->status = PROBE; /* Will be deleted below. */
+				update_client(c, client_pid, client_name,
+					      &info);
 		}
+
+next:
+		if (fdinfo_dir)
+			closedir(fdinfo_dir);
+		if (fd_dir >= 0)
+			close(fd_dir);
+		if (pid_dir >= 0)
+			close(pid_dir);
 	}
 
-	closedir(d);
+	closedir(proc_dir);
 
 	for_each_client(clients, c, tmp) {
 		if (c->status == PROBE)
@@ -1180,7 +1203,7 @@ static struct clients *scan_clients(struct clients *clients)
 			break;
 	}
 
-	return display_clients(clients);
+	return display ? display_clients(clients) : clients;
 }
 
 static const char *bars[] = { " ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█" };
@@ -2212,6 +2235,12 @@ print_clients_footer(struct clients *clients, double t,
 	return lines;
 }
 
+static void restore_term(void)
+{
+	tcsetattr(STDIN_FILENO, TCSANOW, &termios_orig);
+	printf("\n");
+}
+
 static bool stop_top;
 
 static void sigint_handler(int  sig)
@@ -2251,12 +2280,15 @@ static void interactive_stdin(void)
 	struct termios termios = { };
 	int ret;
 
+	ret = tcgetattr(0, &termios);
+	assert(ret == 0);
+
+	memcpy(&termios_orig, &termios, sizeof(struct termios));
+	atexit(restore_term);
+
 	ret = fcntl(0, F_GETFL, NULL);
 	ret |= O_NONBLOCK;
 	ret = fcntl(0, F_SETFL, ret);
-	assert(ret == 0);
-
-	ret = tcgetattr(0, &termios);
 	assert(ret == 0);
 
 	termios.c_lflag &= ~ICANON;
@@ -2276,7 +2308,7 @@ static void select_client_sort(void)
 		{ client_last_cmp, "Sorting clients by current GPU usage." },
 		{ client_total_cmp, "Sorting clients by accummulated GPU usage." },
 		{ client_pid_cmp, "Sorting clients by pid." },
-		{ client_id_cmp, "Sorting clients by sysfs id." },
+		{ client_id_cmp, "Sorting clients by DRM id." },
 	};
 	static unsigned int client_sort;
 
@@ -2379,6 +2411,23 @@ static void process_stdin(unsigned int timeout_us)
 		process_normal_stdin();
 }
 
+static bool has_drm_fdinfo(const struct igt_device_card *card)
+{
+	struct drm_client_fdinfo info = { };
+	unsigned int cnt;
+	int fd;
+
+	fd = open(card->render, O_RDWR);
+	if (fd < 0)
+		return false;
+
+	cnt = igt_parse_drm_fdinfo(fd, &info);
+
+	close(fd);
+
+	return cnt > 0;
+}
+
 static void show_help_screen(void)
 {
 	printf(
@@ -2452,12 +2501,8 @@ int main(int argc, char **argv)
 		out = stdout;
 	}
 
-	if (output_mode != INTERACTIVE) {
-		sighandler_t sig = signal(SIGINT, sigint_handler);
-
-		if (sig == SIG_ERR)
-			fprintf(stderr, "Failed to install signal handler!\n");
-	}
+	if (signal(SIGINT, sigint_handler) == SIG_ERR)
+		fprintf(stderr, "Failed to install signal handler!\n");
 
 	switch (output_mode) {
 	case INTERACTIVE:
@@ -2524,13 +2569,24 @@ int main(int argc, char **argv)
 	if (ret) {
 		fprintf(stderr,
 			"Failed to initialize PMU! (%s)\n", strerror(errno));
+		if (errno == EACCES && geteuid())
+			fprintf(stderr,
+"\n"
+"When running as a normal user CAP_PERFMON is required to access performance\n"
+"monitoring. See \"man 7 capabilities\", \"man 8 setcap\", or contact your\n"
+"distribution vendor for assistance.\n"
+"\n"
+"More information can be found at 'Perf events and tool security' document:\n"
+"https://www.kernel.org/doc/html/latest/admin-guide/perf-security.html\n");
 		ret = EXIT_FAILURE;
 		goto err;
 	}
 
 	ret = EXIT_SUCCESS;
 
-	clients = init_clients(card.pci_slot_name[0] ? card.card : NULL);
+	if (has_drm_fdinfo(&card))
+		clients = init_clients(card.pci_slot_name[0] ?
+				       card.pci_slot_name : IGPU_PCI);
 	init_engine_classes(engines);
 	if (clients) {
 		clients->num_classes = engines->num_classes;
@@ -2538,7 +2594,7 @@ int main(int argc, char **argv)
 	}
 
 	pmu_sample(engines);
-	scan_clients(clients);
+	scan_clients(clients, false);
 	codename = igt_device_get_pretty_name(&card, false);
 
 	while (!stop_top) {
@@ -2565,7 +2621,7 @@ int main(int argc, char **argv)
 		pmu_sample(engines);
 		t = (double)(engines->ts.cur - engines->ts.prev) / 1e9;
 
-		disp_clients = scan_clients(clients);
+		disp_clients = scan_clients(clients, true);
 
 		if (stop_top)
 			break;
@@ -2615,11 +2671,11 @@ int main(int argc, char **argv)
 			pops->close_struct();
 		}
 
-		if (stop_top)
-			break;
-
 		if (disp_clients != clients)
 			free_clients(disp_clients);
+
+		if (stop_top)
+			break;
 
 		if (output_mode == INTERACTIVE)
 			process_stdin(period_us);
@@ -2627,9 +2683,12 @@ int main(int argc, char **argv)
 			usleep(period_us);
 	}
 
+	if (clients)
+		free_clients(clients);
+
 	free(codename);
 err:
-	free(engines);
+	free_engines(engines);
 	free(pmu_device);
 exit:
 	igt_devices_free();

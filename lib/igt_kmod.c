@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/utsname.h>
 
 #include "igt_aux.h"
 #include "igt_core.h"
@@ -141,6 +142,12 @@ igt_kmod_is_loaded(const char *mod_name)
 	kmod_module_unref_list(list);
 out:
 	return ret;
+}
+
+static bool
+igt_kmod_is_loading(struct kmod_module *kmod)
+{
+	return kmod_module_get_initstate(kmod) == KMOD_MODULE_COMING;
 }
 
 static int modprobe(struct kmod_module *kmod, const char *options)
@@ -261,6 +268,17 @@ static int igt_kmod_unload_r(struct kmod_module *kmod, unsigned int flags)
 	if (err < 0)
 		return err;
 
+	if (igt_kmod_is_loading(kmod)) {
+		const char *mod_name = kmod_module_get_name(kmod);
+		igt_debug("%s still initializing\n", mod_name);
+		err = igt_wait(!igt_kmod_is_loading(kmod), 10000, 100);
+		if (err < 0) {
+			igt_debug("%s failed to complete init within the timeout\n",
+				  mod_name);
+			return err;
+		}
+	}
+
 	return kmod_module_remove_module(kmod, flags);
 }
 
@@ -345,6 +363,15 @@ igt_kmod_list_loaded(void)
 	kmod_module_unref_list(list);
 }
 
+static void *strdup_realloc(char *origptr, const char *strdata)
+{
+	size_t nbytes = strlen(strdata) + 1;
+	char *newptr = realloc(origptr, nbytes);
+
+	memcpy(newptr, strdata, nbytes);
+	return newptr;
+}
+
 /**
  * igt_i915_driver_load:
  * @opts: options to pass to i915 driver
@@ -355,18 +382,134 @@ igt_kmod_list_loaded(void)
 int
 igt_i915_driver_load(const char *opts)
 {
+	int ret;
+
 	if (opts)
 		igt_info("Reloading i915 with %s\n\n", opts);
 
-	if (igt_kmod_load("i915", opts)) {
+	ret = igt_kmod_load("i915", opts);
+	if (ret) {
 		igt_warn("Could not load i915\n");
-		return IGT_EXIT_FAILURE;
+		return ret;
 	}
 
 	bind_fbcon(true);
 	igt_kmod_load("snd_hda_intel", NULL);
 
-	return IGT_EXIT_SUCCESS;
+	return 0;
+}
+
+static int igt_always_unload_audio_driver(char **who)
+{
+	int ret;
+	const char *sound[] = {
+		"snd_hda_intel",
+		"snd_hdmi_lpe_audio",
+		NULL,
+	};
+
+	/*
+	 * With old Kernels, the dependencies between audio and DRM drivers
+	 * are not shown. So, it may not be mandatory to remove the audio
+	 * driver before unload/unbind the DRM one. So, let's print warnings,
+	 * but return 0 on errors, as, if the dependency is mandatory, this
+	 * will be detected later when trying to unbind/unload the DRM driver.
+	 */
+	for (const char **m = sound; *m; m++) {
+		if (igt_kmod_is_loaded(*m)) {
+			if (who)
+				*who = strdup_realloc(*who, *m);
+
+			ret = igt_lsof_kill_audio_processes();
+			if (ret) {
+				igt_warn("Could not stop %d audio process(es)\n", ret);
+				igt_kmod_list_loaded();
+				igt_lsof("/dev/snd");
+				return 0;
+			}
+
+			ret = pipewire_pulse_start_reserve();
+			if (ret)
+				igt_warn("Failed to notify pipewire_pulse\n");
+			kick_snd_hda_intel();
+			ret = igt_kmod_unload(*m, 0);
+			pipewire_pulse_stop_reserve();
+			if (ret) {
+				igt_warn("Could not unload audio driver %s\n", *m);
+				igt_kmod_list_loaded();
+				igt_lsof("/dev/snd");
+				return 0;
+			}
+		}
+	}
+	return 0;
+}
+
+struct module_ref {
+	char *name;
+	unsigned long mem;
+	unsigned int ref_count;
+	unsigned int num_required;
+	unsigned int *required_by;
+};
+
+int igt_audio_driver_unload(char **who)
+{
+	/*
+	 * Currently, there's no way to check if the audio driver binds into the
+	 * DRM one. So, always remove audio drivers that  might be binding.
+	 * This may change in future, once kernel/module gets fixed. So, let's
+	 * keep this boilerplace, in order to make easier to add the new code,
+	 * once upstream is fixed.
+	 */
+	return igt_always_unload_audio_driver(who);
+}
+
+int __igt_i915_driver_unload(char **who)
+{
+	int ret;
+
+	const char *aux[] = {
+		/* gen5: ips uses symbol_get() so only a soft module dependency */
+		"intel_ips",
+		/* mei_gsc uses an i915 aux dev and the other mei mods depend on it */
+		"mei_pxp",
+		"mei_hdcp",
+		"mei_gsc",
+		NULL,
+	};
+
+	/* unbind vt */
+	bind_fbcon(false);
+
+	ret = igt_audio_driver_unload(who);
+	if (ret)
+		return ret;
+
+	for (const char **m = aux; *m; m++) {
+		if (!igt_kmod_is_loaded(*m))
+			continue;
+
+		ret = igt_kmod_unload(*m, 0);
+		if (ret) {
+			if (who)
+				*who = strdup_realloc(*who, *m);
+
+			return ret;
+		}
+	}
+
+	if (igt_kmod_is_loaded("i915")) {
+		ret = igt_kmod_unload("i915", 0);
+		if (ret) {
+			if (who)
+				*who = strdup_realloc(*who, "i915");
+
+			return ret;
+		}
+	}
+
+	return 0;
 }
 
 /**
@@ -378,46 +521,19 @@ igt_i915_driver_load(const char *opts)
 int
 igt_i915_driver_unload(void)
 {
-	/* unbind vt */
-	bind_fbcon(false);
+	char *who = NULL;
+	int ret;
 
-	if (igt_kmod_is_loaded("snd_hda_intel")) {
-		igt_terminate_process(SIGTERM, "alsactl");
-
-		/* unbind snd_hda_intel */
-		kick_snd_hda_intel();
-
-		if (igt_kmod_unload("snd_hda_intel", 0)) {
-			igt_warn("Could not unload snd_hda_intel\n");
-			igt_kmod_list_loaded();
-			igt_lsof("/dev/snd");
-			return IGT_EXIT_FAILURE;
-		}
+	ret = __igt_i915_driver_unload(&who);
+	if (ret) {
+		igt_warn("Could not unload %s\n", who);
+		igt_kmod_list_loaded();
+		igt_lsof("/dev/dri");
+		igt_lsof("/dev/snd");
+		free(who);
+		return ret;
 	}
-
-	if (igt_kmod_is_loaded("snd_hdmi_lpe_audio")) {
-		igt_terminate_process(SIGTERM, "alsactl");
-
-		if (igt_kmod_unload("snd_hdmi_lpe_audio", 0)) {
-			igt_warn("Could not unload snd_hdmi_lpe_audio\n");
-			igt_kmod_list_loaded();
-			igt_lsof("/dev/snd");
-			return IGT_EXIT_FAILURE;
-		}
-	}
-
-	/* gen5: ips uses symbol_get() so only a soft module dependency */
-	if (igt_kmod_is_loaded("intel_ips"))
-		igt_kmod_unload("intel_ips", 0);
-
-	if (igt_kmod_is_loaded("i915")) {
-		if (igt_kmod_unload("i915", 0)) {
-			igt_warn("Could not unload i915\n");
-			igt_kmod_list_loaded();
-			igt_lsof("/dev/dri");
-			return IGT_EXIT_SKIP;
-		}
-	}
+	free(who);
 
 	if (igt_kmod_is_loaded("intel-gtt"))
 		igt_kmod_unload("intel-gtt", 0);
@@ -427,6 +543,65 @@ igt_i915_driver_unload(void)
 
 	if (igt_kmod_is_loaded("i915")) {
 		igt_warn("i915.ko still loaded!\n");
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+/**
+ * igt_amdgpu_driver_load:
+ * @opts: options to pass to amdgpu driver
+ *
+ * Returns: IGT_EXIT_SUCCESS or IGT_EXIT_FAILURE.
+ *
+ * Loads the amdgpu driver and its dependencies.
+ *
+ */
+int
+igt_amdgpu_driver_load(const char *opts)
+{
+	if (opts)
+		igt_info("Reloading amdgpu with %s\n\n", opts);
+
+	if (igt_kmod_load("amdgpu", opts)) {
+		igt_warn("Could not load amdgpu\n");
+		return IGT_EXIT_FAILURE;
+	}
+
+	bind_fbcon(true);
+
+	return IGT_EXIT_SUCCESS;
+}
+
+/**
+ * igt_amdgpu_driver_unload:
+ *
+ * Returns: IGT_EXIT_SUCCESS on success, IGT_EXIT_FAILURE on failure
+ * and IGT_EXIT_SKIP if amdgpu could not be unloaded.
+ *
+ * Unloads the amdgpu driver and its dependencies.
+ *
+ */
+int
+igt_amdgpu_driver_unload(void)
+{
+	bind_fbcon(false);
+
+	if (igt_kmod_is_loaded("amdgpu")) {
+		if (igt_kmod_unload("amdgpu", 0)) {
+			igt_warn("Could not unload amdgpu\n");
+			igt_kmod_list_loaded();
+			igt_lsof("/dev/dri");
+			return IGT_EXIT_SKIP;
+		}
+	}
+
+	igt_kmod_unload("drm_kms_helper", 0);
+	igt_kmod_unload("drm", 0);
+
+	if (igt_kmod_is_loaded("amdgpu")) {
+		igt_warn("amdgpu.ko still loaded!\n");
 		return IGT_EXIT_FAILURE;
 	}
 
@@ -656,7 +831,7 @@ void igt_kselftests(const char *module_name,
 		igt_require(igt_kselftest_begin(&tst) == 0);
 
 	igt_kselftest_get_tests(tst.kmod, filter, &tests);
-	igt_subtest_with_dynamic(filter ?: "all") {
+	igt_subtest_with_dynamic(filter ?: "all-tests") {
 		igt_list_for_each_entry_safe(tl, tn, &tests, link) {
 			unsigned long taints;
 

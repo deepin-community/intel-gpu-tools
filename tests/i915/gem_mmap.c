@@ -37,7 +37,9 @@
 #include <sys/ioctl.h>
 
 #include "drm.h"
-#include "i915/gem.h"
+#include "i915/gem_create.h"
+
+IGT_TEST_DESCRIPTION("Basic MMAP IOCTL tests for memory regions.");
 
 #define OBJECT_SIZE 16384
 #define PAGE_SIZE 4096
@@ -64,13 +66,13 @@ test_huge_bo(int huge)
 		huge_object_size = gem_aperture_size(fd) + PAGE_SIZE;
 		break;
 	case 2:
-		huge_object_size = (intel_get_total_ram_mb() + 1) << 20;
+		huge_object_size = (igt_get_total_ram_mb() + 1) << 20;
 		check |= CHECK_SWAP;
 		break;
 	default:
 		return;
 	}
-	intel_require_memory(1, huge_object_size, check);
+	igt_require_memory(1, huge_object_size, check);
 
 	last_offset = huge_object_size - PAGE_SIZE;
 
@@ -123,8 +125,9 @@ test_pf_nonblock(int i915)
 {
 	igt_spin_t *spin;
 	uint32_t *ptr;
+	uint64_t ahnd = get_reloc_ahnd(i915, 0);
 
-	spin = igt_spin_new(i915);
+	spin = igt_spin_new(i915, .ahnd = ahnd);
 
 	igt_set_timeout(1, "initial pagefaulting did not complete within 1s");
 
@@ -135,6 +138,7 @@ test_pf_nonblock(int i915)
 	igt_reset_timeout();
 
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
 static int mmap_ioctl(int i915, struct drm_i915_gem_mmap *arg)
@@ -154,9 +158,12 @@ igt_main
 	uint8_t buf[OBJECT_SIZE];
 	uint8_t *addr;
 
-	igt_fixture
+	igt_fixture {
 		fd = drm_open_driver(DRIVER_INTEL);
+		igt_require(gem_has_legacy_mmap(fd));
+	}
 
+	igt_describe("Verify mapping to invalid gem objects won't be created.");
 	igt_subtest("bad-object") {
 		uint32_t real_handle = gem_create(fd, 4096);
 		uint32_t handles[20];
@@ -181,6 +188,7 @@ igt_main
 		gem_close(fd, real_handle);
 	}
 
+	igt_describe("Verify mapping to gem object with invalid offset won't be created.");
 	igt_subtest("bad-offset") {
 		struct bad_offset {
 			uint64_t size;
@@ -208,6 +216,7 @@ igt_main
 		}
 	}
 
+	igt_describe("Verify mapping to gem object with invalid size won't be created.");
 	igt_subtest("bad-size") {
 		uint64_t bad_size[] = {
 			0,
@@ -238,6 +247,8 @@ igt_main
 		}
 	}
 
+	igt_describe("Test basics of newly mapped gem object like default content, write and read "
+		     "coherency, mapping existence after gem_close and unmapping.");
 	igt_subtest("basic") {
 		struct drm_i915_gem_mmap arg = {
 			.handle = gem_create(fd, OBJECT_SIZE),
@@ -265,6 +276,7 @@ igt_main
 		munmap(addr, OBJECT_SIZE);
 	}
 
+	igt_describe("Map small buffer object though direct CPU access, bypassing GPU.");
 	igt_subtest("short-mmap") {
 		uint32_t handle = gem_create(fd, OBJECT_SIZE);
 
@@ -277,15 +289,28 @@ igt_main
 		gem_close(fd, handle);
 	}
 
+	igt_describe("Verify that GTT page faults are asynchronous to GPU rendering and "
+		     "completes within a specific time.");
 	igt_subtest("pf-nonblock")
 		test_pf_nonblock(fd);
 
+	igt_describe("Test the write read coherency and simultaneous access of different pages "
+		     "of a small buffer object.");
 	igt_subtest("basic-small-bo")
 		test_huge_bo(-1);
+
+	igt_describe("Test the write read coherency and simultaneous access of different pages "
+		     "of a big buffer object.");
 	igt_subtest("big-bo")
 		test_huge_bo(0);
+
+	igt_describe("Test the write read coherency and simultaneous access of different pages "
+		     "of a huge buffer object.");
 	igt_subtest("huge-bo")
 		test_huge_bo(1);
+
+	igt_describe("Test the write read coherency and simultaneous access of different pages "
+		     "while swapping buffer object.");
 	igt_subtest("swap-bo")
 		test_huge_bo(2);
 

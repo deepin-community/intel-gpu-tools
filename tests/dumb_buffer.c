@@ -293,7 +293,7 @@ static uint64_t estimate_largest_dumb_buffer(int fd)
 		.height = 1, /* in rows */
 	};
 	const unsigned long max_rows =
-		intel_get_total_ram_mb() / 2; /* leave some spare */
+		igt_get_total_ram_mb() / 2; /* leave some spare */
 	volatile uint64_t largest = 0;
 	char * volatile ptr = NULL;
 
@@ -392,4 +392,8 @@ igt_main
 
 	igt_subtest("create-clear")
 		always_clear(fd, 30);
+
+	igt_fixture {
+		close(fd);
+	}
 }

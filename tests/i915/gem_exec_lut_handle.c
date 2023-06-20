@@ -38,6 +38,7 @@
 
 #include "drm.h"
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 
 IGT_TEST_DESCRIPTION("Exercises the basic execbuffer using the handle LUT"
@@ -98,6 +99,7 @@ igt_simple_main
 
 	fd = drm_open_driver(DRIVER_INTEL);
 	igt_require_gem(fd);
+	igt_require(gem_has_relocations(fd));
 
 	memset(gem_exec, 0, sizeof(gem_exec));
 	for (n = 0; n < MAX_NUM_EXEC; n++)

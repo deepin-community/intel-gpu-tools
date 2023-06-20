@@ -68,39 +68,28 @@ store_pipe_control_loop(bool preuse_buffer, int timeout)
 	struct intel_buf *target_buf;
 	static struct intel_bb *ibb;
 
-	ibb = intel_bb_create_with_relocs(buf_ops_get_fd(bops), 4096);
+	ibb = intel_bb_create(buf_ops_get_fd(bops), 4096);
 
 	igt_until_timeout(timeout) {
+		igt_spin_t *spin = NULL;
+
 		/* we want to check tlb consistency of the pipe_control target,
 		 * so get a new buffer every time around */
 		target_buf = intel_buf_create(bops, 4096, 1, 8, 0,
 					      I915_TILING_NONE,
 					      I915_COMPRESSION_NONE);
 
-		if (preuse_buffer) {
-			intel_bb_add_intel_buf(ibb, target_buf, true);
-			intel_bb_out(ibb, XY_COLOR_BLT_CMD_NOLEN |
-				     COLOR_BLT_WRITE_ALPHA |
-				     XY_COLOR_BLT_WRITE_RGB |
-				     (4 + (ibb->gen >= 8)));
-
-			intel_bb_out(ibb, (3 << 24) | (0xf0 << 16) | 64);
-			intel_bb_out(ibb, 0);
-			intel_bb_out(ibb, 1 << 16 | 1);
-
-			/*
-			 * IMPORTANT: We need to preuse the buffer in a
-			 * different domain than what the pipe control write
-			 * (and kernel wa) uses!
-			 */
-			intel_bb_emit_reloc_fenced(ibb, target_buf->handle,
-						   I915_GEM_DOMAIN_RENDER,
-						   I915_GEM_DOMAIN_RENDER,
-						   0, target_buf->addr.offset);
-			intel_bb_out(ibb, 0xdeadbeef);
-
-			intel_bb_flush_blit(ibb);
-		}
+		/*
+		 * IMPORTANT: We need to preuse the buffer in a
+		 * different domain than what the pipe control write
+		 * (and kernel wa) uses!
+		 *
+		 * The dependency sets (RENDER, RENDER).
+		 */
+		if (preuse_buffer)
+			spin = igt_spin_new(buf_ops_get_fd(bops),
+					    .ahnd = ibb->allocator_handle,
+					    .dependency = target_buf->handle);
 
 		/* gem_storedw_batches_loop.c is a bit overenthusiastic with
 		 * creating new batchbuffers - with buffer reuse disabled, the
@@ -149,6 +138,8 @@ store_pipe_control_loop(bool preuse_buffer, int timeout)
 		}
 
 		intel_bb_flush(ibb, 0);
+		if (spin)
+			igt_spin_free(buf_ops_get_fd(bops), spin);
 
 		intel_buf_cpu_map(target_buf, 1);
 
@@ -183,9 +174,11 @@ igt_main
 		igt_skip_on(devid == PCI_CHIP_I965_G); /* has totally broken pipe control */
 	}
 
+	igt_describe("Checks tlb consistency of the pipe_control with fresh buffer.");
 	igt_subtest("fresh-buffer")
 		store_pipe_control_loop(false, 2);
 
+	igt_describe("Checks tlb consistency of the pipe_control with reused buffer.");
 	igt_subtest("reused-buffer")
 		store_pipe_control_loop(true, 2);
 

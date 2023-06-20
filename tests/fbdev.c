@@ -27,6 +27,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -37,6 +38,41 @@
 #include <linux/fb.h>
 
 #include "igt.h"
+
+#define PANSTEP(panstep_) \
+	((panstep_) ? (panstep_) : 1)
+
+static unsigned int __panoffset(unsigned int offset, unsigned int panstep)
+{
+	return offset - (offset % PANSTEP(panstep));
+}
+
+#define XOFFSET(offset_) \
+	__panoffset(offset_, fix_info.xpanstep)
+
+#define YOFFSET(offset_) \
+	__panoffset(offset_, fix_info.ypanstep)
+
+static void pan_test(int fd, const struct fb_var_screeninfo *var, int expected_ret)
+{
+	struct fb_var_screeninfo pan_var, new_var;
+	int ret;
+
+	memcpy(&pan_var, var, sizeof(pan_var));
+
+	ret = ioctl(fd, FBIOPAN_DISPLAY, &pan_var);
+	igt_assert_f(ret == expected_ret,
+		     "ioctl(FBIOPAN_DISPLAY) returned ret=%d, expected %d\n", ret, expected_ret);
+
+	if (ret)
+		return; /* panning failed; skip additional tests */
+
+	ret = ioctl(fd, FBIOGET_VSCREENINFO, &new_var);
+	igt_assert_f(ret == 0, "ioctl(FBIOGET_VSCREENINFO) failed, ret=%d\n", ret);
+	igt_assert_f(pan_var.xoffset == new_var.xoffset && pan_var.yoffset == new_var.yoffset,
+		     "panning to (%u, %u) moved to (%u, %u)\n",
+		     pan_var.xoffset, pan_var.yoffset, new_var.xoffset, new_var.yoffset);
+}
 
 static void mode_tests(int fd)
 {
@@ -50,14 +86,119 @@ static void mode_tests(int fd)
 
 	igt_describe("Check if screeninfo is valid");
 	igt_subtest("info") {
-		unsigned long size;
+		unsigned long nbits, nlines;
 
-		size = var_info.yres * fix_info.line_length;
-		igt_assert_f(size <= fix_info.smem_len,
-			     "screen size (%d x %d) of pitch %d does not fit within mappable area of size %u\n",
-			     var_info.xres, var_info.yres,
-			     fix_info.line_length,
-			     fix_info.smem_len);
+		/* video memory configuration */
+		igt_assert_f(fix_info.line_length, "line length not set\n");
+		igt_assert_f(fix_info.smem_len, "size of video memory not set\n");
+		igt_assert_f(fix_info.line_length <= fix_info.smem_len,
+			     "line length (%u) exceeds available video memory (%u)\n",
+			     fix_info.line_length, fix_info.smem_len);
+
+		/* color format */
+		igt_assert_f(var_info.bits_per_pixel, "bits-per-pixel not set\n");
+
+		/* horizontal resolution */
+		igt_assert_f(var_info.xres, "horizontal resolution not set\n");
+		igt_assert_f(var_info.xres_virtual, "horizontal virtual resolution not set\n");
+		igt_assert_f(var_info.xres <= var_info.xres_virtual,
+			     "horizontal virtual resolution (%u) less than horizontal resolution (%u)\n",
+			     var_info.xres_virtual, var_info.xres);
+		igt_assert_f(var_info.xoffset <= (var_info.xres_virtual - var_info.xres),
+			     "screen horizontal offset (%u) overflow\n",
+			     var_info.xoffset);
+		nbits = fix_info.line_length * CHAR_BIT;
+		igt_assert_f((var_info.xres_virtual * var_info.bits_per_pixel) <= nbits,
+			     "vertical virtual resolution (%u) with bpp %u exceeds line length %u\n",
+			     var_info.yres_virtual, var_info.bits_per_pixel, fix_info.line_length);
+
+		/* vertical resolution */
+		igt_assert_f(var_info.yres, "vertical resolution not set\n");
+		igt_assert_f(var_info.yres_virtual, "vertical virtual resolution not set\n");
+		igt_assert_f(var_info.yres <= var_info.yres_virtual,
+			     "vertical virtual resolution (%u) less than vertical resolution (%u)\n",
+			     var_info.yres_virtual, var_info.yres);
+		igt_assert_f((var_info.vmode & FB_VMODE_YWRAP) ||
+			     (var_info.yoffset <= (var_info.yres_virtual - var_info.yres)),
+			     "screen vertical offset (%u) overflow\n",
+			     var_info.yoffset);
+		nlines = fix_info.smem_len / fix_info.line_length;
+		igt_assert_f(var_info.yres_virtual <= nlines,
+			     "vertical virtual resolution (%u) with line length %u exceeds available video memory\n",
+			     var_info.yres_virtual, fix_info.line_length);
+	}
+
+	igt_describe("Check panning / page flipping");
+	igt_subtest("pan") {
+		struct fb_var_screeninfo pan_var;
+		int expected_ret;
+
+		memset(&pan_var, 0, sizeof(pan_var));
+
+		/*
+		 * Tests that are expected to succeed.
+		 */
+
+		igt_debug("Jump to opposite end of virtual screen\n");
+		pan_var.xoffset = XOFFSET(var_info.xres_virtual - var_info.xres - var_info.xoffset);
+		pan_var.yoffset = YOFFSET(var_info.yres_virtual - var_info.yres - var_info.yoffset);
+		pan_test(fd, &pan_var, 0);
+		igt_debug("Jump to (0, 0)\n");
+		pan_var.xoffset = XOFFSET(0);
+		pan_var.yoffset = YOFFSET(0);
+		pan_test(fd, &pan_var, 0);
+		igt_debug("Jump to maximum extend\n");
+		pan_var.xoffset = XOFFSET(var_info.xres_virtual - var_info.xres);
+		pan_var.yoffset = YOFFSET(var_info.yres_virtual - var_info.yres);
+		pan_test(fd, &pan_var, 0);
+
+		/*
+		 * Tests that are expected to fail.
+		 */
+
+		igt_debug("Jump beyond maximum horizontal extend\n");
+		pan_var.xoffset = XOFFSET(var_info.xres_virtual - var_info.xres + PANSTEP(fix_info.xpanstep));
+		pan_var.yoffset = YOFFSET(0);
+		pan_test(fd, &pan_var, -1);
+		igt_debug("Jump beyond horizontal virtual resolution\n");
+		pan_var.xoffset = XOFFSET(var_info.xres_virtual);
+		pan_var.yoffset = YOFFSET(0);
+		pan_test(fd, &pan_var, -1);
+
+		/*
+		 * The FB_VMODE_YWRAP flag is configurable as part of ioctl(FBIOPAN_DISPLAY),
+		 * but it's hard to know which drivers support it and which don't. Testing for
+		 * FBINFO_HWACCEL_YWRAP does not produce meaningful results. So we got with the
+		 * device's current setting.
+		 *
+		 * With FB_VMODE_YWRAP set, the display is expected to wrap around when
+		 * reaching the limits of the vertical resolution. Otherwise, this should
+		 * fail.
+		 *
+		 */
+
+		if (var_info.vmode & FB_VMODE_YWRAP) {
+			pan_var.vmode |= FB_VMODE_YWRAP;
+			expected_ret = 0;
+		} else {
+			expected_ret = -1;
+		}
+
+		igt_debug("Jump beyond maximum vertical extend\n");
+		pan_var.xoffset = XOFFSET(0);
+		pan_var.yoffset = YOFFSET(var_info.yres_virtual - var_info.yres + PANSTEP(fix_info.ypanstep));
+		pan_test(fd, &pan_var, expected_ret);
+		igt_debug("Jump beyond vertical virtual resolution\n");
+		pan_var.xoffset = XOFFSET(0);
+		pan_var.yoffset = YOFFSET(var_info.yres_virtual);
+		pan_test(fd, &pan_var, expected_ret);
+
+		pan_var.vmode &= ~FB_VMODE_YWRAP;
+	}
+
+	igt_fixture {
+		/* restore original panning offsets */
+		ioctl(fd, FBIOPAN_DISPLAY, &var_info);
 	}
 }
 

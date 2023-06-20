@@ -34,7 +34,7 @@
 #include "igt_fb.h"
 #include "ioctl_wrappers.h"
 #include "i830_reg.h"
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "i915/gem_mman.h"
 
 #ifndef PAGE_ALIGN
@@ -226,6 +226,71 @@ static int linear_x_y_to_ytiled_pos(int x, int y, uint32_t stride, int swizzle,
 	return pos / pixel_size;
 }
 
+#define OW_SIZE 16			/* in bytes */
+#define TILE_4_SUBTILE_SIZE 64		/* in bytes */
+#define TILE_4_WIDTH 128		/* in bytes */
+#define TILE_4_HEIGHT 32		/* in pixels */
+#define TILE_4_SUBTILE_WIDTH  OW_SIZE	/* in bytes */
+#define TILE_4_SUBTILE_HEIGHT 4		/* in pixels */
+
+/*
+ * Subtile remapping for tile 4.  Note that map[a]==b implies map[b]==a
+ * so we can use the same table to tile and until.
+ */
+static const int tile4_subtile_map[] = {
+	0,  1,  2,  3,  8,  9, 10, 11,
+	4,  5,  6,  7, 12, 13, 14, 15,
+	16, 17, 18, 19, 24, 25, 26, 27,
+	20, 21, 22, 23, 28, 29, 30, 31,
+	32, 33, 34, 35, 40, 41, 42, 43,
+	36, 37, 38, 39, 44, 45, 46, 47,
+	48, 49, 50, 51, 56, 57, 58, 59,
+	52, 53, 54, 55, 60, 61, 62, 63
+};
+
+static int linear_x_y_to_4tiled_pos(int x, int y, uint32_t stride, int swizzle,
+				    int bpp)
+{
+	int tile_base_pos;
+	int tile_x, tile_y;
+	int subtile_col, subtile_row, subtile_num, new_subtile_num;
+	int pixel_size = bpp / 8;
+	int byte_x = x * pixel_size;
+	int pos;
+
+	/* Modern platforms that have 4-tiling don't use old bit 6 swizzling */
+	igt_assert_eq(swizzle, I915_BIT_6_SWIZZLE_NONE);
+
+	/*
+	* Where does the 4k tile start (in bytes)?  This is the same for Y and
+	* F so we can use the Y-tile algorithm to get to that point.
+	*/
+	tile_base_pos = (y / TILE_4_HEIGHT) * stride * TILE_4_HEIGHT +
+		4096 * (byte_x / TILE_4_WIDTH);
+
+	/* Find pixel within tile */
+	tile_x = (byte_x % TILE_4_WIDTH);
+	tile_y = y % TILE_4_HEIGHT;
+
+	/* And figure out the subtile within the 4k tile */
+	subtile_col = tile_x / TILE_4_SUBTILE_WIDTH;
+	subtile_row = tile_y / TILE_4_SUBTILE_HEIGHT;
+	subtile_num = subtile_row * 8 + subtile_col;
+
+	/* Swizzle the subtile number according to the bspec diagram */
+	new_subtile_num = tile4_subtile_map[subtile_num];
+
+	/* Calculate new position */
+	pos = tile_base_pos +
+		new_subtile_num * TILE_4_SUBTILE_SIZE +
+		(tile_y % TILE_4_SUBTILE_HEIGHT) * OW_SIZE +
+		tile_x % TILE_4_SUBTILE_WIDTH;
+	igt_assert(pos % pixel_size == 0);
+	pos /= pixel_size;
+
+	return pos;
+}
+
 static void xtiled_pos_to_x_y_linear(int tiled_pos, uint32_t stride,
 				     int swizzle, int bpp, int *x, int *y)
 {
@@ -253,6 +318,44 @@ static void ytiled_pos_to_x_y_linear(int tiled_pos, uint32_t stride,
 	*x /= pixel_size;
 }
 
+static void tile4_pos_to_x_y_linear(int tiled_pos, uint32_t stride,
+				    int swizzle, int bpp, int *x, int *y)
+{
+	int pixel_size = bpp / 8;
+	int tiles_per_line = stride / TILE_4_WIDTH;
+	int tile_num, tile_offset, tile_row, tile_col;
+	int tile_origin_x, tile_origin_y;
+	int subtile_num, subtile_offset, subtile_row, subtile_col;
+	int subtile_origin_x, subtile_origin_y;
+	int oword_num, byte_num;
+
+	/* Modern platforms that have 4-tiling don't use old bit 6 swizzling */
+	igt_assert_eq(swizzle, I915_BIT_6_SWIZZLE_NONE);
+
+	/* Calculate the x,y of the start of the 4k tile */
+	tile_num = tiled_pos / 4096;
+	tile_row = tile_num / tiles_per_line;
+	tile_col = tile_num % tiles_per_line;
+	tile_origin_x = tile_col * TILE_4_WIDTH;
+	tile_origin_y = tile_row * TILE_4_HEIGHT;
+
+	/* Now calculate the x,y offset of the start of the subtile */
+	tile_offset = tiled_pos % 4096;
+	subtile_num = tile4_subtile_map[tile_offset / TILE_4_SUBTILE_SIZE];
+	subtile_row = subtile_num / 8;
+	subtile_col = subtile_num % 8;
+	subtile_origin_x = subtile_col * TILE_4_SUBTILE_WIDTH;
+	subtile_origin_y = subtile_row * TILE_4_SUBTILE_HEIGHT;
+
+	/* Next the oword and byte within the subtile */
+	subtile_offset = tiled_pos % TILE_4_SUBTILE_SIZE;
+	oword_num = subtile_offset / OW_SIZE;
+	byte_num = subtile_offset % OW_SIZE;
+
+	*x = (tile_origin_x + subtile_origin_x + byte_num) / pixel_size;
+	*y = tile_origin_y + subtile_origin_y + oword_num;
+}
+
 static void set_pixel(void *_ptr, int index, uint32_t color, int bpp)
 {
 	if (bpp == 16) {
@@ -271,7 +374,7 @@ static void switch_blt_tiling(struct intel_bb *ibb, uint32_t tiling, bool on)
 	uint32_t bcs_swctrl;
 
 	/* Default is X-tile */
-	if (tiling != I915_TILING_Y)
+	if (tiling != I915_TILING_Y && tiling != I915_TILING_4)
 		return;
 
 	igt_require(ibb->gen >= 6);
@@ -321,6 +424,10 @@ static void draw_rect_ptr_tiled(void *ptr, uint32_t stride, uint32_t tiling,
 				pos = linear_x_y_to_ytiled_pos(x, y, stride,
 							       swizzle, bpp);
 				break;
+			case I915_TILING_4:
+				pos = linear_x_y_to_4tiled_pos(x, y, stride,
+							       swizzle, bpp);
+				break;
 			default:
 				igt_assert(false);
 			}
@@ -339,10 +446,10 @@ static void draw_rect_mmap_cpu(int fd, struct buf_data *buf, struct rect *rect,
 
 	/* We didn't implement suport for the older tiling methods yet. */
 	if (tiling != I915_TILING_NONE)
-		igt_require(intel_gen(intel_get_drm_devid(fd)) >= 5);
+		igt_require(intel_display_ver(intel_get_drm_devid(fd)) >= 5);
 
-	ptr = gem_mmap__cpu(fd, buf->handle, 0, PAGE_ALIGN(buf->size),
-			    PROT_READ | PROT_WRITE);
+	ptr = gem_mmap__cpu_coherent(fd, buf->handle, 0, PAGE_ALIGN(buf->size),
+				     PROT_READ | PROT_WRITE);
 
 	switch (tiling) {
 	case I915_TILING_NONE:
@@ -350,6 +457,7 @@ static void draw_rect_mmap_cpu(int fd, struct buf_data *buf, struct rect *rect,
 		break;
 	case I915_TILING_X:
 	case I915_TILING_Y:
+	case I915_TILING_4:
 		draw_rect_ptr_tiled(ptr, buf->stride, tiling, swizzle, rect,
 				    color, buf->bpp);
 		break;
@@ -389,10 +497,19 @@ static void draw_rect_mmap_wc(int fd, struct buf_data *buf, struct rect *rect,
 
 	/* We didn't implement suport for the older tiling methods yet. */
 	if (tiling != I915_TILING_NONE)
-		igt_require(intel_gen(intel_get_drm_devid(fd)) >= 5);
+		igt_require(intel_display_ver(intel_get_drm_devid(fd)) >= 5);
 
-	ptr = gem_mmap__wc(fd, buf->handle, 0, PAGE_ALIGN(buf->size),
-			   PROT_READ | PROT_WRITE);
+	if (gem_has_lmem(fd))
+		ptr = gem_mmap_offset__fixed(fd, buf->handle, 0,
+					     PAGE_ALIGN(buf->size),
+					     PROT_READ | PROT_WRITE);
+	else if (gem_has_legacy_mmap(fd))
+		ptr = gem_mmap__wc(fd, buf->handle, 0, PAGE_ALIGN(buf->size),
+				   PROT_READ | PROT_WRITE);
+	else
+		ptr = gem_mmap_offset__wc(fd, buf->handle, 0,
+					  PAGE_ALIGN(buf->size),
+					  PROT_READ | PROT_WRITE);
 
 	switch (tiling) {
 	case I915_TILING_NONE:
@@ -400,6 +517,7 @@ static void draw_rect_mmap_wc(int fd, struct buf_data *buf, struct rect *rect,
 		break;
 	case I915_TILING_X:
 	case I915_TILING_Y:
+	case I915_TILING_4:
 		draw_rect_ptr_tiled(ptr, buf->stride, tiling, swizzle, rect,
 				    color, buf->bpp);
 		break;
@@ -440,7 +558,7 @@ static void draw_rect_pwrite_tiled(int fd, struct buf_data *buf,
 	int pixels_written = 0;
 
 	/* We didn't implement suport for the older tiling methods yet. */
-	igt_require(intel_gen(intel_get_drm_devid(fd)) >= 5);
+	igt_require(intel_display_ver(intel_get_drm_devid(fd)) >= 5);
 
 	pixel_size = buf->bpp / 8;
 	tmp_size = sizeof(tmp) / pixel_size;
@@ -460,6 +578,10 @@ static void draw_rect_pwrite_tiled(int fd, struct buf_data *buf,
 		case I915_TILING_Y:
 			ytiled_pos_to_x_y_linear(tiled_pos, buf->stride,
 						 swizzle, buf->bpp, &x, &y);
+			break;
+		case I915_TILING_4:
+			tile4_pos_to_x_y_linear(tiled_pos, buf->stride,
+						swizzle, buf->bpp, &x, &y);
 			break;
 		default:
 			igt_assert(false);
@@ -498,6 +620,7 @@ static void draw_rect_pwrite(int fd, struct buf_data *buf,
 		break;
 	case I915_TILING_X:
 	case I915_TILING_Y:
+	case I915_TILING_4:
 		draw_rect_pwrite_tiled(fd, buf, tiling, rect, color, swizzle);
 		break;
 	default:
@@ -543,36 +666,91 @@ static void draw_rect_blt(int fd, struct cmd_data *cmd_data,
 	ibb = intel_bb_create(fd, PAGE_SIZE);
 	intel_bb_add_intel_buf(ibb, dst, true);
 
-	switch (buf->bpp) {
-	case 8:
-		blt_cmd_depth = 0;
-		break;
-	case 16: /* we're assuming 565 */
-		blt_cmd_depth = 1 << 24;
-		break;
-	case 32:
-		blt_cmd_depth = 3 << 24;
-		break;
-	default:
-		igt_assert(false);
+	if (HAS_4TILE(intel_get_drm_devid(fd))) {
+		int buf_height = buf->size / buf->stride;
+
+		switch (buf->bpp) {
+		case 8:
+			blt_cmd_depth = 0;
+			break;
+		case 16: /* we're assuming 565 */
+			blt_cmd_depth = 1 << 19;
+			break;
+		case 32:
+			blt_cmd_depth = 2 << 19;
+			break;
+		case 64:
+			/* Not used or supported yet */
+		default:
+			igt_assert(false);
+		}
+
+		switch (tiling) {
+		case I915_TILING_NONE:
+			blt_cmd_tiling = 0;
+			break;
+		case I915_TILING_X:
+			blt_cmd_tiling = 1 << 30;
+			break;
+		case I915_TILING_4:
+			blt_cmd_tiling = 2 << 30;
+			break;
+		default:
+			igt_assert(false);
+		}
+
+		pitch = tiling ? buf->stride / 4 : buf->stride;
+
+		intel_bb_out(ibb, XY_FAST_COLOR_BLT | blt_cmd_depth);
+		/* DG2 MOCS entry 2 is "UC - Non-Coherent; GO:Memory" */
+		intel_bb_out(ibb, blt_cmd_tiling | 2 << 21 | (pitch-1));
+		intel_bb_out(ibb, (rect->y << 16) | rect->x);
+		intel_bb_out(ibb, ((rect->y + rect->h) << 16) | (rect->x + rect->w));
+		intel_bb_emit_reloc_fenced(ibb, dst->handle, 0,
+					   I915_GEM_DOMAIN_RENDER, 0,
+					   dst->addr.offset);
+		intel_bb_out(ibb, 0);	/* TODO: Pass down enough info for target memory hint */
+		intel_bb_out(ibb, color);
+		intel_bb_out(ibb, 0);	/* 64 bit color */
+		intel_bb_out(ibb, 0);	/* 96 bit color */
+		intel_bb_out(ibb, 0);	/* 128 bit color */
+		intel_bb_out(ibb, 0);	/* clear address */
+		intel_bb_out(ibb, 0);	/* clear address */
+		intel_bb_out(ibb, (1 << 29) | ((pitch-1) << 14) | (buf_height-1));
+		intel_bb_out(ibb, 0);	/* mipmap levels / qpitch */
+		intel_bb_out(ibb, 0);	/* mipmap index / alignment */
+	} else {
+		switch (buf->bpp) {
+		case 8:
+			blt_cmd_depth = 0;
+			break;
+		case 16: /* we're assuming 565 */
+			blt_cmd_depth = 1 << 24;
+			break;
+		case 32:
+			blt_cmd_depth = 3 << 24;
+			break;
+		default:
+			igt_assert(false);
+		}
+
+		blt_cmd_len = (gen >= 8) ?  0x5 : 0x4;
+		blt_cmd_tiling = (tiling) ? XY_COLOR_BLT_TILED : 0;
+		pitch = (gen >= 4 && tiling) ? buf->stride / 4 : buf->stride;
+
+		switch_blt_tiling(ibb, tiling, true);
+
+		intel_bb_out(ibb, XY_COLOR_BLT_CMD_NOLEN | XY_COLOR_BLT_WRITE_ALPHA |
+			     XY_COLOR_BLT_WRITE_RGB | blt_cmd_tiling | blt_cmd_len);
+		intel_bb_out(ibb, blt_cmd_depth | (0xF0 << 16) | pitch);
+		intel_bb_out(ibb, (rect->y << 16) | rect->x);
+		intel_bb_out(ibb, ((rect->y + rect->h) << 16) | (rect->x + rect->w));
+		intel_bb_emit_reloc_fenced(ibb, dst->handle, 0, I915_GEM_DOMAIN_RENDER,
+					   0, dst->addr.offset);
+		intel_bb_out(ibb, color);
+
+		switch_blt_tiling(ibb, tiling, false);
 	}
-
-	blt_cmd_len = (gen >= 8) ?  0x5 : 0x4;
-	blt_cmd_tiling = (tiling) ? XY_COLOR_BLT_TILED : 0;
-	pitch = (gen >= 4 && tiling) ? buf->stride / 4 : buf->stride;
-
-	switch_blt_tiling(ibb, tiling, true);
-
-	intel_bb_out(ibb, XY_COLOR_BLT_CMD_NOLEN | XY_COLOR_BLT_WRITE_ALPHA |
-		     XY_COLOR_BLT_WRITE_RGB | blt_cmd_tiling | blt_cmd_len);
-	intel_bb_out(ibb, blt_cmd_depth | (0xF0 << 16) | pitch);
-	intel_bb_out(ibb, (rect->y << 16) | rect->x);
-	intel_bb_out(ibb, ((rect->y + rect->h) << 16) | (rect->x + rect->w));
-	intel_bb_emit_reloc_fenced(ibb, dst->handle, 0, I915_GEM_DOMAIN_RENDER,
-				   0, dst->addr.offset);
-	intel_bb_out(ibb, color);
-
-	switch_blt_tiling(ibb, tiling, false);
 
 	intel_bb_flush_blit(ibb);
 	intel_bb_destroy(ibb);
@@ -602,7 +780,7 @@ static void draw_rect_render(int fd, struct cmd_data *cmd_data,
 
 	src = create_buf(fd, cmd_data->bops, &tmp, I915_TILING_NONE);
 	dst = create_buf(fd, cmd_data->bops, buf, tiling);
-	ibb = intel_bb_create_with_context(fd, cmd_data->ctx, PAGE_SIZE);
+	ibb = intel_bb_create_with_context(fd, cmd_data->ctx, NULL, PAGE_SIZE);
 
 	rendercopy(ibb, src, 0, 0, rect->w, rect->h, dst, rect->x, rect->y);
 

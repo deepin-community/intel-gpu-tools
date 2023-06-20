@@ -82,7 +82,8 @@ static void test_fini(data_t *data, enum pipe pipe, int n_planes,
 	}
 
 	/* reset the constraint on the pipe */
-	igt_output_set_pipe(output, PIPE_ANY);
+	igt_output_set_pipe(output, PIPE_NONE);
+	igt_display_commit2(&data->display, data->display.is_atomic ? COMMIT_ATOMIC : COMMIT_LEGACY);
 
 	free(data->plane);
 	data->plane = NULL;
@@ -95,7 +96,7 @@ static void
 create_fb_for_mode_position(data_t *data, drmModeModeInfo *mode,
 			    int *rect_x, int *rect_y,
 			    int *rect_w, int *rect_h,
-			    uint64_t tiling, int max_planes,
+			    uint64_t modifier, int max_planes,
 			    igt_output_t *output)
 {
 	unsigned int fb_id;
@@ -104,10 +105,9 @@ create_fb_for_mode_position(data_t *data, drmModeModeInfo *mode,
 
 	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
 
-	fb_id = igt_create_fb(data->drm_fd,
-			      mode->hdisplay, mode->vdisplay,
+	fb_id = igt_create_fb(data->drm_fd, mode->hdisplay, mode->vdisplay,
 			      DRM_FORMAT_XRGB8888,
-			      tiling,
+			      modifier,
 			      &data->fb[primary->index]);
 	igt_assert(fb_id);
 
@@ -117,7 +117,18 @@ create_fb_for_mode_position(data_t *data, drmModeModeInfo *mode,
 			0.0f, 0.0f, 1.0f);
 
 	for (int i = 0; i < max_planes; i++) {
-		if (data->plane[i]->type == DRM_PLANE_TYPE_PRIMARY)
+		/*
+		 * prepare_planes() skips the assignment of data->plane
+		 * for primary planes as they are handled separately.
+		 *
+		 * Only one primary plane is assigned and prepared for
+		 * the test. If there are multiple primary planes, the
+		 * remaining are unassigned.
+		 *
+		 * Check if the data->plane is valid before accessing its
+		 * members to fix this crash
+		 */
+		if (data->plane[i] && data->plane[i]->type == DRM_PLANE_TYPE_PRIMARY)
 			continue;
 
 		igt_paint_color(cr, rect_x[i], rect_y[i],
@@ -138,6 +149,7 @@ prepare_planes(data_t *data, enum pipe pipe, int max_planes,
 	int *y;
 	int *size;
 	int i;
+	int format, modifier;
 
 	igt_output_set_pipe(output, pipe);
 
@@ -161,24 +173,25 @@ prepare_planes(data_t *data, enum pipe pipe, int max_planes,
 	for (i = 0; i < max_planes; i++) {
 		igt_plane_t *plane = igt_output_get_plane(output, i);
 
-		if (plane->type == DRM_PLANE_TYPE_PRIMARY)
+		if (plane->type == DRM_PLANE_TYPE_PRIMARY) {
 			continue;
-		else if (plane->type == DRM_PLANE_TYPE_CURSOR)
+		} else if (plane->type == DRM_PLANE_TYPE_CURSOR) {
 			size[i] = SIZE_CURSOR;
-		else
+			format = DRM_FORMAT_ARGB8888;
+			modifier = DRM_FORMAT_MOD_LINEAR;
+		} else {
 			size[i] = SIZE_PLANE;
+			format = DRM_FORMAT_XRGB8888;
+			modifier = DRM_FORMAT_MOD_LINEAR;
+		}
 
 		x[i] = rand() % (mode->hdisplay - size[i]);
 		y[i] = rand() % (mode->vdisplay - size[i]);
 
 		data->plane[i] = plane;
 
-		igt_create_color_fb(data->drm_fd,
-				    size[i], size[i],
-				    data->plane[i]->type == DRM_PLANE_TYPE_CURSOR ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888,
-				    data->plane[i]->type == DRM_PLANE_TYPE_CURSOR ? LOCAL_DRM_FORMAT_MOD_NONE : LOCAL_I915_FORMAT_MOD_X_TILED,
-				    0.0f, 0.0f, 1.0f,
-				    &data->fb[i]);
+		igt_create_color_fb(data->drm_fd, size[i], size[i], format, modifier,
+				    0.0f, 0.0f, 1.0f, &data->fb[i]);
 
 		igt_plane_set_position(data->plane[i], x[i], y[i]);
 		igt_plane_set_fb(data->plane[i], &data->fb[i]);
@@ -186,8 +199,7 @@ prepare_planes(data_t *data, enum pipe pipe, int max_planes,
 
 	/* primary plane */
 	data->plane[primary->index] = primary;
-	create_fb_for_mode_position(data, mode, x, y, size, size,
-				    LOCAL_I915_FORMAT_MOD_X_TILED,
+	create_fb_for_mode_position(data, mode, x, y, size, size, DRM_FORMAT_MOD_LINEAR,
 				    max_planes, output);
 
 	igt_plane_set_fb(data->plane[primary->index], &data->fb[primary->index]);
@@ -223,44 +235,39 @@ test_plane_position_with_output(data_t *data, enum pipe pipe, int max_planes,
 	}
 }
 
-static const drmModeModeInfo *
+static drmModeModeInfo *
 get_lowres_mode(data_t *data, const drmModeModeInfo *mode_default,
 		igt_output_t *output)
 {
-	const drmModeModeInfo *mode = igt_std_1024_mode_get();
 	drmModeConnector *connector = output->config.connector;
 	int limit = mode_default->vdisplay - SIZE_PLANE;
-	bool found;
 
 	if (!connector)
-		return mode;
+		return igt_std_1024_mode_get(60);
 
-	found = false;
 	for (int i = 0; i < connector->count_modes; i++) {
-		mode = &connector->modes[i];
+		const drmModeModeInfo *mode = &connector->modes[i];
 
-		if (mode->vdisplay < limit) {
-			found = true;
-			break;
-		}
+		if (mode->vdisplay < limit)
+			return igt_memdup(mode, sizeof(*mode));
 	}
 
-	if (!found)
-		mode = igt_std_1024_mode_get();
-
-	return mode;
+	igt_skip_on_f(mode_default->hdisplay < 1024, "No suitable resolution was found\n");
+	return igt_std_1024_mode_get(igt_output_preferred_vrefresh(output));
 }
 
 static void
 test_resolution_with_output(data_t *data, enum pipe pipe, int max_planes, igt_output_t *output)
 {
-	const drmModeModeInfo *mode_hi, *mode_lo;
 	int iterations = opt.iterations < 1 ? max_planes : opt.iterations;
 	bool loop_forever = opt.iterations == LOOP_FOREVER ? true : false;
 	int i;
 
 	i = 0;
 	while (i < iterations || loop_forever) {
+		const drmModeModeInfo *mode_hi;
+		drmModeModeInfo *mode_lo;
+
 		igt_output_set_pipe(output, pipe);
 
 		mode_hi = igt_output_get_mode(output);
@@ -268,6 +275,9 @@ test_resolution_with_output(data_t *data, enum pipe pipe, int max_planes, igt_ou
 
 		/* switch to lower resolution */
 		igt_output_override_mode(output, mode_lo);
+		free(mode_lo);
+		if (is_amdgpu_device(data->drm_fd))
+			igt_output_set_pipe(output, PIPE_NONE);
 		igt_display_commit2(&data->display, COMMIT_ATOMIC);
 
 		/* switch back to higher resolution */
@@ -281,35 +291,28 @@ test_resolution_with_output(data_t *data, enum pipe pipe, int max_planes, igt_ou
 static void
 run_test(data_t *data, enum pipe pipe, igt_output_t *output)
 {
-	int connected_outs;
 	int n_planes = data->display.pipes[pipe].n_planes;
+	igt_display_reset(&data->display);
 
 	if (!opt.user_seed)
 		opt.seed = time(NULL);
 
-	connected_outs = 0;
-	for_each_valid_output_on_pipe(&data->display, pipe, output) {
-		igt_info("Testing resolution with connector %s using pipe %s with seed %d\n",
-			 igt_output_name(output), kmstest_pipe_name(pipe), opt.seed);
+	igt_info("Testing resolution with connector %s using pipe %s with seed %d\n",
+		 igt_output_name(output), kmstest_pipe_name(pipe), opt.seed);
 
-		srand(opt.seed);
+	srand(opt.seed);
 
-		test_init(data, pipe, n_planes, output);
+	test_init(data, pipe, n_planes, output);
 
-		igt_fork(child, 1) {
-			test_plane_position_with_output(data, pipe, n_planes, output);
-		}
-
-		test_resolution_with_output(data, pipe, n_planes, output);
-
-		igt_waitchildren();
-
-		test_fini(data, pipe, n_planes, output);
-
-		connected_outs++;
+	igt_fork(child, 1) {
+		test_plane_position_with_output(data, pipe, n_planes, output);
 	}
 
-	igt_skip_on(connected_outs == 0);
+	test_resolution_with_output(data, pipe, n_planes, output);
+
+	igt_waitchildren();
+
+	test_fini(data, pipe, n_planes, output);
 }
 
 static void
@@ -318,22 +321,19 @@ run_tests_for_pipe(data_t *data, enum pipe pipe)
 	igt_output_t *output;
 
 	igt_fixture {
-		int valid_tests = 0;
-
 		igt_require_pipe(&data->display, pipe);
 		igt_require(data->display.pipes[pipe].n_planes > 0);
 
-		for_each_valid_output_on_pipe(&data->display, pipe, output)
-			valid_tests++;
-
-		igt_require_f(valid_tests, "no valid crtc/connector combinations found\n");
+		igt_display_require_output(&data->display);
 	}
 
 	igt_describe("Test atomic mode setting concurrently with multiple planes and screen "
 		     "resolution.");
-	igt_subtest_f("pipe-%s", kmstest_pipe_name(pipe))
+	igt_subtest_with_dynamic_f("pipe-%s", kmstest_pipe_name(pipe)) {
 		for_each_valid_output_on_pipe(&data->display, pipe, output)
-			run_test(data, pipe, output);
+			igt_dynamic_f("%s", igt_output_name(output))
+				run_test(data, pipe, output);
+	}
 }
 
 static int opt_handler(int option, int option_index, void *input)
@@ -379,6 +379,8 @@ igt_main_args("", long_options, help_str, opt_handler, NULL)
 		kmstest_set_vt_graphics_mode();
 		igt_display_require(&data.display, data.drm_fd);
 		igt_require(data.display.is_atomic);
+		if (is_i915_device(data.drm_fd))
+			intel_allocator_multiprocess_start();
 	}
 
 	for_each_pipe_static(pipe) {
@@ -387,6 +389,8 @@ igt_main_args("", long_options, help_str, opt_handler, NULL)
 	}
 
 	igt_fixture {
+		if (is_i915_device(data.drm_fd))
+			intel_allocator_multiprocess_stop();
 		igt_display_fini(&data.display);
 		close(data.drm_fd);
 	}

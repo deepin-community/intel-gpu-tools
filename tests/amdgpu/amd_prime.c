@@ -27,11 +27,11 @@
 #include <sys/poll.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_vgem.h"
-
-#define GFX_COMPUTE_NOP  0xffff1000
-#define SDMA_NOP  0x0
+#include "lib/amdgpu/amd_sdma.h"
+#include "lib/amdgpu/amd_PM4.h"
 
 static int
 amdgpu_bo_alloc_and_map(amdgpu_device_handle dev, unsigned size,
@@ -172,6 +172,7 @@ static void unplug(struct cork *c)
 static void i915_to_amd(int i915, int amd, amdgpu_device_handle device)
 {
 	const uint32_t bbe = MI_BATCH_BUFFER_END;
+	intel_ctx_cfg_t cfg;
 	struct drm_i915_gem_exec_object2 obj[2];
 	struct drm_i915_gem_execbuffer2 execbuf;
 	const struct intel_execution_engine2 *e;
@@ -180,8 +181,10 @@ static void i915_to_amd(int i915, int amd, amdgpu_device_handle device)
 	unsigned long count;
 	struct cork c;
 
+	cfg = intel_ctx_cfg_all_physical(i915);
+
 	nengine = 0;
-	__for_each_physical_engine(i915, e)
+	for_each_ctx_cfg_engine(i915, &cfg, e)
 		engines[nengine++] = e->flags;
 	igt_require(nengine);
 
@@ -198,14 +201,15 @@ static void i915_to_amd(int i915, int amd, amdgpu_device_handle device)
 
 	count = 0;
 	igt_until_timeout(5) {
-		execbuf.rsvd1 = gem_context_clone_with_engines(i915, 0);
+		const intel_ctx_t *ctx = intel_ctx_create(i915, &cfg);
+		execbuf.rsvd1 = ctx->id;
 
 		for (unsigned n = 0; n < nengine; n++) {
 			execbuf.flags = engines[n];
 			gem_execbuf(i915, &execbuf);
 		}
 
-		gem_context_destroy(i915, execbuf.rsvd1);
+		intel_ctx_destroy(i915, ctx);
 		count++;
 
 		if (!gem_uses_full_ppgtt(i915))

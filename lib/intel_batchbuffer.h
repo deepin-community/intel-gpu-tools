@@ -2,7 +2,6 @@
 #define INTEL_BATCHBUFFER_H
 
 #include <stdint.h>
-#include <intel_bufmgr.h>
 #include <i915_drm.h>
 
 #include "igt_core.h"
@@ -12,197 +11,9 @@
 #include "intel_allocator.h"
 
 #define BATCH_SZ 4096
-#define BATCH_RESERVED 16
-
-struct intel_batchbuffer {
-	drm_intel_bufmgr *bufmgr;
-	uint32_t devid;
-	unsigned int gen;
-
-	drm_intel_context *ctx;
-	drm_intel_bo *bo;
-
-	uint8_t buffer[BATCH_SZ];
-	uint8_t *ptr, *end;
-};
-
-struct intel_batchbuffer *intel_batchbuffer_alloc(drm_intel_bufmgr *bufmgr,
-						  uint32_t devid);
-
-void intel_batchbuffer_set_context(struct intel_batchbuffer *batch,
-				   drm_intel_context *ctx);
-
-
-void intel_batchbuffer_free(struct intel_batchbuffer *batch);
-
-
-void intel_batchbuffer_flush(struct intel_batchbuffer *batch);
-void intel_batchbuffer_flush_on_ring(struct intel_batchbuffer *batch, int ring);
-void intel_batchbuffer_flush_with_context(struct intel_batchbuffer *batch,
-					  drm_intel_context *context);
-
-void intel_batchbuffer_reset(struct intel_batchbuffer *batch);
-
-uint32_t intel_batchbuffer_copy_data(struct intel_batchbuffer *batch,
-				const void *data, unsigned int bytes,
-				uint32_t align);
-
-void intel_batchbuffer_emit_reloc(struct intel_batchbuffer *batch,
-				  drm_intel_bo *buffer,
-				  uint64_t delta,
-				  uint32_t read_domains,
-				  uint32_t write_domain,
-				  int fenced);
-
-uint32_t
-intel_batchbuffer_align(struct intel_batchbuffer *batch, uint32_t align);
-
-void *
-intel_batchbuffer_subdata_alloc(struct intel_batchbuffer *batch,
-				uint32_t size, uint32_t align);
-
-uint32_t
-intel_batchbuffer_subdata_offset(struct intel_batchbuffer *batch, void *ptr);
-
-/* Inline functions - might actually be better off with these
- * non-inlined.  Certainly better off switching all command packets to
- * be passed as structs rather than dwords, but that's a little bit of
- * work...
- */
-#pragma GCC diagnostic ignored "-Winline"
-static inline unsigned int
-intel_batchbuffer_space(struct intel_batchbuffer *batch)
-{
-	return (BATCH_SZ - BATCH_RESERVED) - (batch->ptr - batch->buffer);
-}
-
-
-static inline void
-intel_batchbuffer_emit_dword(struct intel_batchbuffer *batch, uint32_t dword)
-{
-	igt_assert(intel_batchbuffer_space(batch) >= 4);
-	*(uint32_t *) (batch->ptr) = dword;
-	batch->ptr += 4;
-}
-
-static inline void
-intel_batchbuffer_require_space(struct intel_batchbuffer *batch,
-                                unsigned int sz)
-{
-	igt_assert(sz < BATCH_SZ - BATCH_RESERVED);
-	if (intel_batchbuffer_space(batch) < sz)
-		intel_batchbuffer_flush(batch);
-}
-
-/**
- * BEGIN_BATCH:
- * @n: number of DWORDS to emit
- * @r: number of RELOCS to emit
- *
- * Prepares a batch to emit @n DWORDS, flushing it if there's not enough space
- * available.
- *
- * This macro needs a pointer to an #intel_batchbuffer structure called batch in
- * scope.
- */
-#define BEGIN_BATCH(n, r) do {						\
-	int __n = (n); \
-	igt_assert(batch->end == NULL); \
-	if (batch->gen >= 8) __n += r;	\
-	__n *= 4; \
-	intel_batchbuffer_require_space(batch, __n);			\
-	batch->end = batch->ptr + __n; \
-} while (0)
-
-/**
- * OUT_BATCH:
- * @d: DWORD to emit
- *
- * Emits @d into a batch.
- *
- * This macro needs a pointer to an #intel_batchbuffer structure called batch in
- * scope.
- */
-#define OUT_BATCH(d) intel_batchbuffer_emit_dword(batch, d)
-
-/**
- * OUT_RELOC_FENCED:
- * @buf: relocation target libdrm buffer object
- * @read_domains: gem domain bits for the relocation
- * @write_domain: gem domain bit for the relocation
- * @delta: delta value to add to @buffer's gpu address
- *
- * Emits a fenced relocation into a batch.
- *
- * This macro needs a pointer to an #intel_batchbuffer structure called batch in
- * scope.
- */
-#define OUT_RELOC_FENCED(buf, read_domains, write_domain, delta) do {		\
-	igt_assert((delta) >= 0);						\
-	intel_batchbuffer_emit_reloc(batch, buf, delta,			\
-				     read_domains, write_domain, 1);	\
-} while (0)
-
-/**
- * OUT_RELOC:
- * @buf: relocation target libdrm buffer object
- * @read_domains: gem domain bits for the relocation
- * @write_domain: gem domain bit for the relocation
- * @delta: delta value to add to @buffer's gpu address
- *
- * Emits a normal, unfenced relocation into a batch.
- *
- * This macro needs a pointer to an #intel_batchbuffer structure called batch in
- * scope.
- */
-#define OUT_RELOC(buf, read_domains, write_domain, delta) do {		\
-	igt_assert((delta) >= 0);						\
-	intel_batchbuffer_emit_reloc(batch, buf, delta,			\
-				     read_domains, write_domain, 0);	\
-} while (0)
-
-/**
- * ADVANCE_BATCH:
- *
- * Completes the batch command emission sequence started with #BEGIN_BATCH.
- *
- * This macro needs a pointer to an #intel_batchbuffer structure called batch in
- * scope.
- */
-#define ADVANCE_BATCH() do {						\
-	igt_assert(batch->ptr == batch->end); \
-	batch->end = NULL; \
-} while(0)
-
-#define BLIT_COPY_BATCH_START(flags) do { \
-	BEGIN_BATCH(8, 2); \
-	OUT_BATCH(XY_SRC_COPY_BLT_CMD | \
-		  XY_SRC_COPY_BLT_WRITE_ALPHA | \
-		  XY_SRC_COPY_BLT_WRITE_RGB | \
-		  (flags) | \
-		  (6 + 2*(batch->gen >= 8))); \
-} while(0)
-
-#define COLOR_BLIT_COPY_BATCH_START(flags) do { \
-	BEGIN_BATCH(6, 1); \
-	OUT_BATCH(XY_COLOR_BLT_CMD_NOLEN | \
-		  COLOR_BLT_WRITE_ALPHA | \
-		  XY_COLOR_BLT_WRITE_RGB | \
-		  (flags) | \
-		  (4 + (batch->gen >= 8))); \
-} while(0)
-
-void
-intel_blt_copy(struct intel_batchbuffer *batch,
-	      drm_intel_bo *src_bo, int src_x1, int src_y1, int src_pitch,
-	      drm_intel_bo *dst_bo, int dst_x1, int dst_y1, int dst_pitch,
-	      int width, int height, int bpp);
-void intel_copy_bo(struct intel_batchbuffer *batch,
-		   drm_intel_bo *dst_bo, drm_intel_bo *src_bo,
-		   long int size);
 
 /*
- * Yf/Ys tiling
+ * Yf/Ys/4 tiling
  *
  * Tiling mode in the I915_TILING_... namespace for new tiling modes which are
  * defined in the kernel. (They are not fenceable so the kernel does not need
@@ -210,8 +21,9 @@ void intel_copy_bo(struct intel_batchbuffer *batch,
  *
  * They are to be used the the blitting routines below.
  */
-#define I915_TILING_Yf	3
-#define I915_TILING_Ys	4
+#define I915_TILING_4	(I915_TILING_LAST + 1)
+#define I915_TILING_Yf	(I915_TILING_LAST + 2)
+#define I915_TILING_Ys	(I915_TILING_LAST + 3)
 
 enum i915_compression {
 	I915_COMPRESSION_NONE,
@@ -219,64 +31,17 @@ enum i915_compression {
 	I915_COMPRESSION_MEDIA,
 };
 
-/**
- * igt_buf:
- * @bo: underlying libdrm buffer object
- * @stride: stride of the buffer
- * @tiling: tiling mode bits
- * @compression: memory compression mode
- * @bpp: bits per pixel, 8, 16 or 32.
- * @data: pointer to the memory mapping of the buffer
- * @size: size of the buffer object
- *
- * This is a i-g-t buffer object wrapper structure which augments the baseline
- * libdrm buffer object with suitable data needed by the render/vebox copy and
- * the fill functions.
- */
-struct igt_buf {
-	drm_intel_bo *bo;
-	uint32_t tiling;
-	enum i915_compression compression;
-	uint32_t bpp;
-	uint32_t yuv_semiplanar_bpp;
-	uint32_t *data;
-	bool format_is_yuv:1;
-	bool format_is_yuv_semiplanar:1;
-	struct {
-		uint32_t offset;
-		uint32_t stride;
-		uint32_t size;
-	} surface[2];
-	struct {
-		uint32_t offset;
-		uint32_t stride;
-	} ccs[2];
-	struct {
-		uint32_t offset;
-	} cc;
-	/*< private >*/
-	unsigned num_tiles;
-};
-
-static inline bool igt_buf_compressed(const struct igt_buf *buf)
-{
-	return buf->compression != I915_COMPRESSION_NONE;
-}
-
-unsigned igt_buf_width(const struct igt_buf *buf);
-unsigned igt_buf_height(const struct igt_buf *buf);
-unsigned int igt_buf_intel_ccs_width(unsigned int gen,
-				     const struct igt_buf *buf);
-unsigned int igt_buf_intel_ccs_height(unsigned int gen,
-				      const struct igt_buf *buf);
-
 void igt_blitter_src_copy(int fd,
+			  uint64_t ahnd,
+			  uint32_t ctx,
+			  const intel_ctx_cfg_t *cfg,
 			  /* src */
 			  uint32_t src_handle,
 			  uint32_t src_delta,
 			  uint32_t src_stride,
 			  uint32_t src_tiling,
 			  uint32_t src_x, uint32_t src_y,
+			  uint64_t src_size,
 
 			  /* size */
 			  uint32_t width, uint32_t height,
@@ -289,23 +54,20 @@ void igt_blitter_src_copy(int fd,
 			  uint32_t dst_delta,
 			  uint32_t dst_stride,
 			  uint32_t dst_tiling,
-			  uint32_t dst_x, uint32_t dst_y);
-
-void igt_blitter_fast_copy(struct intel_batchbuffer *batch,
-			   const struct igt_buf *src, unsigned src_delta,
-			   unsigned src_x, unsigned src_y,
-			   unsigned width, unsigned height,
-			   int bpp,
-			   const struct igt_buf *dst, unsigned dst_delta,
-			   unsigned dst_x, unsigned dst_y);
+			  uint32_t dst_x, uint32_t dst_y,
+			  uint64_t dst_size);
 
 void igt_blitter_fast_copy__raw(int fd,
+				uint64_t ahnd,
+				uint32_t ctx,
+				const intel_ctx_cfg_t *cfg,
 				/* src */
 				uint32_t src_handle,
 				unsigned int src_delta,
 				unsigned int src_stride,
 				unsigned int src_tiling,
 				unsigned int src_x, unsigned src_y,
+				uint64_t src_size,
 
 				/* size */
 				unsigned int width, unsigned int height,
@@ -318,7 +80,8 @@ void igt_blitter_fast_copy__raw(int fd,
 				unsigned int dst_delta,
 				unsigned int dst_stride,
 				unsigned int dst_tiling,
-				unsigned int dst_x, unsigned dst_y);
+				unsigned int dst_x, unsigned dst_y,
+				uint64_t dst_size);
 
 /**
  * igt_render_copyfunc_t:
@@ -438,12 +201,20 @@ typedef void (*igt_media_spinfunc_t)(int i915,
 
 igt_media_spinfunc_t igt_get_media_spinfunc(int devid);
 
+struct igt_pxp {
+	bool     enabled;
+	uint32_t apptype;
+	uint32_t appid;
+};
 
 /*
  * Batchbuffer without libdrm dependency
  */
 struct intel_bb {
+	struct igt_list_head link;
+
 	uint64_t allocator_handle;
+	uint64_t allocator_start, allocator_end;
 	uint8_t allocator_type;
 	enum allocator_strategy allocator_strategy;
 
@@ -463,9 +234,14 @@ struct intel_bb {
 	uint64_t gtt_size;
 	bool supports_48b_address;
 	bool uses_full_ppgtt;
+	bool allows_obj_alignment;
 
+	struct igt_pxp pxp;
 	uint32_t ctx;
 	uint32_t vm_id;
+
+	/* Context configuration */
+	intel_ctx_cfg_t *cfg;
 
 	/* Cache */
 	void *root;
@@ -495,19 +271,26 @@ struct intel_bb {
 };
 
 struct intel_bb *
-intel_bb_create_full(int i915, uint32_t ctx, uint32_t size,
-		     uint64_t start, uint64_t end,
+intel_bb_create_full(int i915, uint32_t ctx, const intel_ctx_cfg_t *cfg,
+		     uint32_t size, uint64_t start, uint64_t end,
 		     uint8_t allocator_type, enum allocator_strategy strategy);
 struct intel_bb *
-intel_bb_create_with_allocator(int i915, uint32_t ctx,
+intel_bb_create_with_allocator(int i915, uint32_t ctx, const intel_ctx_cfg_t *cfg,
 			       uint32_t size, uint8_t allocator_type);
 struct intel_bb *intel_bb_create(int i915, uint32_t size);
 struct intel_bb *
-intel_bb_create_with_context(int i915, uint32_t ctx, uint32_t size);
+intel_bb_create_with_context(int i915, uint32_t ctx, const intel_ctx_cfg_t *cfg,
+			     uint32_t size);
 struct intel_bb *intel_bb_create_with_relocs(int i915, uint32_t size);
 struct intel_bb *
-intel_bb_create_with_relocs_and_context(int i915, uint32_t ctx, uint32_t size);
+intel_bb_create_with_relocs_and_context(int i915, uint32_t ctx,
+					const intel_ctx_cfg_t *cfg, uint32_t size);
+struct intel_bb *intel_bb_create_no_relocs(int i915, uint32_t size);
 void intel_bb_destroy(struct intel_bb *ibb);
+
+/* make it safe to use intel_allocator after failed test */
+void intel_bb_reinit_allocator(void);
+void intel_bb_track(bool do_tracking);
 
 static inline void intel_bb_ref(struct intel_bb *ibb)
 {
@@ -522,9 +305,6 @@ static inline void intel_bb_unref(struct intel_bb *ibb)
 
 void intel_bb_reset(struct intel_bb *ibb, bool purge_objects_cache);
 int intel_bb_sync(struct intel_bb *ibb);
-
-uint64_t intel_bb_assign_vm(struct intel_bb *ibb, uint64_t allocator,
-			    uint32_t vm_id);
 
 void intel_bb_print(struct intel_bb *ibb);
 void intel_bb_dump(struct intel_bb *ibb, const char *filename);
@@ -578,6 +358,27 @@ static inline void intel_bb_out(struct intel_bb *ibb, uint32_t dword)
 	igt_assert(intel_bb_offset(ibb) <= ibb->size);
 }
 
+void intel_bb_set_pxp(struct intel_bb *ibb, bool new_state,
+		      uint32_t apptype, uint32_t appid);
+
+static inline bool intel_bb_pxp_enabled(struct intel_bb *ibb)
+{
+	igt_assert(ibb);
+	return ibb->pxp.enabled;
+}
+
+static inline uint32_t intel_bb_pxp_apptype(struct intel_bb *ibb)
+{
+	igt_assert(ibb);
+	return ibb->pxp.apptype;
+}
+
+static inline uint32_t intel_bb_pxp_appid(struct intel_bb *ibb)
+{
+	igt_assert(ibb);
+	return ibb->pxp.appid;
+}
+
 struct drm_i915_gem_exec_object2 *
 intel_bb_add_object(struct intel_bb *ibb, uint32_t handle, uint64_t size,
 		    uint64_t offset, uint64_t alignment, bool write);
@@ -588,7 +389,6 @@ intel_bb_add_intel_buf(struct intel_bb *ibb, struct intel_buf *buf, bool write);
 struct drm_i915_gem_exec_object2 *
 intel_bb_add_intel_buf_with_alignment(struct intel_bb *ibb, struct intel_buf *buf,
 				      uint64_t alignment, bool write);
-void intel_bb_detach_intel_buf(struct intel_bb *ibb, struct intel_buf *buf);
 bool intel_bb_remove_intel_buf(struct intel_bb *ibb, struct intel_buf *buf);
 void intel_bb_print_intel_bufs(struct intel_bb *ibb);
 struct drm_i915_gem_exec_object2 *
@@ -637,6 +437,9 @@ uint64_t intel_bb_offset_reloc_to_object(struct intel_bb *ibb,
 					 uint32_t offset,
 					 uint64_t presumed_offset);
 
+int __intel_bb_exec(struct intel_bb *ibb, uint32_t end_offset,
+			uint64_t flags, bool sync);
+
 void intel_bb_dump_cache(struct intel_bb *ibb);
 
 void intel_bb_exec(struct intel_bb *ibb, uint32_t end_offset,
@@ -675,10 +478,12 @@ void intel_bb_copy_intel_buf(struct intel_bb *ibb,
 /**
  * igt_huc_copyfunc_t:
  * @fd: drm fd
+ * @ahnd: allocator handle, if it is equal to 0 we use relocations
  * @obj: drm_i915_gem_exec_object2 buffer array
  *       obj[0] is source buffer
  *       obj[1] is destination buffer
  *       obj[2] is execution buffer
+ * @objsize: corresponding buffer sizes to @obj
  *
  * This is the type of the per-platform huc copy functions.
  *
@@ -686,8 +491,9 @@ void intel_bb_copy_intel_buf(struct intel_bb *ibb,
  * invoke the HuC Copy kernel to copy 4K bytes from the source buffer
  * to the destination buffer.
  */
-typedef void (*igt_huc_copyfunc_t)(int fd,
-		struct drm_i915_gem_exec_object2 *obj);
+typedef void (*igt_huc_copyfunc_t)(int fd, uint64_t ahnd,
+		struct drm_i915_gem_exec_object2 *obj, uint64_t *objsize);
 
 igt_huc_copyfunc_t	igt_get_huc_copyfunc(int devid);
 #endif
+

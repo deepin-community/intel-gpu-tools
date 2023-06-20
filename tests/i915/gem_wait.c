@@ -28,8 +28,11 @@
 #include <sys/poll.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_vgem.h"
+
+IGT_TEST_DESCRIPTION("Tests the GEM_WAIT ioctl");
 
 static int __gem_wait(int fd, struct drm_i915_gem_wait *w)
 {
@@ -74,13 +77,17 @@ static void invalid_buf(int fd)
 
 #define timespec_isset(x) ((x)->tv_sec | (x)->tv_nsec)
 
-static void basic(int fd, unsigned engine, unsigned flags)
+static void basic(int fd, const intel_ctx_t *ctx, unsigned engine,
+		  unsigned flags)
 {
+	uint64_t ahnd = get_reloc_ahnd(fd, ctx->id);
 	IGT_CORK_HANDLE(cork);
 	uint32_t plug =
 		flags & (WRITE | AWAIT) ? igt_cork_plug(&cork, fd) : 0;
 	igt_spin_t *spin =
 		igt_spin_new(fd,
+			     .ahnd = ahnd,
+			     .ctx = ctx,
 			     .engine = engine,
 			     .dependency = plug,
 			     .flags = (flags & HANG) ? IGT_SPIN_NO_PREEMPTION : 0);
@@ -144,23 +151,25 @@ static void basic(int fd, unsigned engine, unsigned flags)
 	if (plug)
 		gem_close(fd, plug);
 	igt_spin_free(fd, spin);
+	put_ahnd(ahnd);
 }
 
-static void test_all_engines(const char *name, int i915, unsigned int test)
+static void test_all_engines(const char *name, int i915, const intel_ctx_t *ctx,
+			     unsigned int test)
 {
 	const struct intel_execution_engine2 *e;
 
 	igt_subtest_with_dynamic(name) {
-		igt_dynamic("all") {
+		igt_dynamic("all-engines") {
 			gem_quiescent_gpu(i915);
-			basic(i915, ALL_ENGINES, test);
+			basic(i915, ctx, ALL_ENGINES, test);
 			gem_quiescent_gpu(i915);
 		}
 
-		__for_each_physical_engine(i915, e) {
+		for_each_ctx_engine(i915, ctx, e) {
 			igt_dynamic_f("%s", e->name) {
 				gem_quiescent_gpu(i915);
-				basic(i915, e->flags, test);
+				basic(i915, ctx, e->flags, test);
 				gem_quiescent_gpu(i915);
 			}
 		}
@@ -169,16 +178,20 @@ static void test_all_engines(const char *name, int i915, unsigned int test)
 
 igt_main
 {
+	const intel_ctx_t *ctx;
 	int fd = -1;
 
 	igt_fixture {
 		fd = drm_open_driver_master(DRIVER_INTEL);
 		igt_require_gem(fd);
+		ctx = intel_ctx_create_all_physical(fd);
 	}
 
+	igt_describe("Verify that GEM_WAIT called with invalid flag will fail.");
 	igt_subtest("invalid-flags")
 		invalid_flags(fd);
 
+	igt_describe("Verify that GEM_WAIT called with invalid buffer object will fail.");
 	igt_subtest("invalid-buf")
 		invalid_buf(fd);
 
@@ -200,8 +213,11 @@ igt_main
 			igt_fork_signal_helper();
 		}
 
-		for (const typeof(*tests) *t = tests; t->name; t++)
-			test_all_engines(t->name, fd, t->flags);
+		for (const typeof(*tests) *t = tests; t->name; t++) {
+			igt_describe_f("Verify GEM_WAIT functionality in"
+				       " %s mode.", t->name);
+			test_all_engines(t->name, fd, ctx, t->flags);
+		}
 
 		igt_fixture {
 			igt_stop_signal_helper();
@@ -223,12 +239,15 @@ igt_main
 		igt_hang_t hang;
 
 		igt_fixture {
-			hang = igt_allow_hang(fd, 0, 0);
+			hang = igt_allow_hang(fd, ctx->id, 0);
 			igt_fork_signal_helper();
 		}
 
-		for (const typeof(*tests) *t = tests; t->name; t++)
-			test_all_engines(t->name, fd, t->flags);
+		for (const typeof(*tests) *t = tests; t->name; t++) {
+			igt_describe_f("Verify GEM_WAIT functionality in %s mode,"
+				       " when hang is allowed.", (t->name+5));
+			test_all_engines(t->name, fd, ctx, t->flags);
+		}
 
 		igt_fixture {
 			igt_stop_signal_helper();
@@ -237,6 +256,7 @@ igt_main
 	}
 
 	igt_fixture {
+		intel_ctx_destroy(fd, ctx);
 		close(fd);
 	}
 }

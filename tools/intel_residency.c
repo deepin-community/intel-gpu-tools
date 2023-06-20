@@ -267,13 +267,13 @@ static void setup_modeset(void)
 	for (i = 0; i < 2; i++) {
 		igt_create_fb(drm.fd, modeset.mode->hdisplay,
 			      modeset.mode->vdisplay,  DRM_FORMAT_XRGB8888,
-			      LOCAL_I915_FORMAT_MOD_X_TILED, &fbs[i]);
+			      I915_FORMAT_MOD_X_TILED, &fbs[i]);
 		igt_draw_fill_fb(drm.fd, &fbs[i], 0x80);
 	}
 	draw_rect(&fbs[1], IGT_DRAW_BLT, 0x800000);
 
 	igt_create_fb(drm.fd, 64, 64, DRM_FORMAT_ARGB8888,
-		     LOCAL_DRM_FORMAT_MOD_NONE, &cursor);
+		     DRM_FORMAT_MOD_LINEAR, &cursor);
 	igt_draw_fill_fb(drm.fd, &cursor, 0xFF008000);
 }
 

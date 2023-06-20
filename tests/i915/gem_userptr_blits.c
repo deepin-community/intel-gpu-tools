@@ -59,8 +59,10 @@
 #include "i915_drm.h"
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_sysfs.h"
+#include "igt_types.h"
 #include "sw_sync.h"
 
 #include "eviction_common.c"
@@ -99,6 +101,12 @@ static int copy(int fd, uint32_t dst, uint32_t src)
 	struct drm_i915_gem_execbuffer2 exec;
 	uint32_t handle;
 	int ret, i=0;
+	uint64_t dst_offset, src_offset, bb_offset;
+	bool has_relocs = gem_has_relocations(fd);
+
+	bb_offset = 16 << 20;
+	dst_offset = bb_offset + 4096;
+	src_offset = dst_offset + WIDTH * HEIGHT * sizeof(uint32_t) * (src != dst);
 
 	batch[i++] = XY_SRC_COPY_BLT_CMD |
 		  XY_SRC_COPY_BLT_WRITE_ALPHA |
@@ -113,14 +121,14 @@ static int copy(int fd, uint32_t dst, uint32_t src)
 		  WIDTH*4;
 	batch[i++] = 0; /* dst x1,y1 */
 	batch[i++] = (HEIGHT << 16) | WIDTH; /* dst x2,y2 */
-	batch[i++] = 0; /* dst reloc */
+	batch[i++] = dst_offset; /* dst reloc */
 	if (intel_gen(intel_get_drm_devid(fd)) >= 8)
-		batch[i++] = 0;
+		batch[i++] = dst_offset >> 32;
 	batch[i++] = 0; /* src x1,y1 */
 	batch[i++] = WIDTH*4;
-	batch[i++] = 0; /* src reloc */
+	batch[i++] = src_offset; /* src reloc */
 	if (intel_gen(intel_get_drm_devid(fd)) >= 8)
-		batch[i++] = 0;
+		batch[i++] = src_offset >> 32;
 	batch[i++] = MI_BATCH_BUFFER_END;
 	batch[i++] = MI_NOOP;
 
@@ -147,19 +155,28 @@ static int copy(int fd, uint32_t dst, uint32_t src)
 	memset(obj, 0, sizeof(obj));
 
 	obj[exec.buffer_count].handle = dst;
+	obj[exec.buffer_count].offset = dst_offset;
 	obj[exec.buffer_count].flags = EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+	if (!has_relocs)
+		obj[exec.buffer_count].flags |= EXEC_OBJECT_PINNED | EXEC_OBJECT_WRITE;
 	exec.buffer_count++;
 
 	if (src != dst) {
 		obj[exec.buffer_count].handle = src;
+		obj[exec.buffer_count].offset = src_offset;
 		obj[exec.buffer_count].flags = EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+		if (!has_relocs)
+			obj[exec.buffer_count].flags |= EXEC_OBJECT_PINNED;
 		exec.buffer_count++;
 	}
 
 	obj[exec.buffer_count].handle = handle;
-	obj[exec.buffer_count].relocation_count = 2;
+	obj[exec.buffer_count].offset = bb_offset;
+	obj[exec.buffer_count].relocation_count = has_relocs ? 2 : 0;
 	obj[exec.buffer_count].relocs_ptr = to_user_pointer(reloc);
 	obj[exec.buffer_count].flags = EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+	if (!has_relocs)
+		obj[exec.buffer_count].flags |= EXEC_OBJECT_PINNED;
 	exec.buffer_count++;
 	exec.buffers_ptr = to_user_pointer(obj);
 	exec.flags = HAS_BLT_RING(intel_get_drm_devid(fd)) ? I915_EXEC_BLT : 0;
@@ -583,10 +600,11 @@ static void test_nohangcheck_hostile(int i915)
 {
 	const struct intel_execution_engine2 *e;
 	igt_hang_t hang;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
 	int fence = -1;
 	int err = 0;
 	int dir;
+	uint64_t ahnd;
 
 	/*
 	 * Even if the user disables hangcheck, we must still recover.
@@ -598,11 +616,12 @@ static void test_nohangcheck_hostile(int i915)
 	dir = igt_params_open(i915);
 	igt_require(dir != -1);
 
-	ctx = gem_context_create(i915);
-	hang = igt_allow_hang(i915, ctx, 0);
+	ctx = intel_ctx_create_all_physical(i915);
+	hang = igt_allow_hang(i915, ctx->id, 0);
 	igt_require(__enable_hangcheck(dir, false));
+	ahnd = get_reloc_ahnd(i915, ctx->id);
 
-	____for_each_physical_engine(i915, ctx, e) {
+	for_each_ctx_engine(i915, ctx, e) {
 		igt_spin_t *spin;
 		int new;
 
@@ -610,7 +629,7 @@ static void test_nohangcheck_hostile(int i915)
 		gem_engine_property_printf(i915, e->name,
 					   "preempt_timeout_ms", "%d", 50);
 
-		spin = __igt_spin_new(i915, ctx,
+		spin = __igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 				      .engine = e->flags,
 				      .flags = (IGT_SPIN_NO_PREEMPTION |
 						IGT_SPIN_USERPTR |
@@ -632,7 +651,8 @@ static void test_nohangcheck_hostile(int i915)
 			fence = tmp;
 		}
 	}
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
+	put_ahnd(ahnd);
 	igt_assert(fence != -1);
 
 	if (sync_fence_wait(fence, MSEC_PER_SEC)) { /* 640ms preempt-timeout */
@@ -689,13 +709,15 @@ static void test_vma_merge(int i915)
 	igt_spin_t *spin;
 	uint32_t handle;
 	void *addr;
+	uint64_t ahnd = get_reloc_ahnd(i915, 0);
 
 	addr = mmap(NULL, sz, PROT_READ | PROT_WRITE,
 		    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
 	gem_userptr(i915, addr + sz / 2, 4096, 0, userptr_flags, &handle);
 
-	spin = igt_spin_new(i915, .dependency = handle, .flags = IGT_SPIN_FENCE_OUT);
+	spin = igt_spin_new(i915, .ahnd = ahnd, .dependency = handle,
+			    .flags = IGT_SPIN_FENCE_OUT);
 	igt_assert(gem_bo_busy(i915, handle));
 
 	for (size_t x = 0; x < sz; x += 4096) {
@@ -715,6 +737,7 @@ static void test_vma_merge(int i915)
 	gem_sync(i915, spin->handle);
 	igt_assert_eq(sync_fence_status(spin->out_fence), 1);
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
 static void test_huge_split(int i915)
@@ -724,6 +747,7 @@ static void test_huge_split(int i915)
 	igt_spin_t *spin;
 	uint32_t handle;
 	void *addr;
+	uint64_t ahnd = get_reloc_ahnd(i915, 0);
 
 	flags = MFD_HUGETLB;
 #if defined(MFD_HUGE_2MB)
@@ -748,7 +772,8 @@ static void test_huge_split(int i915)
 	madvise(addr, sz, MADV_HUGEPAGE);
 
 	gem_userptr(i915, addr + sz / 2 - 4096, 8192, 0, userptr_flags, &handle);
-	spin = igt_spin_new(i915, .dependency = handle, .flags = IGT_SPIN_FENCE_OUT);
+	spin = igt_spin_new(i915, .ahnd = ahnd, .dependency = handle,
+			    .flags = IGT_SPIN_FENCE_OUT);
 	igt_assert(gem_bo_busy(i915, handle));
 
 	igt_assert(mmap(addr, 4096, PROT_READ,
@@ -766,6 +791,7 @@ static void test_huge_split(int i915)
 	gem_sync(i915, spin->handle);
 	igt_assert_eq(sync_fence_status(spin->out_fence), 1);
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
 static int test_access_control(int fd)
@@ -1209,7 +1235,8 @@ static int test_dmabuf(void)
 	return 0;
 }
 
-static void store_dword_rand(int i915, unsigned int engine,
+static void store_dword_rand(int i915, const intel_ctx_t *ctx,
+			     unsigned int engine,
 			     uint32_t target, uint64_t sz,
 			     int count)
 {
@@ -1241,6 +1268,7 @@ static void store_dword_rand(int i915, unsigned int engine,
 	exec.flags = engine;
 	if (gen < 6)
 		exec.flags |= I915_EXEC_SECURE;
+	exec.rsvd1 = ctx->id;
 
 	i = 0;
 	for (int n = 0; n < count; n++) {
@@ -1358,17 +1386,19 @@ static void test_readonly(int i915)
 
 	igt_fork(child, 1) {
 		const struct intel_execution_engine2 *e;
+		const intel_ctx_t *ctx;
 		char *orig;
 
 		orig = g_compute_checksum_for_data(G_CHECKSUM_SHA1, pages, sz);
 
 		gem_userptr(i915, space, total, true, userptr_flags, &rhandle);
 
-		__for_each_physical_engine(i915, e) {
+		ctx = intel_ctx_create_all_physical(i915);
+		for_each_ctx_engine(i915, ctx, e) {
 			char *ref, *result;
 
 			/* First tweak the backing store through the write */
-			store_dword_rand(i915, e->flags, whandle, sz, 64);
+			store_dword_rand(i915, ctx, e->flags, whandle, sz, 64);
 			gem_sync(i915, whandle);
 			ref = g_compute_checksum_for_data(G_CHECKSUM_SHA1,
 							  pages, sz);
@@ -1377,7 +1407,7 @@ static void test_readonly(int i915)
 			igt_assert(strcmp(ref, orig));
 
 			/* Now try the same through the read-only handle */
-			store_dword_rand(i915, e->flags, rhandle, total, 64);
+			store_dword_rand(i915, ctx, e->flags, rhandle, total, 64);
 			gem_sync(i915, rhandle);
 			result = g_compute_checksum_for_data(G_CHECKSUM_SHA1,
 							     pages, sz);
@@ -1393,6 +1423,7 @@ static void test_readonly(int i915)
 			g_free(orig);
 			orig = ref;
 		}
+		intel_ctx_destroy(i915, ctx);
 
 		gem_close(i915, rhandle);
 
@@ -1511,7 +1542,7 @@ static int test_coherency(int fd, int count)
 	int i, ret;
 
 	igt_info("Using 2x%d 1MiB buffers\n", count);
-	intel_require_memory(2*count, sizeof(linear), CHECK_RAM);
+	igt_require_memory(2*count, sizeof(linear), CHECK_RAM);
 
 	ret = posix_memalign((void **)&memory, PAGE_SIZE, count*sizeof(linear));
 	igt_assert(ret == 0 && memory);
@@ -1611,7 +1642,7 @@ static int can_swap(void)
 	else
 		as = 256 * 1024; /* Just a big number */
 
-	ram = intel_get_total_ram_mb();
+	ram = igt_get_total_ram_mb();
 
 	if ((as - 128) < (ram - 256))
 		return 0;
@@ -1658,12 +1689,12 @@ static void test_forking_evictions(int fd, int size, int count,
 
 	igt_require(forked_userptr(fd));
 
-	trash_count = intel_get_total_ram_mb() * 11 / 10;
+	trash_count = igt_get_total_ram_mb() * 11 / 10;
 	/* Use the fact test will spawn a number of child
 	 * processes meaning swapping will be triggered system
 	 * wide even if one process on it's own can't do it.
 	 */
-	num_threads = min(sysconf(_SC_NPROCESSORS_ONLN) * 4, 12);
+	num_threads = min_t(int, sysconf(_SC_NPROCESSORS_ONLN) * 4, 12);
 	trash_count /= num_threads;
 	if (count > trash_count)
 		count = trash_count;
@@ -1686,7 +1717,7 @@ static void test_swapping_evictions(int fd, int size, int count)
 	igt_skip_on_f(!can_swap(),
 		"Not enough process address space for swapping tests.\n");
 
-	trash_count = intel_get_total_ram_mb() * 11 / 10;
+	trash_count = igt_get_total_ram_mb() * 11 / 10;
 
 	swapping_evictions(fd, &fault_ops, size, count, trash_count);
 	reset_handle_ptr();
@@ -1904,7 +1935,7 @@ static void test_stress_purge(int fd, int timeout)
 
 		gem_set_domain(fd, handle,
 			       I915_GEM_DOMAIN_GTT, I915_GEM_DOMAIN_GTT);
-		intel_purge_vm_caches(fd);
+		igt_purge_vm_caches(fd);
 
 		gem_close(fd, handle);
 	}
@@ -2016,6 +2047,7 @@ static void test_set_caching(int i915)
 	};
 	uint32_t handle;
 	void *page;
+	int ret;
 
 	page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
 		    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -2032,15 +2064,43 @@ static void test_set_caching(int i915)
 
 	for (int idx = 0; idx < ARRAY_SIZE(levels); idx++) {
 		gem_userptr(i915, page, 4096, 0, 0, &handle);
-		igt_assert_eq(__gem_set_caching(i915, handle, levels[idx]), 0);
+		ret = __gem_set_caching(i915, handle, levels[idx]);
+		if (gem_has_lmem(i915))
+			igt_assert_eq(ret, -ENODEV);
+		else if (levels[idx] == I915_CACHING_NONE) {
+			if(ret != 0)
+				igt_assert_eq(ret, -ENXIO);
+			else
+				igt_warn("Deprecated userptr SET_CACHING behavior\n");
+		} else {
+			igt_assert_eq(ret, 0);
+		}
 		gem_close(i915, handle);
 	}
 
 	gem_userptr(i915, page, 4096, 0, 0, &handle);
-	for (int idx = 0; idx < ARRAY_SIZE(levels); idx++)
-		igt_assert_eq(__gem_set_caching(i915, handle, levels[idx]), 0);
-	for (int idx = 0; idx < ARRAY_SIZE(levels); idx++)
-		igt_assert_eq(__gem_set_caching(i915, handle, levels[idx]), 0);
+	for (int idx = 0; idx < ARRAY_SIZE(levels); idx++) {
+		ret = __gem_set_caching(i915, handle, levels[idx]);
+		if (gem_has_lmem(i915))
+                        igt_assert_eq(ret, -ENODEV);
+		else if (levels[idx] == I915_CACHING_NONE) {
+			if (ret != 0)
+			        igt_assert_eq(ret, -ENXIO);
+		} else {
+			igt_assert_eq(ret, 0);
+		}
+	}
+	for (int idx = 0; idx < ARRAY_SIZE(levels); idx++) {
+		ret = __gem_set_caching(i915, handle, levels[idx]);
+		if (gem_has_lmem(i915))
+                        igt_assert_eq(ret, -ENODEV);
+		else if (levels[idx] == I915_CACHING_NONE) {
+			if (ret != 0)
+				igt_assert_eq(ret, -ENXIO);
+		} else {
+			igt_assert_eq(ret, 0);
+		}
+	}
 	gem_close(i915, handle);
 
 	munmap(page, 4096);
@@ -2096,6 +2156,87 @@ static void *ufd_thread(void *arg)
 static int userfaultfd(int flags)
 {
 	return syscall(SYS_userfaultfd, flags);
+}
+
+static bool has_userptr_probe(int fd)
+{
+	struct drm_i915_getparam gp;
+	int value = 0;
+
+	memset(&gp, 0, sizeof(gp));
+	gp.param = I915_PARAM_HAS_USERPTR_PROBE;
+	gp.value = &value;
+
+	ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp, sizeof(gp));
+	errno = 0;
+
+	return value;
+}
+
+static void test_probe(int fd)
+{
+#define N_PAGES 5
+	struct drm_i915_gem_mmap_offset mmap_offset;
+	uint32_t handle;
+
+	/*
+	 * We allocate 5 pages, and apply various combinations of unmap,
+	 * remap-mmap-offset to the pages. Then we try to create a userptr from
+	 * the middle 3 pages and check if unexpectedly succeeds or fails.
+	 */
+	memset(&mmap_offset, 0, sizeof(mmap_offset));
+	mmap_offset.handle = gem_create(fd, PAGE_SIZE);
+	if (gem_has_lmem(fd))
+		mmap_offset.flags = I915_MMAP_OFFSET_FIXED;
+	else
+		mmap_offset.flags = I915_MMAP_OFFSET_WB;
+	igt_assert_eq(igt_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &mmap_offset), 0);
+
+	for (unsigned long pass = 0; pass < 4 * 4 * 4 * 4 * 4; pass++) {
+		int expected = 0;
+		void *ptr;
+
+		ptr = mmap(NULL, N_PAGES * PAGE_SIZE,
+			   PROT_READ | PROT_WRITE,
+			   MAP_SHARED | MAP_ANONYMOUS,
+			   -1, 0);
+
+		for (int page = 0; page < N_PAGES; page++) {
+			int mode = (pass >> (2 * page)) & 3;
+			void *fixed = ptr + page * PAGE_SIZE;
+
+			switch (mode) {
+			default:
+			case 0:
+				break;
+
+			case 1:
+				munmap(fixed, PAGE_SIZE);
+				if (page >= 1 && page <= 3)
+					expected = -EFAULT;
+				break;
+
+			case 2:
+				fixed = mmap(fixed, PAGE_SIZE,
+					     PROT_READ | PROT_WRITE,
+					     MAP_SHARED | MAP_FIXED,
+					     fd, mmap_offset.offset);
+				igt_assert(fixed != MAP_FAILED);
+				if (page >= 1 && page <= 3)
+					expected = -EFAULT;
+				break;
+			}
+		}
+
+		igt_assert_eq(__gem_userptr(fd, ptr + PAGE_SIZE, 3*PAGE_SIZE,
+					    0, I915_USERPTR_PROBE, &handle),
+			      expected);
+
+		munmap(ptr, N_PAGES * PAGE_SIZE);
+	}
+
+	gem_close(fd, mmap_offset.handle);
+#undef N_PAGES
 }
 
 static void test_userfault(int i915)
@@ -2159,7 +2300,7 @@ static void test_userfault(int i915)
 
 uint64_t total_ram;
 uint64_t aperture_size;
-int fd, count;
+int count;
 
 static int opt_handler(int opt, int opt_index, void *data)
 {
@@ -2179,6 +2320,7 @@ const char *help_str = "  -c\tBuffer count\n";
 igt_main_args("c:", NULL, help_str, opt_handler, NULL)
 {
 	int size = sizeof(linear);
+	igt_fd_t(fd);
 
 	igt_fixture {
 		unsigned int mmo_max = 0;
@@ -2201,11 +2343,11 @@ igt_main_args("c:", NULL, help_str, opt_handler, NULL)
 		if (count == 0)
 			count = 2 * aperture_size / (1024*1024) / 3;
 
-		total_ram = intel_get_total_ram_mb();
+		total_ram = igt_get_total_ram_mb();
 		igt_info("Total RAM is %'llu MiB\n", (long long)total_ram);
 
 		if (count > total_ram * 3 / 4) {
-			count = intel_get_total_ram_mb() * 3 / 4;
+			count = igt_get_total_ram_mb() * 3 / 4;
 			igt_info("Not enough RAM to run test, reducing buffer count.\n");
 		}
 	}
@@ -2234,8 +2376,11 @@ igt_main_args("c:", NULL, help_str, opt_handler, NULL)
 		igt_subtest("forbidden-operations")
 			test_forbidden_ops(fd);
 
-		igt_subtest("sd-probe")
+		igt_subtest("sd-probe") {
+			igt_skip_on_f(gem_has_lmem(fd),
+				      "GEM_SET_DOMAIN not supported on discrete platforms\n");
 			test_sd_probe(fd);
+		}
 
 		igt_subtest("set-cache-level")
 			test_set_caching(fd);
@@ -2243,8 +2388,10 @@ igt_main_args("c:", NULL, help_str, opt_handler, NULL)
 		igt_subtest("userfault")
 			test_userfault(fd);
 
-		igt_subtest("relocations")
+		igt_subtest("relocations") {
+			igt_require(gem_has_relocations(fd));
 			test_relocations(fd);
+		}
 	}
 
 	igt_subtest_group {
@@ -2318,7 +2465,7 @@ igt_main_args("c:", NULL, help_str, opt_handler, NULL)
 			size = sizeof(linear);
 			count = 2 * gem_aperture_size(fd) / (1024*1024) / 3;
 			if (count > total_ram * 3 / 4)
-				count = intel_get_total_ram_mb() * 3 / 4;
+				count = igt_get_total_ram_mb() * 3 / 4;
 		}
 
 		igt_fork_signal_helper();
@@ -2349,7 +2496,7 @@ igt_main_args("c:", NULL, help_str, opt_handler, NULL)
 			size = sizeof(linear);
 			count = 2 * gem_aperture_size(fd) / (1024*1024) / 3;
 			if (count > total_ram * 3 / 4)
-				count = intel_get_total_ram_mb() * 3 / 4;
+				count = igt_get_total_ram_mb() * 3 / 4;
 		}
 
 		igt_subtest("process-exit")
@@ -2444,7 +2591,7 @@ igt_main_args("c:", NULL, help_str, opt_handler, NULL)
 			size = 1024 * 1024;
 			count = 2 * gem_aperture_size(fd) / (1024*1024) / 3;
 			if (count > total_ram * 3 / 4)
-				count = intel_get_total_ram_mb() * 3 / 4;
+				count = igt_get_total_ram_mb() * 3 / 4;
 		}
 
 		igt_fork_signal_helper();
@@ -2487,4 +2634,9 @@ igt_main_args("c:", NULL, help_str, opt_handler, NULL)
 
 	igt_subtest("access-control")
 		test_access_control(fd);
+
+	igt_subtest("probe") {
+		igt_require(has_userptr_probe(fd));
+		test_probe(fd);
+	}
 }

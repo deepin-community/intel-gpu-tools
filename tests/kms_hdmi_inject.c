@@ -82,12 +82,13 @@ hdmi_inject_4k(int drm_fd, drmModeConnector *connector)
 	int fb_id;
 	struct igt_fb fb;
 	uint8_t found_4k_mode = 0;
-	uint32_t devid;
 
-	devid = intel_get_drm_devid(drm_fd);
+	if (is_i915_device(drm_fd)) {
+		uint32_t devid = intel_get_drm_devid(drm_fd);
 
-	/* 4K requires at least HSW */
-	igt_require(IS_HASWELL(devid) || intel_gen(devid) >= 8);
+		/* 4K requires at least HSW */
+		igt_require(IS_HASWELL(devid) || intel_display_ver(devid) >= 8);
+	}
 
 	edid = igt_kms_get_4k_edid();
 	kmstest_force_edid(drm_fd, connector, edid);
@@ -120,7 +121,7 @@ hdmi_inject_4k(int drm_fd, drmModeConnector *connector)
 	fb_id = igt_create_fb(drm_fd, connector->modes[i].hdisplay,
 			      connector->modes[i].vdisplay,
 			      DRM_FORMAT_XRGB8888,
-			      LOCAL_DRM_FORMAT_MOD_NONE, &fb);
+			      DRM_FORMAT_MOD_LINEAR, &fb);
 
 	ret = drmModeSetCrtc(drm_fd, config.crtc->crtc_id, fb_id, 0, 0,
 			     &connector->connector_id, 1,
@@ -164,7 +165,7 @@ hdmi_inject_audio(int drm_fd, drmModeConnector *connector)
 	fb_id = igt_create_fb(drm_fd, connector->modes[0].hdisplay,
 			      connector->modes[0].vdisplay,
 			      DRM_FORMAT_XRGB8888,
-			      LOCAL_DRM_FORMAT_MOD_NONE, &fb);
+			      DRM_FORMAT_MOD_LINEAR, &fb);
 
 	ret = drmModeSetCrtc(drm_fd, config.crtc->crtc_id, fb_id, 0, 0,
 			     &connector->connector_id, 1,
@@ -195,7 +196,7 @@ igt_main
 	drmModeConnector *connector;
 
 	igt_fixture {
-		drm_fd = drm_open_driver_master(DRIVER_INTEL);
+		drm_fd = drm_open_driver_master(DRIVER_ANY);
 
 		res = drmModeGetResources(drm_fd);
 		igt_require(res);
@@ -218,5 +219,6 @@ igt_main
 
 	igt_fixture {
 		drmModeFreeConnector(connector);
+		close(drm_fd);
 	}
 }

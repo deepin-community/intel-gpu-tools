@@ -35,6 +35,7 @@ IGT_TEST_DESCRIPTION("Test atomic mode setting with multiple planes.");
 #define SIZE_PLANE      256
 #define SIZE_CURSOR     128
 #define LOOP_FOREVER     -1
+#define DEFAULT_N_PLANES  3
 
 typedef struct {
 	float red;
@@ -56,8 +57,10 @@ struct {
 	int iterations;
 	unsigned int seed;
 	bool user_seed;
+	bool all_planes;
 } opt = {
 	.iterations = 1,
+	.all_planes = false,
 };
 
 /*
@@ -65,7 +68,8 @@ struct {
  */
 static void test_init(data_t *data, enum pipe pipe, int n_planes)
 {
-	data->pipe_crc = igt_pipe_crc_new(data->drm_fd, pipe, INTEL_PIPE_CRC_SOURCE_AUTO);
+	data->pipe_crc = igt_pipe_crc_new(data->drm_fd, pipe,
+					  IGT_PIPE_CRC_SOURCE_AUTO);
 
 	data->plane = calloc(n_planes, sizeof(*data->plane));
 	igt_assert_f(data->plane != NULL, "Failed to allocate memory for planes\n");
@@ -76,8 +80,6 @@ static void test_init(data_t *data, enum pipe pipe, int n_planes)
 
 static void test_fini(data_t *data, igt_output_t *output, int n_planes)
 {
-	igt_pipe_crc_stop(data->pipe_crc);
-
 	/* reset the constraint on the pipe */
 	igt_output_set_pipe(output, PIPE_ANY);
 
@@ -95,7 +97,7 @@ static void test_fini(data_t *data, igt_output_t *output, int n_planes)
 
 static void
 get_reference_crc(data_t *data, igt_output_t *output, enum pipe pipe,
-	      color_t *color, uint64_t tiling)
+	      color_t *color, uint64_t modifier)
 {
 	drmModeModeInfo *mode;
 	igt_plane_t *primary;
@@ -110,7 +112,7 @@ get_reference_crc(data_t *data, igt_output_t *output, enum pipe pipe,
 
 	igt_create_color_fb(data->drm_fd, mode->hdisplay, mode->vdisplay,
 			    DRM_FORMAT_XRGB8888,
-			    LOCAL_DRM_FORMAT_MOD_NONE,
+			    modifier,
 			    color->red, color->green, color->blue,
 			    &data->fb[primary->index]);
 
@@ -125,7 +127,7 @@ get_reference_crc(data_t *data, igt_output_t *output, enum pipe pipe,
 static void
 create_fb_for_mode_position(data_t *data, igt_output_t *output, drmModeModeInfo *mode,
 			    color_t *color, int *rect_x, int *rect_y,
-			    int *rect_w, int *rect_h, uint64_t tiling,
+			    int *rect_w, int *rect_h, uint64_t modifier,
 			    int max_planes)
 {
 	unsigned int fb_id;
@@ -134,14 +136,10 @@ create_fb_for_mode_position(data_t *data, igt_output_t *output, drmModeModeInfo 
 
 	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
 
-	igt_skip_on(!igt_display_has_format_mod(&data->display,
-						DRM_FORMAT_XRGB8888,
-						tiling));
-
 	fb_id = igt_create_fb(data->drm_fd,
 			      mode->hdisplay, mode->vdisplay,
 			      DRM_FORMAT_XRGB8888,
-			      tiling,
+			      modifier,
 			      &data->fb[primary->index]);
 	igt_assert(fb_id);
 
@@ -155,7 +153,7 @@ create_fb_for_mode_position(data_t *data, igt_output_t *output, drmModeModeInfo 
 			continue;
 		igt_paint_color(cr, rect_x[i], rect_y[i],
 				rect_w[i], rect_h[i], 0.0, 0.0, 0.0);
-		}
+	}
 
 	igt_put_cairo_ctx(cr);
 }
@@ -163,7 +161,7 @@ create_fb_for_mode_position(data_t *data, igt_output_t *output, drmModeModeInfo 
 
 static void
 prepare_planes(data_t *data, enum pipe pipe_id, color_t *color,
-	       uint64_t tiling, int max_planes, igt_output_t *output)
+	       uint64_t modifier, int max_planes, igt_output_t *output)
 {
 	drmModeModeInfo *mode;
 	igt_pipe_t *pipe;
@@ -225,7 +223,9 @@ prepare_planes(data_t *data, enum pipe pipe_id, color_t *color,
 		 */
 		igt_plane_t *plane = igt_output_get_plane(output, suffle[i]);
 		uint32_t plane_format;
-		uint64_t plane_tiling;
+		uint64_t plane_modifier;
+
+		data->plane[i] = plane;
 
 		if (plane->type == DRM_PLANE_TYPE_PRIMARY)
 			continue;
@@ -237,18 +237,16 @@ prepare_planes(data_t *data, enum pipe pipe_id, color_t *color,
 		x[i] = rand() % (mode->hdisplay - size[i]);
 		y[i] = rand() % (mode->vdisplay - size[i]);
 
-		data->plane[i] = plane;
-
 		plane_format = data->plane[i]->type == DRM_PLANE_TYPE_CURSOR ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888;
-		plane_tiling = data->plane[i]->type == DRM_PLANE_TYPE_CURSOR ? LOCAL_DRM_FORMAT_MOD_NONE : tiling;
+		plane_modifier = data->plane[i]->type == DRM_PLANE_TYPE_CURSOR ? DRM_FORMAT_MOD_LINEAR : modifier;
 
 		igt_skip_on(!igt_plane_has_format_mod(plane, plane_format,
-						      plane_tiling));
+						      plane_modifier));
 
 		igt_create_color_fb(data->drm_fd,
 				    size[i], size[i],
 				    plane_format,
-				    plane_tiling,
+				    plane_modifier,
 				    color->red, color->green, color->blue,
 				    &data->fb[i]);
 
@@ -259,7 +257,7 @@ prepare_planes(data_t *data, enum pipe pipe_id, color_t *color,
 	/* primary plane */
 	data->plane[primary->index] = primary;
 	create_fb_for_mode_position(data, output, mode, color, x, y,
-				    size, size, tiling, max_planes);
+				    size, size, modifier, max_planes);
 	igt_plane_set_fb(data->plane[primary->index], &data->fb[primary->index]);
 	free((void*)x);
 	free((void*)y);
@@ -281,7 +279,7 @@ prepare_planes(data_t *data, enum pipe pipe_id, color_t *color,
 static void
 test_plane_position_with_output(data_t *data, enum pipe pipe,
 				igt_output_t *output, int n_planes,
-				uint64_t tiling)
+				uint64_t modifier)
 {
 	color_t blue  = { 0.0f, 0.0f, 1.0f };
 	igt_crc_t crc;
@@ -303,17 +301,18 @@ test_plane_position_with_output(data_t *data, enum pipe pipe,
 
 	test_init(data, pipe, n_planes);
 
-	get_reference_crc(data, output, pipe, &blue, tiling);
+	get_reference_crc(data, output, pipe, &blue, modifier);
 
 	/* Find out how many planes are allowed simultaneously */
 	do {
 		c++;
-		prepare_planes(data, pipe, &blue, tiling, c, output);
+		prepare_planes(data, pipe, &blue, modifier, c, output);
 		err = igt_display_try_commit2(&data->display, COMMIT_ATOMIC);
 
 		for_each_plane_on_pipe(&data->display, pipe, plane)
 			igt_plane_set_fb(plane, NULL);
 
+		igt_output_set_pipe(output, PIPE_NONE);
 		igt_display_commit2(&data->display, COMMIT_ATOMIC);
 
 		for (int x = 0; x < c; x++)
@@ -327,26 +326,27 @@ test_plane_position_with_output(data_t *data, enum pipe pipe,
 		 igt_output_name(output), kmstest_pipe_name(pipe), c,
 		 info, opt.seed);
 
-	igt_pipe_crc_start(data->pipe_crc);
-
 	i = 0;
 	while (i < iterations || loop_forever) {
+
 		/* randomize planes and set up the holes */
-		prepare_planes(data, pipe, &blue, tiling, c, output);
+		prepare_planes(data, pipe, &blue, modifier, c, output);
 
 		igt_display_commit2(&data->display, COMMIT_ATOMIC);
+		igt_pipe_crc_start(data->pipe_crc);
 
 		igt_pipe_crc_get_current(data->display.drm_fd, data->pipe_crc, &crc);
+		igt_assert_crc_equal(&data->ref_crc, &crc);
+		igt_pipe_crc_stop(data->pipe_crc);
 
 		for_each_plane_on_pipe(&data->display, pipe, plane)
 			igt_plane_set_fb(plane, NULL);
 
+		igt_output_set_pipe(output, PIPE_NONE);
 		igt_display_commit2(&data->display, COMMIT_ATOMIC);
 
 		for (int x = 0; x < c; x++)
 			igt_remove_fb(data->drm_fd, &data->fb[x]);
-
-		igt_assert_crc_equal(&data->ref_crc, &crc);
 
 		i++;
 	}
@@ -355,13 +355,10 @@ test_plane_position_with_output(data_t *data, enum pipe pipe,
 }
 
 static void
-test_plane_position(data_t *data, enum pipe pipe, uint64_t tiling)
+test_plane_position(data_t *data, enum pipe pipe, igt_output_t *output, uint64_t modifier)
 {
-	igt_output_t *output;
-	int n_planes = data->display.pipes[pipe].n_planes;
-
-	output = igt_get_single_output_for_pipe(&data->display, pipe);
-	igt_require(output);
+	int n_planes = opt.all_planes ?
+			data->display.pipes[pipe].n_planes : DEFAULT_N_PLANES;
 
 	if (!opt.user_seed)
 		opt.seed = time(NULL);
@@ -369,35 +366,54 @@ test_plane_position(data_t *data, enum pipe pipe, uint64_t tiling)
 	srand(opt.seed);
 
 	test_plane_position_with_output(data, pipe, output,
-					n_planes, tiling);
+					n_planes, modifier);
 }
 
-static void
-run_tests_for_pipe(data_t *data, enum pipe pipe)
+static void run_test(data_t *data, uint64_t modifier)
 {
-	igt_fixture {
-		igt_require_pipe(&data->display, pipe);
-		igt_require(data->display.pipes[pipe].n_planes > 0);
+	enum pipe pipe;
+	igt_output_t *output;
+
+	if (!igt_display_has_format_mod(&data->display, DRM_FORMAT_XRGB8888, modifier))
+		return;
+
+	for_each_pipe_with_valid_output(&data->display, pipe, output) {
+		igt_display_reset(&data->display);
+
+		igt_dynamic_f("pipe-%s-%s", kmstest_pipe_name(pipe), output->name)
+			test_plane_position(data, pipe, output, modifier);
 	}
-
-	igt_subtest_f("atomic-pipe-%s-tiling-x", kmstest_pipe_name(pipe))
-		test_plane_position(data, pipe, LOCAL_I915_FORMAT_MOD_X_TILED);
-
-	igt_subtest_f("atomic-pipe-%s-tiling-y", kmstest_pipe_name(pipe))
-		test_plane_position(data, pipe, LOCAL_I915_FORMAT_MOD_Y_TILED);
-
-	igt_subtest_f("atomic-pipe-%s-tiling-yf", kmstest_pipe_name(pipe))
-		test_plane_position(data, pipe, LOCAL_I915_FORMAT_MOD_Yf_TILED);
-
-	igt_subtest_f("atomic-pipe-%s-tiling-none", kmstest_pipe_name(pipe))
-		test_plane_position(data, pipe, LOCAL_DRM_FORMAT_MOD_NONE);
 }
+
+static const struct {
+	const char *name;
+	uint64_t modifier;
+} subtests[] = {
+	{ .name = "tiling-none",
+	  .modifier = DRM_FORMAT_MOD_LINEAR,
+	},
+	{ .name = "tiling-x",
+	  .modifier = I915_FORMAT_MOD_X_TILED,
+	},
+	{ .name = "tiling-y",
+	  .modifier = I915_FORMAT_MOD_Y_TILED,
+	},
+	{ .name = "tiling-yf",
+	  .modifier = I915_FORMAT_MOD_Yf_TILED,
+	},
+	{ .name = "tiling-4",
+	  .modifier = I915_FORMAT_MOD_4_TILED,
+	},
+};
 
 static data_t data;
 
 static int opt_handler(int option, int option_index, void *input)
 {
 	switch (option) {
+	case 'a':
+		opt.all_planes = true;
+		break;
 	case 'i':
 		opt.iterations = strtol(optarg, NULL, 0);
 
@@ -420,36 +436,39 @@ static int opt_handler(int option, int option_index, void *input)
 
 const char *help_str =
 	"  --iterations Number of iterations for test coverage. -1 loop forever, default 64 iterations\n"
-	"  --seed       Seed for random number generator\n";
+	"  --seed       Seed for random number generator\n"
+	"  --all-planes Test with all available planes";
 
 struct option long_options[] = {
 	{ "iterations", required_argument, NULL, 'i'},
 	{ "seed",    required_argument, NULL, 's'},
+	{ "all-planes", no_argument, NULL, 'a'},
 	{ 0, 0, 0, 0 }
 };
 
 igt_main_args("", long_options, help_str, opt_handler, NULL)
 {
-	enum pipe pipe;
-
 	igt_fixture {
-		data.drm_fd = drm_open_driver_master(DRIVER_INTEL | DRIVER_AMDGPU);
+		data.drm_fd = drm_open_driver_master(DRIVER_ANY);
 		kmstest_set_vt_graphics_mode();
 		igt_require_pipe_crc(data.drm_fd);
 		igt_display_require(&data.display, data.drm_fd);
 		igt_require(data.display.is_atomic);
+		igt_display_require_output(&data.display);
 	}
 
-	for_each_pipe_static(pipe) {
+	for (int i = 0; i < ARRAY_SIZE(subtests); i++) {
 		igt_describe("Check that the kernel handles atomic updates of "
 			     "multiple planes correctly by changing their "
 			     "geometry and making sure the changes are "
 			     "reflected immediately after each commit.");
-		igt_subtest_group
-			run_tests_for_pipe(&data, pipe);
+
+		igt_subtest_with_dynamic(subtests[i].name)
+			run_test(&data, subtests[i].modifier);
 	}
 
 	igt_fixture {
 		igt_display_fini(&data.display);
+		close(data.drm_fd);
 	}
 }

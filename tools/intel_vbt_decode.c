@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -69,7 +70,7 @@ typedef uint64_t u64;
 struct bdb_block {
 	uint8_t id;
 	uint32_t size;
-	const void *data;
+	uint8_t data[];
 };
 
 struct context {
@@ -93,11 +94,16 @@ static uint32_t _get_blocksize(const uint8_t *block_base)
 		return *((const uint16_t *)(block_base + 1));
 }
 
-static struct bdb_block *find_section(struct context *context, int section_id)
+/* Get BDB block size give a pointer to data after Block ID and Block Size. */
+static u32 get_blocksize(const void *block_data)
+{
+	return _get_blocksize(block_data - 3);
+}
+
+static const void *find_raw_section(const struct context *context, int section_id)
 {
 	const struct bdb_header *bdb = context->bdb;
 	int length = context->size;
-	struct bdb_block *block;
 	const uint8_t *base = (const uint8_t *)bdb;
 	int index = 0;
 	uint32_t total, current_size;
@@ -109,12 +115,6 @@ static struct bdb_block *find_section(struct context *context, int section_id)
 	if (total > length)
 		total = length;
 
-	block = malloc(sizeof(*block));
-	if (!block) {
-		fprintf(stderr, "out of memory\n");
-		exit(EXIT_FAILURE);
-	}
-
 	/* walk the sections looking for section_id */
 	while (index + 3 < total) {
 		current_id = *(base + index);
@@ -124,61 +124,437 @@ static struct bdb_block *find_section(struct context *context, int section_id)
 		if (index + current_size > total)
 			return NULL;
 
-		if (current_id == section_id) {
-			block->id = current_id;
-			block->size = current_size;
-			block->data = base + index;
-			return block;
-		}
+		if (current_id == section_id)
+			return base + index;
 
 		index += current_size;
 	}
 
-	free(block);
 	return NULL;
 }
+
+/*
+ * Offset from the start of BDB to the start of the
+ * block data (just past the block header).
+ */
+static u32 raw_block_offset(const struct context *context, enum bdb_block_id section_id)
+{
+	const void *block;
+
+	block = find_raw_section(context, section_id);
+	if (!block)
+		return 0;
+
+	return block - (const void *)context->bdb;
+}
+
+static const void *block_data(const struct bdb_block *block)
+{
+	return block->data + 3;
+}
+
+static struct bdb_block *find_section(const struct context *context, int section_id);
+
+static size_t lfp_data_min_size(const struct context *context)
+{
+	const struct bdb_lvds_lfp_data_ptrs *ptrs;
+	struct bdb_block *ptrs_block;
+	size_t size;
+
+	ptrs_block = find_section(context, BDB_LVDS_LFP_DATA_PTRS);
+	if (!ptrs_block)
+		return 0;
+
+	ptrs = block_data(ptrs_block);
+
+	size = sizeof(struct bdb_lvds_lfp_data);
+	if (ptrs->panel_name.table_size)
+		size = max(size, ptrs->panel_name.offset +
+			   sizeof(struct bdb_lvds_lfp_data_tail));
+
+	free(ptrs_block);
+
+	return size;
+}
+
+static int make_lvds_data_ptr(struct lvds_lfp_data_ptr_table *table,
+			      int table_size, int total_size)
+{
+	if (total_size < table_size)
+		return total_size;
+
+	table->table_size = table_size;
+	table->offset = total_size - table_size;
+
+	return total_size - table_size;
+}
+
+static void next_lvds_data_ptr(struct lvds_lfp_data_ptr_table *next,
+			       const struct lvds_lfp_data_ptr_table *prev,
+			       int size)
+{
+	next->table_size = prev->table_size;
+	next->offset = prev->offset + size;
+}
+
+static void *generate_lvds_data_ptrs(const struct context *context)
+{
+	int size, table_size, block_size, offset, fp_timing_size;
+	const void *block;
+	struct bdb_lvds_lfp_data_ptrs *ptrs;
+	void *ptrs_block;
+
+	/*
+	 * The hardcoded fp_timing_size is only valid for
+	 * modernish VBTs. All older VBTs definitely should
+	 * include block 41 and thus we don't need to
+	 * generate one.
+	 */
+	if (context->bdb->version < 155)
+		return NULL;
+
+	fp_timing_size = 38;
+
+	block = find_raw_section(context, BDB_LVDS_LFP_DATA);
+	if (!block)
+		return NULL;
+
+	block_size = get_blocksize(block);
+
+	size = block_size;
+
+	size = fp_timing_size + sizeof(struct lvds_dvo_timing) +
+		sizeof(struct lvds_pnp_id);
+	if (size * 16 > block_size)
+		return NULL;
+
+	ptrs_block = calloc(1, sizeof(*ptrs) + 3);
+	if (!ptrs_block)
+		return NULL;
+
+	*(uint8_t *)(ptrs_block + 0) = BDB_LVDS_LFP_DATA_PTRS;
+	*(uint16_t *)(ptrs_block + 1) = sizeof(*ptrs);
+	ptrs = ptrs_block + 3;
+
+	table_size = sizeof(struct lvds_pnp_id);
+	size = make_lvds_data_ptr(&ptrs->ptr[0].panel_pnp_id, table_size, size);
+
+	table_size = sizeof(struct lvds_dvo_timing);
+	size = make_lvds_data_ptr(&ptrs->ptr[0].dvo_timing, table_size, size);
+
+	table_size = fp_timing_size;
+	size = make_lvds_data_ptr(&ptrs->ptr[0].fp_timing, table_size, size);
+
+	if (ptrs->ptr[0].fp_timing.table_size)
+		ptrs->lvds_entries++;
+	if (ptrs->ptr[0].dvo_timing.table_size)
+		ptrs->lvds_entries++;
+	if (ptrs->ptr[0].panel_pnp_id.table_size)
+		ptrs->lvds_entries++;
+
+	if (size != 0 || ptrs->lvds_entries != 3)
+		return NULL;
+
+	size = fp_timing_size + sizeof(struct lvds_dvo_timing) +
+		sizeof(struct lvds_pnp_id);
+	for (int i = 1; i < 16; i++) {
+		next_lvds_data_ptr(&ptrs->ptr[i].fp_timing, &ptrs->ptr[i-1].fp_timing, size);
+		next_lvds_data_ptr(&ptrs->ptr[i].dvo_timing, &ptrs->ptr[i-1].dvo_timing, size);
+		next_lvds_data_ptr(&ptrs->ptr[i].panel_pnp_id, &ptrs->ptr[i-1].panel_pnp_id, size);
+	}
+
+	table_size = sizeof(struct lvds_lfp_panel_name);
+
+	if (16 * (size + table_size) <= block_size) {
+		ptrs->panel_name.table_size = table_size;
+		ptrs->panel_name.offset = size * 16;
+	}
+
+	offset = block - (const void *)context->bdb;
+	for (int i = 0; i < 16; i++) {
+		ptrs->ptr[i].fp_timing.offset += offset;
+		ptrs->ptr[i].dvo_timing.offset += offset;
+		ptrs->ptr[i].panel_pnp_id.offset += offset;
+	}
+
+	if (ptrs->panel_name.offset)
+		ptrs->panel_name.offset += offset;
+
+	return ptrs_block;
+}
+
+static size_t block_min_size(const struct context *context, int section_id)
+{
+	switch (section_id) {
+	case BDB_GENERAL_FEATURES:
+		return sizeof(struct bdb_general_features);
+	case BDB_GENERAL_DEFINITIONS:
+		return sizeof(struct bdb_general_definitions);
+	case BDB_PSR:
+		return sizeof(struct bdb_psr);
+	case BDB_CHILD_DEVICE_TABLE:
+		return sizeof(struct bdb_legacy_child_devices);
+	case BDB_DRIVER_FEATURES:
+		return sizeof(struct bdb_driver_features);
+	case BDB_SDVO_LVDS_OPTIONS:
+		return sizeof(struct bdb_sdvo_lvds_options);
+	case BDB_SDVO_PANEL_DTDS:
+		/* FIXME? */
+		return 0;
+	case BDB_EDP:
+		return sizeof(struct bdb_edp);
+	case BDB_LVDS_OPTIONS:
+		return sizeof(struct bdb_lvds_options);
+	case BDB_LVDS_LFP_DATA_PTRS:
+		return sizeof(struct bdb_lvds_lfp_data_ptrs);
+	case BDB_LVDS_LFP_DATA:
+		return lfp_data_min_size(context);
+	case BDB_LVDS_BACKLIGHT:
+		return sizeof(struct bdb_lfp_backlight_data);
+	case BDB_LFP_POWER:
+		return sizeof(struct bdb_lfp_power);
+	case BDB_MIPI_CONFIG:
+		return sizeof(struct bdb_mipi_config);
+	case BDB_MIPI_SEQUENCE:
+		return sizeof(struct bdb_mipi_sequence);
+	case BDB_COMPRESSION_PARAMETERS:
+		return sizeof(struct bdb_compression_parameters);
+	case BDB_GENERIC_DTD:
+		/* FIXME check spec */
+		return sizeof(struct bdb_generic_dtd);
+	default:
+		return 0;
+	}
+}
+
+static bool validate_lfp_data_ptrs(const struct context *context,
+				   const struct bdb_lvds_lfp_data_ptrs *ptrs)
+{
+	int fp_timing_size, dvo_timing_size, panel_pnp_id_size, panel_name_size;
+	int data_block_size, lfp_data_size;
+	const void *block;
+	int i;
+
+	block = find_raw_section(context, BDB_LVDS_LFP_DATA);
+	if (!block)
+		return false;
+
+	data_block_size = get_blocksize(block);
+	if (data_block_size == 0)
+		return false;
+
+	/* always 3 indicating the presence of fp_timing+dvo_timing+panel_pnp_id */
+	if (ptrs->lvds_entries != 3)
+		return false;
+
+	fp_timing_size = ptrs->ptr[0].fp_timing.table_size;
+	dvo_timing_size = ptrs->ptr[0].dvo_timing.table_size;
+	panel_pnp_id_size = ptrs->ptr[0].panel_pnp_id.table_size;
+	panel_name_size = ptrs->panel_name.table_size;
+
+	/* fp_timing has variable size */
+	if (fp_timing_size < 32 ||
+	    dvo_timing_size != sizeof(struct lvds_dvo_timing) ||
+	    panel_pnp_id_size != sizeof(struct lvds_pnp_id))
+		return false;
+
+	/* panel_name is not present in old VBTs */
+	if (panel_name_size != 0 &&
+	    panel_name_size != sizeof(struct lvds_lfp_panel_name))
+		return false;
+
+	lfp_data_size = ptrs->ptr[1].fp_timing.offset - ptrs->ptr[0].fp_timing.offset;
+	if (16 * lfp_data_size > data_block_size)
+		return false;
+
+	/* make sure the table entries have uniform size */
+	for (i = 1; i < 16; i++) {
+		if (ptrs->ptr[i].fp_timing.table_size != fp_timing_size ||
+		    ptrs->ptr[i].dvo_timing.table_size != dvo_timing_size ||
+		    ptrs->ptr[i].panel_pnp_id.table_size != panel_pnp_id_size)
+			return false;
+
+		if (ptrs->ptr[i].fp_timing.offset - ptrs->ptr[i-1].fp_timing.offset != lfp_data_size ||
+		    ptrs->ptr[i].dvo_timing.offset - ptrs->ptr[i-1].dvo_timing.offset != lfp_data_size ||
+		    ptrs->ptr[i].panel_pnp_id.offset - ptrs->ptr[i-1].panel_pnp_id.offset != lfp_data_size)
+			return false;
+	}
+
+	/*
+	 * Except for vlv/chv machines all real VBTs seem to have 6
+	 * unaccounted bytes in the fp_timing table. And it doesn't
+	 * appear to be a really intentional hole as the fp_timing
+	 * 0xffff terminator is always within those 6 missing bytes.
+	 */
+	if (fp_timing_size + 6 + dvo_timing_size + panel_pnp_id_size == lfp_data_size)
+		fp_timing_size += 6;
+
+	if (fp_timing_size + dvo_timing_size + panel_pnp_id_size != lfp_data_size)
+		return false;
+
+	if (ptrs->ptr[0].fp_timing.offset + fp_timing_size != ptrs->ptr[0].dvo_timing.offset ||
+	    ptrs->ptr[0].dvo_timing.offset + dvo_timing_size != ptrs->ptr[0].panel_pnp_id.offset ||
+	    ptrs->ptr[0].panel_pnp_id.offset + panel_pnp_id_size != lfp_data_size)
+		return false;
+
+	/* make sure the tables fit inside the data block */
+	for (i = 0; i < 16; i++) {
+		if (ptrs->ptr[i].fp_timing.offset + fp_timing_size > data_block_size ||
+		    ptrs->ptr[i].dvo_timing.offset + dvo_timing_size > data_block_size ||
+		    ptrs->ptr[i].panel_pnp_id.offset + panel_pnp_id_size > data_block_size)
+			return false;
+	}
+
+	if (ptrs->panel_name.offset + 16 * panel_name_size > data_block_size)
+		return false;
+
+	/* make sure fp_timing terminators are present at expected locations */
+	for (i = 0; i < 16; i++) {
+		const u16 *t = block + ptrs->ptr[i].fp_timing.offset + fp_timing_size - 2;
+
+		if (*t != 0xffff)
+			return false;
+	}
+
+	return true;
+}
+
+/* make the data table offsets relative to the data block */
+static bool fixup_lfp_data_ptrs(const struct context *context,
+				void *ptrs_block)
+{
+	struct bdb_lvds_lfp_data_ptrs *ptrs = ptrs_block;
+	u32 offset;
+	int i;
+
+	offset = raw_block_offset(context, BDB_LVDS_LFP_DATA);
+
+	for (i = 0; i < 16; i++) {
+		if (ptrs->ptr[i].fp_timing.offset < offset ||
+		    ptrs->ptr[i].dvo_timing.offset < offset ||
+		    ptrs->ptr[i].panel_pnp_id.offset < offset)
+			return false;
+
+		ptrs->ptr[i].fp_timing.offset -= offset;
+		ptrs->ptr[i].dvo_timing.offset -= offset;
+		ptrs->ptr[i].panel_pnp_id.offset -= offset;
+	}
+
+	if (ptrs->panel_name.table_size) {
+		if (ptrs->panel_name.offset < offset)
+			return false;
+
+		ptrs->panel_name.offset -= offset;
+	}
+
+	return validate_lfp_data_ptrs(context, ptrs);
+}
+
+static struct bdb_block *find_section(const struct context *context, int section_id)
+{
+	size_t min_size = block_min_size(context, section_id);
+	struct bdb_block *block;
+	void *temp_block = NULL;
+	const void *data;
+	size_t size;
+
+	data = find_raw_section(context, section_id);
+	if (!data && section_id == BDB_LVDS_LFP_DATA_PTRS) {
+		fprintf(stderr, "Generating LVDS data table pointers\n");
+		temp_block = generate_lvds_data_ptrs(context);
+		if (temp_block)
+			data = temp_block + 3;
+	}
+	if (!data)
+		return NULL;
+
+	size = get_blocksize(data);
+
+	/*
+	 * Version number and new block size are considered
+	 * part of the header for MIPI sequenece block v3+.
+	 */
+	if (section_id == BDB_MIPI_SEQUENCE && *(const u8*)data >= 3)
+		size += 5;
+
+	/* expect to have the full definition for each block with modern VBTs */
+	if (min_size && size > min_size &&
+	    section_id != BDB_CHILD_DEVICE_TABLE &&
+	    section_id != BDB_SDVO_LVDS_OPTIONS &&
+	    section_id != BDB_GENERAL_DEFINITIONS &&
+	    context->bdb->version >= 155)
+		fprintf(stderr, "Block %d min size %zu less than block size %zu\n",
+			section_id, min_size, size);
+
+	block = calloc(1, sizeof(*block) + 3 + max(size, min_size));
+	if (!block) {
+		free(temp_block);
+		return NULL;
+	}
+
+	block->id = section_id;
+	block->size = size;
+	memcpy(block->data, data - 3, 3 + size);
+
+	free(temp_block);
+
+	if (section_id == BDB_LVDS_LFP_DATA_PTRS &&
+	    !fixup_lfp_data_ptrs(context, 3 + block->data)) {
+		fprintf(stderr, "VBT has malformed LFP data table pointers\n");
+		free(block);
+		return NULL;
+	}
+
+	return block;
+}
+
+static unsigned int panel_bits(unsigned int value, int panel_type, int num_bits)
+{
+	return (value >> (panel_type * num_bits)) & (BIT(num_bits) - 1);
+}
+
+static bool panel_bool(unsigned int value, int panel_type)
+{
+	return panel_bits(value, panel_type, 1);
+}
+
+static int decode_ssc_freq(struct context *context, bool alternate)
+{
+	switch (intel_gen(context->devid)) {
+	case 2:
+		return alternate ? 66 : 48;
+	case 3:
+	case 4:
+		return alternate ? 100 : 96;
+	default:
+		return alternate ? 100 : 120;
+	}
+}
+
+static const char * const panel_fitting[] = {
+	[0] = "disabled",
+	[1] = "text only",
+	[2] = "graphics only",
+	[3] = "text & graphics",
+};
 
 static void dump_general_features(struct context *context,
 				  const struct bdb_block *block)
 {
-	const struct bdb_general_features *features = block->data;
+	const struct bdb_general_features *features = block_data(block);
 
-	printf("\tPanel fitting: ");
-	switch (features->panel_fitting) {
-	case 0:
-		printf("disabled\n");
-		break;
-	case 1:
-		printf("text only\n");
-		break;
-	case 2:
-		printf("graphics only\n");
-		break;
-	case 3:
-		printf("text & graphics\n");
-		break;
-	}
+	printf("\tPanel fitting: %s (0x%x)\n",
+	       panel_fitting[features->panel_fitting], features->panel_fitting);
 	printf("\tFlexaim: %s\n", YESNO(features->flexaim));
 	printf("\tMessage: %s\n", YESNO(features->msg_enable));
 	printf("\tClear screen: %d\n", features->clear_screen);
 	printf("\tDVO color flip required: %s\n", YESNO(features->color_flip));
 
 	printf("\tExternal VBT: %s\n", YESNO(features->download_ext_vbt));
-	printf("\tEnable SSC: %s\n", YESNO(features->enable_ssc));
-	if (features->enable_ssc) {
-		if (!context->devid)
-			printf("\tSSC frequency: <unknown platform>\n");
-		else if (IS_VALLEYVIEW(context->devid) ||
-			 IS_CHERRYVIEW(context->devid) ||
-			 IS_BROXTON(context->devid))
-			printf("\tSSC frequency: 100 MHz\n");
-		else if (HAS_PCH_SPLIT(context->devid))
-			printf("\tSSC frequency: %s\n", features->ssc_freq ?
-			       "100 MHz" : "120 MHz");
-		else
-			printf("\tSSC frequency: %s\n", features->ssc_freq ?
-			       "100 MHz (66 MHz on 855)" : "96 MHz (48 MHz on 855)");
-	}
+	printf("\tLVDS SSC Enable: %s\n", YESNO(features->enable_ssc));
+	printf("\tLVDS SSC frequency: %d MHz (0x%x)\n",
+	       decode_ssc_freq(context, features->ssc_freq),
+	       features->ssc_freq);
 	printf("\tLFP on override: %s\n",
 	       YESNO(features->enable_lfp_on_override));
 	printf("\tDisable SSC on clone: %s\n",
@@ -210,24 +586,16 @@ static void dump_general_features(struct context *context,
 	printf("\tIntegrated TV: %s\n", YESNO(features->int_tv_support));
 	printf("\tIntegrated EFP: %s\n", YESNO(features->int_efp_support));
 	printf("\tDP SSC enable: %s\n", YESNO(features->dp_ssc_enable));
-	if (features->dp_ssc_enable) {
-		if (IS_VALLEYVIEW(context->devid) || IS_CHERRYVIEW(context->devid) ||
-		    IS_BROXTON(context->devid))
-			printf("\tSSC frequency: 100 MHz\n");
-		else if (HAS_PCH_SPLIT(context->devid))
-			printf("\tSSC frequency: %s\n", features->dp_ssc_freq ?
-			       "100 MHz" : "120 MHz");
-		else
-			printf("\tSSC frequency: %s\n", features->dp_ssc_freq ?
-			       "100 MHz" : "96 MHz");
-	}
+	printf("\tDP SSC frequency: %d MHz (0x%x)\n",
+	       decode_ssc_freq(context, features->dp_ssc_freq),
+	       features->dp_ssc_freq);
 	printf("\tDP SSC dongle supported: %s\n", YESNO(features->dp_ssc_dongle_supported));
 }
 
 static void dump_backlight_info(struct context *context,
 				const struct bdb_block *block)
 {
-	const struct bdb_lfp_backlight_data *backlight = block->data;
+	const struct bdb_lfp_backlight_data *backlight = block_data(block);
 	const struct lfp_backlight_data_entry *blc;
 	const struct lfp_backlight_control_method *control;
 	int i;
@@ -357,7 +725,7 @@ static const struct {
 	{ DEVICE_HANDLE_EFP2, "EFP 2 (HDMI/DVI/DP)" },
 	{ DEVICE_HANDLE_EFP3, "EFP 3 (HDMI/DVI/DP)" },
 	{ DEVICE_HANDLE_EFP4, "EFP 4 (HDMI/DVI/DP)" },
-	{ DEVICE_HANDLE_LPF1, "LFP 1 (eDP)" },
+	{ DEVICE_HANDLE_LFP1, "LFP 1 (eDP)" },
 	{ DEVICE_HANDLE_LFP2, "LFP 2 (eDP)" },
 };
 static const int num_child_device_handles =
@@ -379,6 +747,11 @@ static const char *dvo_port_names[] = {
 	[DVO_PORT_HDMIB] = "HDMI-B",
 	[DVO_PORT_HDMIC] = "HDMI-C",
 	[DVO_PORT_HDMID] = "HDMI-D",
+	[DVO_PORT_HDMIE] = "HDMI-E",
+	[DVO_PORT_HDMIF] = "HDMI-F",
+	[DVO_PORT_HDMIG] = "HDMI-G",
+	[DVO_PORT_HDMIH] = "HDMI-H",
+	[DVO_PORT_HDMII] = "HDMI-I",
 	[DVO_PORT_LVDS] = "LVDS",
 	[DVO_PORT_TV] = "TV",
 	[DVO_PORT_CRT] = "CRT",
@@ -387,7 +760,10 @@ static const char *dvo_port_names[] = {
 	[DVO_PORT_DPD] = "DP-D",
 	[DVO_PORT_DPA] = "DP-A",
 	[DVO_PORT_DPE] = "DP-E",
-	[DVO_PORT_HDMIE] = "HDMI-E",
+	[DVO_PORT_DPF] = "DP-F",
+	[DVO_PORT_DPG] = "DP-G",
+	[DVO_PORT_DPH] = "DP-H",
+	[DVO_PORT_DPI] = "DP-I",
 	[DVO_PORT_MIPIA] = "MIPI-A",
 	[DVO_PORT_MIPIB] = "MIPI-B",
 	[DVO_PORT_MIPIC] = "MIPI-C",
@@ -398,6 +774,29 @@ static const char *dvo_port(uint8_t type)
 {
 	if (type < ARRAY_SIZE(dvo_port_names) && dvo_port_names[type])
 		return dvo_port_names[type];
+	else
+		return "unknown";
+}
+
+static const char *aux_ch_names[] = {
+	[0] = "none",
+	[DP_AUX_A >> 4] = "AUX-A",
+	[DP_AUX_B >> 4] = "AUX-B",
+	[DP_AUX_C >> 4] = "AUX-C",
+	[DP_AUX_D >> 4] = "AUX-D",
+	[DP_AUX_E >> 4] = "AUX-E",
+	[DP_AUX_F >> 4] = "AUX-F",
+	[DP_AUX_G >> 4] = "AUX-G",
+	[DP_AUX_H >> 4] = "AUX-H",
+	[DP_AUX_I >> 4] = "AUX-I",
+};
+
+static const char *aux_ch(uint8_t aux_ch)
+{
+	aux_ch >>= 4;
+
+	if (aux_ch < ARRAY_SIZE(aux_ch_names) && aux_ch_names[aux_ch])
+		return aux_ch_names[aux_ch];
 	else
 		return "unknown";
 }
@@ -422,6 +821,9 @@ static void dump_hmdi_max_data_rate(uint8_t hdmi_max_data_rate)
 		[HDMI_MAX_DATA_RATE_PLATFORM] = 0,
 		[HDMI_MAX_DATA_RATE_297] = 297,
 		[HDMI_MAX_DATA_RATE_165] = 165,
+		[HDMI_MAX_DATA_RATE_594] = 594,
+		[HDMI_MAX_DATA_RATE_340] = 340,
+		[HDMI_MAX_DATA_RATE_300] = 300,
 	};
 
 	if (hdmi_max_data_rate >= ARRAY_SIZE(max_data_rate))
@@ -434,6 +836,97 @@ static void dump_hmdi_max_data_rate(uint8_t hdmi_max_data_rate)
 		printf("\t\tHDMI max data rate: %d MHz (0x%02x)\n",
 		       max_data_rate[hdmi_max_data_rate],
 		       hdmi_max_data_rate);
+}
+
+static int parse_dp_max_link_rate_216(uint8_t dp_max_link_rate)
+{
+	static const uint16_t max_link_rate[] = {
+		[BDB_216_VBT_DP_MAX_LINK_RATE_HBR3] = 810,
+		[BDB_216_VBT_DP_MAX_LINK_RATE_HBR2] = 540,
+		[BDB_216_VBT_DP_MAX_LINK_RATE_HBR] = 270,
+		[BDB_216_VBT_DP_MAX_LINK_RATE_LBR] = 162,
+	};
+
+	return max_link_rate[dp_max_link_rate & 0x3];
+}
+
+static int parse_dp_max_link_rate_230(uint8_t dp_max_link_rate)
+{
+	static const uint16_t max_link_rate[] = {
+		[BDB_230_VBT_DP_MAX_LINK_RATE_DEF] = 0,
+		[BDB_230_VBT_DP_MAX_LINK_RATE_LBR] = 162,
+		[BDB_230_VBT_DP_MAX_LINK_RATE_HBR] = 270,
+		[BDB_230_VBT_DP_MAX_LINK_RATE_HBR2] = 540,
+		[BDB_230_VBT_DP_MAX_LINK_RATE_HBR3] = 810,
+		[BDB_230_VBT_DP_MAX_LINK_RATE_UHBR10] = 1000,
+		[BDB_230_VBT_DP_MAX_LINK_RATE_UHBR13P5] = 1350,
+		[BDB_230_VBT_DP_MAX_LINK_RATE_UHBR20] = 2000,
+	};
+
+	return max_link_rate[dp_max_link_rate];
+}
+
+static void dump_dp_max_link_rate(uint16_t version, uint8_t dp_max_link_rate)
+{
+	int link_rate;
+
+	if (version >= 230)
+		link_rate = parse_dp_max_link_rate_230(dp_max_link_rate);
+	else
+		link_rate = parse_dp_max_link_rate_216(dp_max_link_rate);
+
+	if (link_rate == 0)
+		printf("\t\tDP max link rate: <platform max> (0x%02x)\n",
+		       dp_max_link_rate);
+	else
+		printf("\t\tDP max link rate: %g Gbps (0x%02x)\n",
+		       link_rate / 100.0f, dp_max_link_rate);
+}
+
+static const char *dp_vswing(u8 vswing)
+{
+	switch (vswing) {
+	case 0: return "0.4V";
+	case 1: return "0.6V";
+	case 2: return "0.8V";
+	case 3: return "1.2V";
+	default: return "<unknown>";
+	}
+}
+
+static const char *dp_preemph(u8 preemph)
+{
+	switch (preemph) {
+	case 0: return "0dB";
+	case 1: return "3.5dB";
+	case 2: return "6dB";
+	case 3: return "9.5dB";
+	default: return "<unknown>";
+	}
+}
+
+static const char *hdmi_frl_rate(u8 frl_rate)
+{
+	switch (frl_rate) {
+	case 0: return "FRL not supported";
+	case 1: return "3 GT/s";
+	case 2: return "6 GT/s";
+	case 3: return "8 GT/s";
+	case 4: return "10 GT/s";
+	case 5: return "12 GT/s";
+	default: return "<unknown>";
+	}
+}
+
+static const char *i2c_speed(u8 i2c_speed)
+{
+	switch (i2c_speed) {
+	case 0: return "100 kHz";
+	case 1: return "50 kHz";
+	case 2: return "400 kHz";
+	case 3: return "1 MHz";
+	default: return "<unknown>";
+	}
 }
 
 static void dump_child_device(struct context *context,
@@ -452,22 +945,69 @@ static void dump_child_device(struct context *context,
 	if (context->bdb->version < 152) {
 		printf("\t\tSignature: %.*s\n", (int)sizeof(child->device_id), child->device_id);
 	} else {
-		printf("\t\tI2C speed: 0x%02x\n", child->i2c_speed);
-		printf("\t\tDP onboard redriver: 0x%02x\n", child->dp_onboard_redriver);
-		printf("\t\tDP ondock redriver: 0x%02x\n", child->dp_ondock_redriver);
-		printf("\t\tHDMI level shifter value: 0x%02x\n", child->hdmi_level_shifter_value);
-		dump_hmdi_max_data_rate(child->hdmi_max_data_rate);
-		printf("\t\tOffset to DTD buffer for edidless CHILD: 0x%02x\n", child->dtd_buf_ptr);
-		printf("\t\tEdidless EFP: %s\n", YESNO(child->edidless_efp));
-		printf("\t\tCompression enable: %s\n", YESNO(child->compression_enable));
-		printf("\t\tCompression method CPS: %s\n", YESNO(child->compression_method));
-		printf("\t\tDual pipe ganged eDP: %s\n", YESNO(child->ganged_edp));
-		printf("\t\tCompression structure index: 0x%02x)\n", child->compression_structure_index);
-		printf("\t\tSlave DDI port: 0x%02x (%s)\n", child->slave_port, dvo_port(child->slave_port));
+		printf("\t\tI2C speed: %s (0x%02x)\n",
+		       i2c_speed(child->i2c_speed), child->i2c_speed);
+
+		if (context->bdb->version >= 158) {
+			printf("\t\tDP onboard redriver:\n");
+			printf("\t\t\tpresent: %s\n",
+			       YESNO((child->dp_onboard_redriver_present)));
+			printf("\t\t\tvswing: %s (0x%x)\n",
+			       dp_vswing(child->dp_onboard_redriver_vswing),
+			       child->dp_onboard_redriver_vswing);
+			printf("\t\t\tpre-emphasis: %s (0x%x)\n",
+			       dp_preemph(child->dp_onboard_redriver_preemph),
+			       child->dp_onboard_redriver_preemph);
+
+			printf("\t\tDP ondock redriver:\n");
+			printf("\t\t\tpresent: %s\n",
+			       YESNO((child->dp_ondock_redriver_present)));
+			printf("\t\t\tvswing: %s (0x%x)\n",
+			       dp_vswing(child->dp_ondock_redriver_vswing),
+			       child->dp_ondock_redriver_vswing);
+			printf("\t\t\tpre-emphasis: %s (0x%x)\n",
+			       dp_preemph(child->dp_ondock_redriver_preemph),
+			       child->dp_ondock_redriver_preemph);
+		}
+
+		if (context->bdb->version >= 204)
+			dump_hmdi_max_data_rate(child->hdmi_max_data_rate);
+		if (context->bdb->version >= 169)
+			printf("\t\tHDMI level shifter value: 0x%02x\n", child->hdmi_level_shifter_value);
+
+		if (context->bdb->version >= 161)
+			printf("\t\tOffset to DTD buffer for edidless CHILD: 0x%02x\n", child->dtd_buf_ptr);
+
+		if (context->bdb->version >= 251)
+			printf("\t\tDisable compression for external DP/HDMI: %s\n",
+			       YESNO(child->disable_compression_for_ext_disp));
+		if (context->bdb->version >= 235)
+			printf("\t\tLTTPR Mode: %stransparent\n",
+			       child->lttpr_non_transparent ? "non-" : "");
+		if (context->bdb->version >= 202)
+			printf("\t\tDual pipe ganged eDP: %s\n", YESNO(child->ganged_edp));
+		if (context->bdb->version >= 198) {
+			printf("\t\tCompression method CPS: %s\n", YESNO(child->compression_method_cps));
+			printf("\t\tCompression enable: %s\n", YESNO(child->compression_enable));
+		}
+		if (context->bdb->version >= 161)
+			printf("\t\tEdidless EFP: %s\n", YESNO(child->edidless_efp));
+
+		if (context->bdb->version >= 198)
+			printf("\t\tCompression structure index: %d\n", child->compression_structure_index);
+
+		if (context->bdb->version >= 237) {
+			printf("\t\tHDMI Max FRL rate valid: %s\n",
+			       YESNO(child->hdmi_max_frl_rate_valid));
+			printf("\t\tHDMI Max FRL rate: %s (0x%x)\n",
+			       hdmi_frl_rate(child->hdmi_max_frl_rate),
+			       child->hdmi_max_frl_rate);
+		}
 	}
 
 	printf("\t\tAIM offset: %d\n", child->addin_offset);
-	printf("\t\tDVO Port: 0x%02x (%s)\n", child->dvo_port, dvo_port(child->dvo_port));
+	printf("\t\tDVO Port: %s (0x%02x)\n",
+	       dvo_port(child->dvo_port), child->dvo_port);
 
 	printf("\t\tAIM I2C pin: 0x%02x\n", child->i2c_pin);
 	printf("\t\tAIM Slave address: 0x%02x\n", child->slave_addr);
@@ -481,22 +1021,38 @@ static void dump_child_device(struct context *context,
 		printf("\t\tSlave2 address: 0x%02x\n", child->slave2_addr);
 		printf("\t\tDDC2 pin: 0x%02x\n", child->ddc2_pin);
 	} else {
-		printf("\t\tEFP routed through dock: %s\n", YESNO(child->efp_routed));
-		printf("\t\tLane reversal: %s\n", YESNO(child->lane_reversal));
-		printf("\t\tOnboard LSPCON: %s\n", YESNO(child->lspcon));
-		printf("\t\tIboost enable: %s\n", YESNO(child->iboost));
-		printf("\t\tHPD sense invert: %s\n", YESNO(child->hpd_invert));
-		printf("\t\tHDMI compatible? %s\n", YESNO(child->hdmi_support));
-		printf("\t\tDP compatible? %s\n", YESNO(child->dp_support));
-		printf("\t\tTMDS compatible? %s\n", YESNO(child->tmds_support));
-		printf("\t\tAux channel: 0x%02x\n", child->aux_channel);
+		if (context->bdb->version >= 244)
+			printf("\t\teDP/DP max lane count: X%d\n", child->dp_max_lane_count + 1);
+		if (context->bdb->version >= 218)
+			printf("\t\tUse VBT vswing/premph table: %s\n", YESNO(child->use_vbt_vswing));
+		if (context->bdb->version >= 196) {
+			printf("\t\tHPD sense invert: %s\n", YESNO(child->hpd_invert));
+			printf("\t\tIboost enable: %s\n", YESNO(child->iboost));
+		}
+		if (context->bdb->version >= 192)
+			printf("\t\tOnboard LSPCON: %s\n", YESNO(child->lspcon));
+		if (context->bdb->version >= 184)
+			printf("\t\tLane reversal: %s\n", YESNO(child->lane_reversal));
+		if (context->bdb->version >= 158)
+			printf("\t\tEFP routed through dock: %s\n", YESNO(child->efp_routed));
+
+		if (context->bdb->version >= 158) {
+			printf("\t\tTMDS compatible? %s\n", YESNO(child->tmds_support));
+			printf("\t\tDP compatible? %s\n", YESNO(child->dp_support));
+			printf("\t\tHDMI compatible? %s\n", YESNO(child->hdmi_support));
+		}
+
+		printf("\t\tAux channel: %s (0x%02x)\n",
+		       aux_ch(child->aux_channel), child->aux_channel);
+
 		printf("\t\tDongle detect: 0x%02x\n", child->dongle_detect);
 	}
 
-	printf("\t\tPipe capabilities: 0x%02x\n", child->pipe_cap);
-	printf("\t\tSDVO stall signal available: %s\n", YESNO(child->sdvo_stall));
-	printf("\t\tHotplug connect status: 0x%02x\n", child->hpd_status);
 	printf("\t\tIntegrated encoder instead of SDVO: %s\n", YESNO(child->integrated_encoder));
+	printf("\t\tHotplug connect status: 0x%02x\n", child->hpd_status);
+	printf("\t\tSDVO stall signal available: %s\n", YESNO(child->sdvo_stall));
+	printf("\t\tPipe capabilities: 0x%02x\n", child->pipe_cap);
+
 	printf("\t\tDVO wiring: 0x%02x\n", child->dvo_wiring);
 
 	if (context->bdb->version < 171) {
@@ -507,20 +1063,30 @@ static void dump_child_device(struct context *context,
 	}
 
 	printf("\t\tDevice class extension: 0x%02x\n", child->extended_type);
+
 	printf("\t\tDVO function: 0x%02x\n", child->dvo_function);
 
-	if (context->bdb->version >= 195) {
+	if (context->bdb->version >= 209) {
+		printf("\t\tDP port trace length: 0x%x\n", child->dp_port_trace_length);
+		printf("\t\tThunderbolt port: %s\n", YESNO(child->tbt));
+	}
+	if (context->bdb->version >= 195)
 		printf("\t\tDP USB type C support: %s\n", YESNO(child->dp_usb_type_c));
+
+	if (context->bdb->version >= 195) {
 		printf("\t\t2X DP GPIO index: 0x%02x\n", child->dp_gpio_index);
 		printf("\t\t2X DP GPIO pin number: 0x%02x\n", child->dp_gpio_pin_num);
 	}
 
 	if (context->bdb->version >= 196) {
-		printf("\t\tIBoost level for HDMI: 0x%02x\n", child->hdmi_iboost_level);
 		printf("\t\tIBoost level for DP/eDP: 0x%02x\n", child->dp_iboost_level);
+		printf("\t\tIBoost level for HDMI: 0x%02x\n", child->hdmi_iboost_level);
 	}
-}
 
+	if (context->bdb->version >= 216)
+		dump_dp_max_link_rate(context->bdb->version,
+				      child->dp_max_link_rate);
+}
 
 static void dump_child_devices(struct context *context, const uint8_t *devices,
 			       uint8_t child_dev_num, uint8_t child_dev_size)
@@ -534,10 +1100,11 @@ static void dump_child_devices(struct context *context, const uint8_t *devices,
 	 * initialized to zero.
 	 */
 	child = calloc(1, sizeof(*child));
+	igt_assert(child);
 
 	for (i = 0; i < child_dev_num; i++) {
 		memcpy(child, devices + i * child_dev_size,
-		       min(sizeof(*child), child_dev_size));
+		       min_t(child_dev_size, sizeof(*child), child_dev_size));
 
 		dump_child_device(context, child);
 	}
@@ -548,17 +1115,17 @@ static void dump_child_devices(struct context *context, const uint8_t *devices,
 static void dump_general_definitions(struct context *context,
 				     const struct bdb_block *block)
 {
-	const struct bdb_general_definitions *defs = block->data;
+	const struct bdb_general_definitions *defs = block_data(block);
 	int child_dev_num;
 
 	child_dev_num = (block->size - sizeof(*defs)) / defs->child_dev_size;
 
 	printf("\tCRT DDC GMBUS addr: 0x%02x\n", defs->crt_ddc_gmbus_pin);
-	printf("\tUse ACPI DPMS CRT power states: %s\n",
-	       YESNO(defs->dpms_acpi));
+	printf("\tUse DPMS on AIM devices: %s\n", YESNO(defs->dpms_aim));
 	printf("\tSkip CRT detect at boot: %s\n",
 	       YESNO(defs->skip_boot_crt_detect));
-	printf("\tUse DPMS on AIM devices: %s\n", YESNO(defs->dpms_aim));
+	printf("\tUse Non ACPI DPMS CRT power states: %s\n",
+	       YESNO(defs->dpms_non_acpi));
 	printf("\tBoot display type: 0x%02x%02x\n", defs->boot_display[1],
 	       defs->boot_display[0]);
 	printf("\tChild device size: %d\n", defs->child_dev_size);
@@ -571,7 +1138,7 @@ static void dump_general_definitions(struct context *context,
 static void dump_legacy_child_devices(struct context *context,
 				      const struct bdb_block *block)
 {
-	const struct bdb_legacy_child_devices *defs = block->data;
+	const struct bdb_legacy_child_devices *defs = block_data(block);
 	int child_dev_num;
 
 	child_dev_num = (block->size - sizeof(*defs)) / defs->child_dev_size;
@@ -583,16 +1150,42 @@ static void dump_legacy_child_devices(struct context *context,
 			   child_dev_num, defs->child_dev_size);
 }
 
+static const char * const channel_type[] = {
+	[0] = "automatic",
+	[1] = "single",
+	[2] = "dual",
+	[3] = "reserved",
+};
+
+static const char * const dps_type[] = {
+	[0] = "static DRRS",
+	[1] = "D2PO",
+	[2] = "seamless DRRS",
+	[3] = "reserved",
+};
+
+static const char * const blt_type[] = {
+	[0] = "default",
+	[1] = "CCFL",
+	[2] = "LED",
+	[3] = "reserved",
+};
+
+static const char * const pos_type[] = {
+	[0] = "inside shell",
+	[1] = "outside shell",
+	[2] = "reserved",
+	[3] = "reserved",
+};
+
 static void dump_lvds_options(struct context *context,
 			      const struct bdb_block *block)
 {
-	const struct bdb_lvds_options *options = block->data;
+	const struct bdb_lvds_options *options = block_data(block);
 
-	if (context->panel_type == options->panel_type)
-		printf("\tPanel type: %d\n", options->panel_type);
-	else
-		printf("\tPanel type: %d (override %d)\n",
-		       options->panel_type, context->panel_type);
+	printf("\tPanel type: %d\n", options->panel_type);
+	if (context->bdb->version >= 212)
+		printf("\tPanel type 2: %d\n", options->panel_type2);
 	printf("\tLVDS EDID available: %s\n", YESNO(options->lvds_edid));
 	printf("\tPixel dither: %s\n", YESNO(options->pixel_dither));
 	printf("\tPFIT auto ratio: %s\n", YESNO(options->pfit_ratio_auto));
@@ -601,62 +1194,154 @@ static void dump_lvds_options(struct context *context,
 	printf("\tPFIT enhanced text mode: %s\n",
 	       YESNO(options->pfit_text_mode_enhanced));
 	printf("\tPFIT mode: %d\n", options->pfit_mode);
+
+	if (block->size < 14)
+		return;
+
+	for (int i = 0; i < 16; i++) {
+		unsigned int val;
+
+		if (i != context->panel_type && !context->dump_all_panel_types)
+			continue;
+
+		printf("\tPanel %d%s\n", i, context->panel_type == i ? " *" : "");
+
+		val = panel_bits(options->lvds_panel_channel_bits, i, 2);
+		printf("\t\tChannel type: %s (0x%x)\n",
+		       channel_type[val], val);
+
+		printf("\t\tSSC: %s\n",
+		       YESNO(panel_bool(options->ssc_bits, i)));
+
+		val = panel_bool(options->ssc_freq, i);
+		printf("\t\tSSC frequency: %d MHz (0x%x)\n",
+		       decode_ssc_freq(context, val), val);
+
+		printf("\t\tDisable SSC in dual display twin: %s\n",
+		       YESNO(panel_bool(options->ssc_ddt, i)));
+
+		if (block->size < 16)
+			continue;
+
+		val = panel_bool(options->panel_color_depth, i);
+		printf("\t\tPanel color depth: %d (0x%x)\n",
+		       val ? 24 : 18, val);
+
+		if (block->size < 24)
+			continue;
+
+		val = panel_bits(options->dps_panel_type_bits, i, 2);
+		printf("\t\tDPS type: %s (0x%x)\n",
+		       dps_type[val], val);
+
+		val = panel_bits(options->blt_control_type_bits, i, 2);
+		printf("\t\tBacklight type: %s (0x%x)\n",
+		       blt_type[val], val);
+
+		if (context->bdb->version < 200)
+			continue;
+
+		printf("\t\tLCDVCC on during S0 state: %s\n",
+		       YESNO(panel_bool(options->lcdvcc_s0_enable, i)));
+
+		if (context->bdb->version < 228)
+			continue;
+
+		val = panel_bits((options->rotation), i, 2);
+		printf("\t\tPanel rotation: %d degrees (0x%x)\n",
+		       val * 90, val);
+
+		if (context->bdb->version < 240)
+			continue;
+
+		val = panel_bits((options->position), i, 2);
+		printf("\t\tPanel position: %s (0x%x)\n",
+		       pos_type[val], val);
+	}
 }
 
 static void dump_lvds_ptr_data(struct context *context,
 			       const struct bdb_block *block)
 {
-	const struct bdb_lvds_lfp_data_ptrs *ptrs = block->data;
+	const struct bdb_lvds_lfp_data_ptrs *ptrs = block_data(block);
 
 	printf("\tNumber of entries: %d\n", ptrs->lvds_entries);
+
+	for (int i = 0; i < 16; i++) {
+		if (i != context->panel_type && !context->dump_all_panel_types)
+			continue;
+
+		printf("\tPanel %d%s\n", i, context->panel_type == i ? " *" : "");
+
+		if (ptrs->lvds_entries >= 1) {
+			printf("\t\tFP timing offset: %d\n",
+			       ptrs->ptr[i].fp_timing.offset);
+			printf("\t\tFP timing table size: %d\n",
+			       ptrs->ptr[i].fp_timing.table_size);
+		}
+		if (ptrs->lvds_entries >= 2) {
+			printf("\t\tDVO timing offset: %d\n",
+			       ptrs->ptr[i].dvo_timing.offset);
+			printf("\t\tDVO timing table size: %d\n",
+			       ptrs->ptr[i].dvo_timing.table_size);
+		}
+		if (ptrs->lvds_entries >= 3) {
+			printf("\t\tPanel PnP ID offset: %d\n",
+			       ptrs->ptr[i].panel_pnp_id.offset);
+			printf("\t\tPanel PnP ID table size: %d\n",
+			       ptrs->ptr[i].panel_pnp_id.table_size);
+		}
+	}
+
+	if (ptrs->panel_name.table_size) {
+		printf("\tPanel name offset: %d\n",
+		       ptrs->panel_name.offset);
+		printf("\tPanel name table size: %d\n",
+		       ptrs->panel_name.table_size);
+	}
+}
+
+static char *decode_pnp_id(u16 mfg_name, char str[4])
+{
+	mfg_name = ntohs(mfg_name);
+
+	str[0] = '@' + ((mfg_name >> 10) & 0x1f);
+	str[1] = '@' + ((mfg_name >> 5) & 0x1f);
+	str[2] = '@' + ((mfg_name >> 0) & 0x1f);
+	str[3] = '\0';
+
+	return str;
 }
 
 static void dump_lvds_data(struct context *context,
 			   const struct bdb_block *block)
 {
-	const struct bdb_lvds_lfp_data *lvds_data = block->data;
 	struct bdb_block *ptrs_block;
 	const struct bdb_lvds_lfp_data_ptrs *ptrs;
-	int num_entries;
 	int i;
 	int hdisplay, hsyncstart, hsyncend, htotal;
 	int vdisplay, vsyncstart, vsyncend, vtotal;
 	float clock;
-	int lfp_data_size, dvo_offset;
 
 	ptrs_block = find_section(context, BDB_LVDS_LFP_DATA_PTRS);
-	if (!ptrs_block) {
-		printf("No LVDS ptr block\n");
+	if (!ptrs_block)
 		return;
-	}
 
-	ptrs = ptrs_block->data;
+	ptrs = block_data(ptrs_block);
 
-	lfp_data_size =
-	    ptrs->ptr[1].fp_timing_offset - ptrs->ptr[0].fp_timing_offset;
-	dvo_offset =
-	    ptrs->ptr[0].dvo_timing_offset - ptrs->ptr[0].fp_timing_offset;
-
-	num_entries = block->size / lfp_data_size;
-
-	printf("  Number of entries: %d (preferred block marked with '*')\n",
-	       num_entries);
-
-	for (i = 0; i < num_entries; i++) {
-		const uint8_t *lfp_data_ptr =
-		    (const uint8_t *) lvds_data->data + lfp_data_size * i;
-		const uint8_t *timing_data = lfp_data_ptr + dvo_offset;
-		const struct lvds_lfp_data_entry *lfp_data =
-		    (const struct lvds_lfp_data_entry *)lfp_data_ptr;
-		char marker;
+	for (i = 0; i < 16; i++) {
+		const struct lvds_fp_timing *fp_timing =
+			block_data(block) + ptrs->ptr[i].fp_timing.offset;
+		const uint8_t *timing_data =
+			block_data(block) + ptrs->ptr[i].dvo_timing.offset;
+		const struct lvds_pnp_id *pnp_id =
+			block_data(block) + ptrs->ptr[i].panel_pnp_id.offset;
+		const struct bdb_lvds_lfp_data_tail *tail =
+			block_data(block) + ptrs->panel_name.offset;
+		char mfg[4];
 
 		if (i != context->panel_type && !context->dump_all_panel_types)
 			continue;
-
-		if (i == context->panel_type)
-			marker = '*';
-		else
-			marker = ' ';
 
 		hdisplay = _H_ACTIVE(timing_data);
 		hsyncstart = hdisplay + _H_SYNC_OFF(timing_data);
@@ -669,52 +1354,118 @@ static void dump_lvds_data(struct context *context,
 		vtotal = vdisplay + _V_BLANK(timing_data);
 		clock = _PIXEL_CLOCK(timing_data) / 1000;
 
-		printf("%c\tpanel type %02i: %dx%d clock %d\n", marker,
-		       i, lfp_data->fp_timing.x_res, lfp_data->fp_timing.y_res,
+		printf("\tPanel %d%s\n", i, context->panel_type == i ? " *" : "");
+		printf("\t\t%dx%d clock %d\n",
+		       fp_timing->x_res, fp_timing->y_res,
 		       _PIXEL_CLOCK(timing_data));
 		printf("\t\tinfo:\n");
 		printf("\t\t  LVDS: 0x%08lx\n",
-		       (unsigned long)lfp_data->fp_timing.lvds_reg_val);
+		       (unsigned long)fp_timing->lvds_reg_val);
 		printf("\t\t  PP_ON_DELAYS: 0x%08lx\n",
-		       (unsigned long)lfp_data->fp_timing.pp_on_reg_val);
+		       (unsigned long)fp_timing->pp_on_reg_val);
 		printf("\t\t  PP_OFF_DELAYS: 0x%08lx\n",
-		       (unsigned long)lfp_data->fp_timing.pp_off_reg_val);
+		       (unsigned long)fp_timing->pp_off_reg_val);
 		printf("\t\t  PP_DIVISOR: 0x%08lx\n",
-		       (unsigned long)lfp_data->fp_timing.pp_cycle_reg_val);
+		       (unsigned long)fp_timing->pp_cycle_reg_val);
 		printf("\t\t  PFIT: 0x%08lx\n",
-		       (unsigned long)lfp_data->fp_timing.pfit_reg_val);
+		       (unsigned long)fp_timing->pfit_reg_val);
 		printf("\t\ttimings: %d %d %d %d %d %d %d %d %.2f (%s)\n",
 		       hdisplay, hsyncstart, hsyncend, htotal,
 		       vdisplay, vsyncstart, vsyncend, vtotal, clock,
 		       (hsyncend > htotal || vsyncend > vtotal) ?
 		       "BAD!" : "good");
+
+		printf("\t\tPnP ID:\n");
+		printf("\t\t  Mfg name: %s (0x%x)\n",
+		       decode_pnp_id(pnp_id->mfg_name, mfg), pnp_id->mfg_name);
+		printf("\t\t  Product code: %u\n", pnp_id->product_code);
+		printf("\t\t  Serial: %u\n", pnp_id->serial);
+		printf("\t\t  Mfg week: %d\n", pnp_id->mfg_week);
+		printf("\t\t  Mfg year: %d\n", 1990 + pnp_id->mfg_year);
+
+		if (!ptrs->panel_name.table_size)
+			continue;
+
+		printf("\t\tPanel name: %.*s\n",
+		       (int)sizeof(tail->panel_name[0].name), tail->panel_name[i].name);
+
+		if (context->bdb->version < 187)
+			continue;
+
+		printf("\t\tScaling enable: %s\n",
+		       YESNO(panel_bool(tail->scaling_enable, i)));
+
+		if (context->bdb->version < 188)
+			continue;
+
+		printf("\t\tSeamless DRRS min refresh rate: %d\n",
+		       tail->seamless_drrs_min_refresh_rate[i]);
+
+		if (context->bdb->version < 208)
+			continue;
+
+		printf("\t\tPixel overlap count: %d\n",
+		       tail->pixel_overlap_count[i]);
+
+		if (context->bdb->version < 227)
+			continue;
+
+		printf("\t\tBlack border:\n");
+		printf("\t\t  Top: %d\n", tail->black_border[i].top);
+		printf("\t\t  Bottom: %d\n", tail->black_border[i].top);
+		printf("\t\t  Left: %d\n", tail->black_border[i].left);
+		printf("\t\t  Right: %d\n", tail->black_border[i].right);
+
+		if (context->bdb->version < 231)
+			continue;
+
+		printf("\t\tDual LFP port sync enable: %s\n",
+		       YESNO(panel_bool(tail->dual_lfp_port_sync_enable, i)));
+
+		if (context->bdb->version < 245)
+			continue;
+
+		printf("\t\tGPU dithering for banding artifacts: %s\n",
+		       YESNO(panel_bool(tail->gpu_dithering_for_banding_artifacts, i)));
 	}
 
 	free(ptrs_block);
 }
 
+static const char * const lvds_config[] = {
+	[BDB_DRIVER_NO_LVDS] = "No LVDS",
+	[BDB_DRIVER_INT_LVDS] = "Integrated LVDS",
+	[BDB_DRIVER_SDVO_LVDS] = "SDVO LVDS",
+	[BDB_DRIVER_EDP] = "Embedded DisplayPort",
+};
+
 static void dump_driver_feature(struct context *context,
 				const struct bdb_block *block)
 {
-	const struct bdb_driver_features *feature = block->data;
+	const struct bdb_driver_features *feature = block_data(block);
 
-	printf("\tBoot Device Algorithm: %s\n", feature->boot_dev_algorithm ?
-	       "driver default" : "os default");
-	printf("\tBlock display switching when DVD active: %s\n",
-	       YESNO(feature->block_display_switch));
-	printf("\tAllow display switching when in Full Screen DOS: %s\n",
-	       YESNO(feature->allow_display_switch));
-	printf("\tHot Plug DVO: %s\n", YESNO(feature->hotplug_dvo));
-	printf("\tDual View Zoom: %s\n", YESNO(feature->dual_view_zoom));
-	printf("\tDriver INT 15h hook: %s\n", YESNO(feature->int15h_hook));
-	printf("\tEnable Sprite in Clone Mode: %s\n",
-	       YESNO(feature->sprite_in_clone));
 	printf("\tUse 00000110h ID for Primary LFP: %s\n",
 	       YESNO(feature->primary_lfp_id));
+	printf("\tEnable Sprite in Clone Mode: %s\n",
+	       YESNO(feature->sprite_in_clone));
+	printf("\tDriver INT 15h hook: %s\n",
+	       YESNO(feature->int15h_hook));
+	printf("\tDual View Zoom: %s\n",
+	       YESNO(feature->dual_view_zoom));
+	printf("\tHot Plug DVO: %s\n",
+	       YESNO(feature->hotplug_dvo));
+	printf("\tAllow display switching when in Full Screen DOS: %s\n",
+	       YESNO(feature->allow_display_switch_dos));
+	printf("\tAllow display switching when DVD active: %s\n",
+	       YESNO(feature->allow_display_switch_dvd));
+	printf("\tBoot Device Algorithm: %s\n",
+	       feature->boot_dev_algorithm ? "driver default" : "os default");
+
 	printf("\tBoot Mode X: %u\n", feature->boot_mode_x);
 	printf("\tBoot Mode Y: %u\n", feature->boot_mode_y);
 	printf("\tBoot Mode Bpp: %u\n", feature->boot_mode_bpp);
 	printf("\tBoot Mode Refresh: %u\n", feature->boot_mode_refresh);
+
 	printf("\tEnable LFP as primary: %s\n",
 	       YESNO(feature->enable_lfp_primary));
 	printf("\tSelective Mode Pruning: %s\n",
@@ -727,9 +1478,8 @@ static void dump_driver_feature(struct context *context,
 	       YESNO(feature->nt_clone_support));
 	printf("\tDefault Power Scheme user interface: %s\n",
 	       feature->power_scheme_ui ? "3rd party" : "CUI");
-	printf
-	    ("\tSprite Display Assignment when Overlay is Active in Clone Mode: %s\n",
-	     feature->sprite_display_assign ? "primary" : "secondary");
+	printf("\tSprite Display Assignment when Overlay is Active in Clone Mode: %s\n",
+	       feature->sprite_display_assign ? "primary" : "secondary");
 	printf("\tDisplay Maintain Aspect Scaling via CUI: %s\n",
 	       YESNO(feature->cui_aspect_scaling));
 	printf("\tPreserve Aspect Ratio: %s\n",
@@ -737,35 +1487,65 @@ static void dump_driver_feature(struct context *context,
 	printf("\tEnable SDVO device power down: %s\n",
 	       YESNO(feature->sdvo_device_power_down));
 	printf("\tCRT hotplug: %s\n", YESNO(feature->crt_hotplug));
-	printf("\tLVDS config: ");
-	switch (feature->lvds_config) {
-	case BDB_DRIVER_NO_LVDS:
-		printf("No LVDS\n");
-		break;
-	case BDB_DRIVER_INT_LVDS:
-		printf("Integrated LVDS\n");
-		break;
-	case BDB_DRIVER_SDVO_LVDS:
-		printf("SDVO LVDS\n");
-		break;
-	case BDB_DRIVER_EDP:
-		printf("Embedded DisplayPort\n");
-		break;
-	}
+
+	printf("\tLVDS config: %s (0x%x)\n",
+	       lvds_config[feature->lvds_config], feature->lvds_config);
+	printf("\tTV hotplug: %s\n",
+	       YESNO(feature->tv_hotplug));
+
+	printf("\tDisplay subsystem enable: %s\n",
+	       YESNO(feature->display_subsystem_enable));
+	printf("\tEmbedded platform: %s\n",
+	       YESNO(feature->embedded_platform));
 	printf("\tDefine Display statically: %s\n",
 	       YESNO(feature->static_display));
+
 	printf("\tLegacy CRT max X: %d\n", feature->legacy_crt_max_x);
 	printf("\tLegacy CRT max Y: %d\n", feature->legacy_crt_max_y);
 	printf("\tLegacy CRT max refresh: %d\n",
 	       feature->legacy_crt_max_refresh);
-	printf("\tEnable DRRS: %s\n", YESNO(feature->drrs_enabled));
-	printf("\tEnable PSR: %s\n", YESNO(feature->psr_enabled));
+
+	printf("\tInternal source termination for HDMI: %s\n",
+	       YESNO(feature->hdmi_termination));
+	printf("\tCEA 861-D HDMI support: %s\n",
+	       YESNO(feature->cea861d_hdmi_support));
+	printf("\tSelf refresh enable: %s\n",
+	       YESNO(feature->self_refresh_enable));
+
+	printf("\tCustom VBT number: 0x%x\n", feature->custom_vbt_version);
+
+	printf("\tPC Features field validity: %s\n",
+	       YESNO(feature->pc_feature_valid));
+	printf("\tDynamic Media Refresh Rate Switching (DMRRS): %s\n",
+	       YESNO(feature->dmrrs_enabled));
+	printf("\tIntermediate Pixel Storage (IPS): %s\n",
+	       YESNO(feature->ips_enabled));
+	printf("\tPanel Self Refresh (PSR): %s\n",
+	       YESNO(feature->psr_enabled));
+	printf("\tTurbo Boost Technology: %s\n",
+	       YESNO(feature->tbt_enabled));
+	printf("\tGraphics Power Management (GPMT): %s\n",
+	       YESNO(feature->gpmt_enabled));
+	printf("\tGraphics Render Standby (RS): %s\n",
+	       YESNO(feature->grs_enabled));
+	printf("\tDynamic Refresh Rate Switching (DRRS): %s\n",
+	       YESNO(feature->drrs_enabled));
+	printf("\tAutomatic Display Brightness (ADB): %s\n",
+	       YESNO(feature->adb_enabled));
+	printf("\tDxgkDDI Backlight Control (DxgkDdiBLC): %s\n",
+	       YESNO(feature->bltclt_enabled));
+	printf("\tDisplay Power Saving Technology (DPST): %s\n",
+	       YESNO(feature->dpst_enabled));
+	printf("\tSmart 2D Display Technology (S2DDT): %s\n",
+	       YESNO(feature->s2ddt_enabled));
+	printf("\tRapid Memory Power Management (RMPM): %s\n",
+	       YESNO(feature->rmpm_enabled));
 }
 
 static void dump_edp(struct context *context,
 		     const struct bdb_block *block)
 {
-	const struct bdb_edp *edp = block->data;
+	const struct bdb_edp *edp = block_data(block);
 	int bpp, msa;
 	int i;
 
@@ -782,7 +1562,7 @@ static void dump_edp(struct context *context,
 		       edp->power_seqs[i].t10,
 		       edp->power_seqs[i].t12);
 
-		bpp = (edp->color_depth >> (i * 2)) & 3;
+		bpp = panel_bits(edp->color_depth, i, 2);
 
 		printf("\t\tPanel color depth: ");
 		switch (bpp) {
@@ -800,79 +1580,42 @@ static void dump_edp(struct context *context,
 			break;
 		}
 
-		msa = (edp->sdrrs_msa_timing_delay >> (i * 2)) & 3;
+		msa = panel_bits(edp->sdrrs_msa_timing_delay, i, 2);
 		printf("\t\teDP sDRRS MSA Delay: Lane %d\n", msa + 1);
 
 		printf("\t\tFast link params:\n");
 		printf("\t\t\trate: ");
-		if (edp->fast_link_params[i].rate == EDP_RATE_1_62)
-			printf("1.62G\n");
-		else if (edp->fast_link_params[i].rate == EDP_RATE_2_7)
-			printf("2.7G\n");
-		printf("\t\t\tlanes: ");
-		switch (edp->fast_link_params[i].lanes) {
-		case EDP_LANE_1:
-			printf("x1 mode\n");
+		switch (edp->fast_link_params[i].rate) {
+		case EDP_RATE_1_62:
+			printf("1.62Gbps\n");
 			break;
-		case EDP_LANE_2:
-			printf("x2 mode\n");
+		case EDP_RATE_2_7:
+			printf("2.7Gbpc\n");
 			break;
-		case EDP_LANE_4:
-			printf("x4 mode\n");
+		case EDP_RATE_5_4:
+			printf("5.4Gbps\n");
 			break;
 		default:
-			printf("(unknown value %d)\n",
-			       edp->fast_link_params[i].lanes);
+			printf("(unknonn value %d)\n",
+			       edp->fast_link_params[i].rate);
 			break;
 		}
-		printf("\t\t\tpre-emphasis: ");
-		switch (edp->fast_link_params[i].preemphasis) {
-		case EDP_PREEMPHASIS_NONE:
-			printf("none\n");
-			break;
-		case EDP_PREEMPHASIS_3_5dB:
-			printf("3.5dB\n");
-			break;
-		case EDP_PREEMPHASIS_6dB:
-			printf("6dB\n");
-			break;
-		case EDP_PREEMPHASIS_9_5dB:
-			printf("9.5dB\n");
-			break;
-		default:
-			printf("(unknown value %d)\n",
-			       edp->fast_link_params[i].preemphasis);
-			break;
-		}
-		printf("\t\t\tvswing: ");
-		switch (edp->fast_link_params[i].vswing) {
-		case EDP_VSWING_0_4V:
-			printf("0.4V\n");
-			break;
-		case EDP_VSWING_0_6V:
-			printf("0.6V\n");
-			break;
-		case EDP_VSWING_0_8V:
-			printf("0.8V\n");
-			break;
-		case EDP_VSWING_1_2V:
-			printf("1.2V\n");
-			break;
-		default:
-			printf("(unknown value %d)\n",
-			       edp->fast_link_params[i].vswing);
-			break;
-		}
+		printf("\t\t\tlanes: X%d",
+		       edp->fast_link_params[i].lanes + 1);
+		printf("\t\t\tpre-emphasis: %s (0x%x)\n",
+		       dp_preemph(edp->fast_link_params[i].preemphasis),
+		       edp->fast_link_params[i].preemphasis);
+		printf("\t\t\tvswing: %s (0x%x)\n",
+		       dp_vswing(edp->fast_link_params[i].vswing),
+		       edp->fast_link_params[i].vswing);
 
-		if (context->bdb->version >= 162) {
-			bool val = (edp->edp_s3d_feature >> i) & 1;
-			printf("\t\tStereo 3D feature: %s\n", YESNO(val));
-		}
+		if (context->bdb->version >= 162)
+			printf("\t\tStereo 3D feature: %s\n",
+			       YESNO(panel_bool(edp->edp_s3d_feature, i)));
 
-		if (context->bdb->version >= 165) {
-			bool val = (edp->edp_t3_optimization >> i) & 1;
-			printf("\t\tT3 optimization: %s\n", YESNO(val));
-		}
+		if (context->bdb->version >= 165)
+			printf("\t\tT3 optimization: %s\n",
+			       YESNO(panel_bool(edp->edp_t3_optimization, i)));
 
 		if (context->bdb->version >= 173) {
 			int val = (edp->edp_vswing_preemph >> (i * 4)) & 0xf;
@@ -891,67 +1634,46 @@ static void dump_edp(struct context *context,
 			}
 		}
 
-		if (context->bdb->version >= 182) {
-			bool val = (edp->fast_link_training >> i) & 1;
-			printf("\t\tFast link training: %s\n", YESNO(val));
-		}
+		if (context->bdb->version >= 182)
+			printf("\t\tFast link training: %s\n",
+			       YESNO(panel_bool(edp->fast_link_training, i)));
 
-		if (context->bdb->version >= 185) {
-			bool val = (edp->dpcd_600h_write_required >> i) & 1;
-			printf("\t\tDPCD 600h write required: %s\n", YESNO(val));
-		}
+		if (context->bdb->version >= 185)
+			printf("\t\tDPCD 600h write required: %s\n",
+			       YESNO(panel_bool(edp->dpcd_600h_write_required, i)));
 
-		if (context->bdb->version >= 186) {
+		if (context->bdb->version >= 186)
 			printf("\t\tPWM delays:\n"
 			       "\t\t\tPWM on to backlight enable: %d\n"
 			       "\t\t\tBacklight disable to PWM off: %d\n",
 			       edp->pwm_delays[i].pwm_on_to_backlight_enable,
 			       edp->pwm_delays[i].backlight_disable_to_pwm_off);
-		}
 
 		if (context->bdb->version >= 199) {
-			bool val = (edp->full_link_params_provided >> i) & 1;
+			printf("\t\tFull link params provided: %s\n",
+			       YESNO(panel_bool(edp->full_link_params_provided, i)));
 
-			printf("\t\tFull link params provided: %s\n", YESNO(val));
 			printf("\t\tFull link params:\n");
-			printf("\t\t\tpre-emphasis: ");
-			switch (edp->full_link_params[i].preemphasis) {
-			case EDP_PREEMPHASIS_NONE:
-				printf("none\n");
-				break;
-			case EDP_PREEMPHASIS_3_5dB:
-				printf("3.5dB\n");
-				break;
-			case EDP_PREEMPHASIS_6dB:
-				printf("6dB\n");
-				break;
-			case EDP_PREEMPHASIS_9_5dB:
-				printf("9.5dB\n");
-				break;
-			default:
-				printf("(unknown value %d)\n",
-				       edp->full_link_params[i].preemphasis);
-				break;
-			}
-			printf("\t\t\tvswing: ");
-			switch (edp->full_link_params[i].vswing) {
-			case EDP_VSWING_0_4V:
-				printf("0.4V\n");
-				break;
-			case EDP_VSWING_0_6V:
-				printf("0.6V\n");
-				break;
-			case EDP_VSWING_0_8V:
-				printf("0.8V\n");
-				break;
-			case EDP_VSWING_1_2V:
-				printf("1.2V\n");
-				break;
-			default:
-				printf("(unknown value %d)\n",
-				       edp->full_link_params[i].vswing);
-				break;
-			}
+			printf("\t\t\tpre-emphasis: %s (0x%x)\n",
+			       dp_preemph(edp->full_link_params[i].preemphasis),
+			       edp->full_link_params[i].preemphasis);
+			printf("\t\t\tvswing: %s (0x%x)\n",
+			       dp_vswing(edp->full_link_params[i].vswing),
+			       edp->full_link_params[i].vswing);
+		}
+
+		if (context->bdb->version >= 224) {
+			u16 rate = edp->edp_fast_link_training_rate[i];
+
+			printf("\t\teDP fast link training data rate: %g Gbps (0x%02x)\n",
+			       rate / 5000.0f, rate);
+		}
+
+		if (context->bdb->version >= 244) {
+			u16 rate = edp->edp_max_port_link_rate[i];
+
+			printf("\t\teDP max port link rate: %g Gbps (0x%02x)\n",
+			       rate / 5000.0f, rate);
 		}
 	}
 }
@@ -959,7 +1681,7 @@ static void dump_edp(struct context *context,
 static void dump_psr(struct context *context,
 		     const struct bdb_block *block)
 {
-	const struct bdb_psr *psr_block = block->data;
+	const struct bdb_psr *psr_block = block_data(block);
 	int i;
 	uint32_t psr2_tp_time;
 
@@ -1011,10 +1733,92 @@ static void dump_psr(struct context *context,
 			int index;
 			static const uint16_t psr2_tp_times[] = {500, 100, 2500, 5};
 
-			index = (psr2_tp_time >> (i * 2)) & 0x3;
+			index = panel_bits(psr2_tp_time, i, 2);
+
 			printf("\t\tPSR2 TP2/TP3 wakeup time: %d usec (0x%x)\n",
 			       psr2_tp_times[index], index);
 		}
+	}
+}
+
+static void dump_lfp_power(struct context *context,
+			   const struct bdb_block *block)
+{
+	const struct bdb_lfp_power *lfp_block = block_data(block);
+	int i;
+
+	printf("\tALS enable: %s\n",
+	       YESNO(lfp_block->features.als_enable));
+	printf("\tDisplay LACE support: %s\n",
+	       YESNO(lfp_block->features.lace_support));
+	printf("\tDefault Display LACE enabled status: %s\n",
+	       YESNO(lfp_block->features.lace_enabled_status));
+	printf("\tPower conservation preference level: %d\n",
+	       lfp_block->features.power_conservation_pref);
+
+	for (i = 0; i < 5; i++) {
+		printf("\tALS backlight adjust: %d\n",
+		       lfp_block->als[i].backlight_adjust);
+		printf("\tALS Lux: %d\n",
+		       lfp_block->als[i].lux);
+	}
+
+	printf("\tDisplay LACE aggressiveness profile: %d\n",
+	       lfp_block->lace_aggressiveness_profile);
+
+	if (context->bdb->version < 228)
+		return;
+
+	for (i = 0; i < 16; i++) {
+		if (i != context->panel_type && !context->dump_all_panel_types)
+			continue;
+
+		printf("\tPanel %d%s\n", i, context->panel_type == i ? " *" : "");
+
+		printf("\t\tDisplay Power Saving Technology (DPST): %s\n",
+		       YESNO(panel_bool(lfp_block->dpst, i)));
+		printf("\t\tPanel Self Refresh (PSR): %s\n",
+		       YESNO(panel_bool(lfp_block->psr, i)));
+		printf("\t\tDynamic Refresh Rate Switching (DRRS): %s\n",
+		       YESNO(panel_bool(lfp_block->drrs, i)));
+		printf("\t\tDisplay LACE support: %s\n",
+		       YESNO(panel_bool(lfp_block->lace_support, i)));
+		printf("\t\tAssertive Display Technology (ADT): %s\n",
+		       YESNO(panel_bool(lfp_block->adt, i)));
+		printf("\t\tDynamic Media Refresh Rate Switching (DMRRS): %s\n",
+		       YESNO(panel_bool(lfp_block->dmrrs, i)));
+		printf("\t\tAutomatic Display Brightness (ADB): %s\n",
+		       YESNO(panel_bool(lfp_block->adb, i)));
+		printf("\t\tDefault Display LACE enabled: %s\n",
+		       YESNO(panel_bool(lfp_block->lace_enabled_status, i)));
+		printf("\t\tLACE Aggressiveness: %d\n",
+		       lfp_block->aggressiveness[i].lace_aggressiveness);
+		printf("\t\tDPST Aggressiveness: %d\n",
+		       lfp_block->aggressiveness[i].dpst_aggressiveness);
+
+		if (context->bdb->version < 232)
+			continue;
+
+		printf("\t\tEDP 4k/2k HOBL feature: %s\n",
+		       YESNO(panel_bool(lfp_block->hobl, i)));
+
+		if (context->bdb->version < 233)
+			continue;
+
+		printf("\t\tVariable Refresh Rate (VRR): %s\n",
+		       YESNO(panel_bool(lfp_block->vrr_feature_enabled, i)));
+
+		if (context->bdb->version < 247)
+			continue;
+
+		printf("\t\tELP: %s\n",
+		       YESNO(panel_bool(lfp_block->elp, i)));
+		printf("\t\tOPST: %s\n",
+		       YESNO(panel_bool(lfp_block->opst, i)));
+		printf("\t\tELP Aggressiveness: %d\n",
+		       lfp_block->aggressiveness2[i].elp_aggressiveness);
+		printf("\t\tOPST Aggrgessiveness: %d\n",
+		       lfp_block->aggressiveness2[i].opst_aggressiveness);
 	}
 }
 
@@ -1053,7 +1857,7 @@ print_detail_timing_data(const struct lvds_dvo_timing *dvo_timing)
 static void dump_sdvo_panel_dtds(struct context *context,
 				 const struct bdb_block *block)
 {
-	const struct lvds_dvo_timing *dvo_timing = block->data;
+	const struct lvds_dvo_timing *dvo_timing = block_data(block);
 	int n, count;
 
 	count = block->size / sizeof(struct lvds_dvo_timing);
@@ -1066,7 +1870,7 @@ static void dump_sdvo_panel_dtds(struct context *context,
 static void dump_sdvo_lvds_options(struct context *context,
 				   const struct bdb_block *block)
 {
-	const struct bdb_sdvo_lvds_options *options = block->data;
+	const struct bdb_sdvo_lvds_options *options = block_data(block);
 
 	printf("\tbacklight: %d\n", options->panel_backlight);
 	printf("\th40 type: %d\n", options->h40_set_panel_type);
@@ -1088,95 +1892,122 @@ static void dump_sdvo_lvds_options(struct context *context,
 static void dump_mipi_config(struct context *context,
 			     const struct bdb_block *block)
 {
-	const struct bdb_mipi_config *start = block->data;
-	const struct mipi_config *config;
-	const struct mipi_pps_data *pps;
+	const struct bdb_mipi_config *start = block_data(block);
 
-	config = &start->config[context->panel_type];
-	pps = &start->pps[context->panel_type];
+	for (int i = 0; i < ARRAY_SIZE(start->config); i++) {
+		const struct mipi_config *config =
+			&start->config[context->panel_type];
+		const struct mipi_pps_data *pps =
+			&start->pps[context->panel_type];
+		const struct edp_pwm_delays *pwm_delays =
+			&start->pwm_delays[context->panel_type];
 
-	printf("\tGeneral Param\n");
-	printf("\t\t BTA disable: %s\n", config->bta ? "Disabled" : "Enabled");
-	printf("\t\t Panel Rotation: %d degrees\n", config->rotation * 90);
+		if (i != context->panel_type && !context->dump_all_panel_types)
+			continue;
 
-	printf("\t\t Video Mode Color Format: ");
-	if (config->videomode_color_format == 0)
-		printf("Not supported\n");
-	else if (config->videomode_color_format == 1)
-		printf("RGB565\n");
-	else if (config->videomode_color_format == 2)
-		printf("RGB666\n");
-	else if (config->videomode_color_format == 3)
-		printf("RGB666 Loosely Packed\n");
-	else if (config->videomode_color_format == 4)
-		printf("RGB888\n");
-	printf("\t\t PPS GPIO Pins: %s \n", config->pwm_blc ? "Using SOC" : "Using PMIC");
-	printf("\t\t CABC Support: %s\n", config->cabc ? "supported" : "not supported");
-	printf("\t\t Mode: %s\n", config->cmd_mode ? "COMMAND" : "VIDEO");
-	printf("\t\t Video transfer mode: %s (0x%x)\n",
-	       config->vtm == 1 ? "non-burst with sync pulse" :
-	       config->vtm == 2 ? "non-burst with sync events" :
-	       config->vtm == 3 ? "burst" : "<unknown>",
-	       config->vtm);
-	printf("\t\t Dithering: %s\n", config->dithering ? "done in Display Controller" : "done in Panel Controller");
+		printf("\tPanel %d%s\n", i,
+		       context->panel_type == i ? " *" : "");
 
-	printf("\tPort Desc\n");
-	printf("\t\t Pixel overlap: %d\n", config->pixel_overlap);
-	printf("\t\t Lane Count: %d\n", config->lane_cnt + 1);
-	printf("\t\t Dual Link Support: ");
-	if (config->dual_link == 0)
-		printf("not supported\n");
-	else if (config->dual_link == 1)
-		printf("Front Back mode\n");
-	else
-		printf("Pixel Alternative Mode\n");
+		printf("\t\tGeneral Param\n");
+		printf("\t\t\t BTA disable: %s\n", config->bta ? "Disabled" : "Enabled");
+		printf("\t\t\t Panel Rotation: %d degrees\n", config->rotation * 90);
 
-	printf("\tDphy Flags\n");
-	printf("\t\t Clock Stop: %s\n", config->clk_stop ? "ENABLED" : "DISABLED");
-	printf("\t\t EOT disabled: %s\n\n", config->eot_disabled ? "EOT not to be sent" : "EOT to be sent");
+		printf("\t\t\t Video Mode Color Format: ");
+		if (config->videomode_color_format == 0)
+			printf("Not supported\n");
+		else if (config->videomode_color_format == 1)
+			printf("RGB565\n");
+		else if (config->videomode_color_format == 2)
+			printf("RGB666\n");
+		else if (config->videomode_color_format == 3)
+			printf("RGB666 Loosely Packed\n");
+		else if (config->videomode_color_format == 4)
+			printf("RGB888\n");
+		printf("\t\t\t PPS GPIO Pins: %s \n",
+		       config->pwm_blc ? "Using SOC" : "Using PMIC");
+		printf("\t\t\t CABC Support: %s\n",
+		       config->cabc ? "supported" : "not supported");
+		printf("\t\t\t Mode: %s\n",
+		       config->cmd_mode ? "COMMAND" : "VIDEO");
+		printf("\t\t\t Video transfer mode: %s (0x%x)\n",
+		       config->vtm == 1 ? "non-burst with sync pulse" :
+		       config->vtm == 2 ? "non-burst with sync events" :
+		       config->vtm == 3 ? "burst" : "<unknown>",
+		       config->vtm);
+		printf("\t\t\t Dithering: %s\n",
+		       config->dithering ? "done in Display Controller" : "done in Panel Controller");
 
-	printf("\tHSTxTimeOut: 0x%x\n", config->hs_tx_timeout);
-	printf("\tLPRXTimeOut: 0x%x\n", config->lp_rx_timeout);
-	printf("\tTurnAroundTimeOut: 0x%x\n", config->turn_around_timeout);
-	printf("\tDeviceResetTimer: 0x%x\n", config->device_reset_timer);
-	printf("\tMasterinitTimer: 0x%x\n", config->master_init_timer);
-	printf("\tDBIBandwidthTimer: 0x%x\n", config->dbi_bw_timer);
-	printf("\tLpByteClkValue: 0x%x\n\n", config->lp_byte_clk_val);
+		printf("\t\tPort Desc\n");
+		printf("\t\t\t Pixel overlap: %d\n", config->pixel_overlap);
+		printf("\t\t\t Lane Count: %d\n", config->lane_cnt + 1);
+		printf("\t\t\t Dual Link Support: ");
+		if (config->dual_link == 0)
+			printf("not supported\n");
+		else if (config->dual_link == 1)
+			printf("Front Back mode\n");
+		else
+			printf("Pixel Alternative Mode\n");
 
-	printf("\tDphy Params\n");
-	printf("\t\tExit to zero Count: 0x%x\n", config->exit_zero_cnt);
-	printf("\t\tTrail Count: 0x%X\n", config->trail_cnt);
-	printf("\t\tClk zero count: 0x%x\n", config->clk_zero_cnt);
-	printf("\t\tPrepare count:0x%x\n\n", config->prepare_cnt);
+		printf("\t\tDphy Flags\n");
+		printf("\t\t\t Clock Stop: %s\n",
+		       config->clk_stop ? "ENABLED" : "DISABLED");
+		printf("\t\t\t EOT disabled: %s\n\n",
+		       config->eot_disabled ? "EOT not to be sent" : "EOT to be sent");
 
-	printf("\tClockLaneSwitchingCount: 0x%x\n", config->clk_lane_switch_cnt);
-	printf("\tHighToLowSwitchingCount: 0x%x\n\n", config->hl_switch_cnt);
+		printf("\t\tHSTxTimeOut: 0x%x\n", config->hs_tx_timeout);
+		printf("\t\tLPRXTimeOut: 0x%x\n", config->lp_rx_timeout);
+		printf("\t\tTurnAroundTimeOut: 0x%x\n", config->turn_around_timeout);
+		printf("\t\tDeviceResetTimer: 0x%x\n", config->device_reset_timer);
+		printf("\t\tMasterinitTimer: 0x%x\n", config->master_init_timer);
+		printf("\t\tDBIBandwidthTimer: 0x%x\n", config->dbi_bw_timer);
+		printf("\t\tLpByteClkValue: 0x%x\n\n", config->lp_byte_clk_val);
 
-	printf("\tTimings based on Dphy spec\n");
-	printf("\t\tTClkMiss: 0x%x\n", config->tclk_miss);
-	printf("\t\tTClkPost: 0x%x\n", config->tclk_post);
-	printf("\t\tTClkPre: 0x%x\n", config->tclk_pre);
-	printf("\t\tTClkPrepare: 0x%x\n", config->tclk_prepare);
-	printf("\t\tTClkSettle: 0x%x\n", config->tclk_settle);
-	printf("\t\tTClkTermEnable: 0x%x\n\n", config->tclk_term_enable);
+		printf("\t\tDphy Params\n");
+		printf("\t\t\tExit to zero Count: 0x%x\n", config->exit_zero_cnt);
+		printf("\t\t\tTrail Count: 0x%X\n", config->trail_cnt);
+		printf("\t\t\tClk zero count: 0x%x\n", config->clk_zero_cnt);
+		printf("\t\t\tPrepare count:0x%x\n\n", config->prepare_cnt);
 
-	printf("\tTClkTrail: 0x%x\n", config->tclk_trail);
-	printf("\tTClkPrepareTClkZero: 0x%x\n", config->tclk_prepare_clkzero);
-	printf("\tTHSExit: 0x%x\n", config->ths_exit);
-	printf("\tTHsPrepare: 0x%x\n", config->ths_prepare);
-	printf("\tTHsPrepareTHsZero: 0x%x\n", config->ths_prepare_hszero);
-	printf("\tTHSSettle: 0x%x\n", config->ths_settle);
-	printf("\tTHSSkip: 0x%x\n", config->ths_skip);
-	printf("\tTHsTrail: 0x%x\n", config->ths_trail);
-	printf("\tTInit: 0x%x\n", config->tinit);
-	printf("\tTLPX: 0x%x\n", config->tlpx);
+		printf("\t\tClockLaneSwitchingCount: 0x%x\n", config->clk_lane_switch_cnt);
+		printf("\t\tHighToLowSwitchingCount: 0x%x\n\n", config->hl_switch_cnt);
 
-	printf("\tMIPI PPS\n");
-	printf("\t\tPanel power ON delay: %d\n", pps->panel_on_delay);
-	printf("\t\tPanel power on to Backlight enable delay: %d\n", pps->bl_enable_delay);
-	printf("\t\tBacklight disable to Panel power OFF delay: %d\n", pps->bl_disable_delay);
-	printf("\t\tPanel power OFF delay: %d\n", pps->panel_off_delay);
-	printf("\t\tPanel power cycle delay: %d\n", pps->panel_power_cycle_delay);
+		printf("\t\tTimings based on Dphy spec\n");
+		printf("\t\t\tTClkMiss: 0x%x\n", config->tclk_miss);
+		printf("\t\t\tTClkPost: 0x%x\n", config->tclk_post);
+		printf("\t\t\tTClkPre: 0x%x\n", config->tclk_pre);
+		printf("\t\t\tTClkPrepare: 0x%x\n", config->tclk_prepare);
+		printf("\t\t\tTClkSettle: 0x%x\n", config->tclk_settle);
+		printf("\t\t\tTClkTermEnable: 0x%x\n\n", config->tclk_term_enable);
+
+		printf("\t\tTClkTrail: 0x%x\n", config->tclk_trail);
+		printf("\t\tTClkPrepareTClkZero: 0x%x\n", config->tclk_prepare_clkzero);
+		printf("\t\tTHSExit: 0x%x\n", config->ths_exit);
+		printf("\t\tTHsPrepare: 0x%x\n", config->ths_prepare);
+		printf("\t\tTHsPrepareTHsZero: 0x%x\n", config->ths_prepare_hszero);
+		printf("\t\tTHSSettle: 0x%x\n", config->ths_settle);
+		printf("\t\tTHSSkip: 0x%x\n", config->ths_skip);
+		printf("\t\tTHsTrail: 0x%x\n", config->ths_trail);
+		printf("\t\tTInit: 0x%x\n", config->tinit);
+		printf("\t\tTLPX: 0x%x\n", config->tlpx);
+
+		printf("\t\tMIPI PPS\n");
+		printf("\t\t\tPanel power ON delay: %d\n", pps->panel_on_delay);
+		printf("\t\t\tPanel power on to Backlight enable delay: %d\n", pps->bl_enable_delay);
+		printf("\t\t\tBacklight disable to Panel power OFF delay: %d\n", pps->bl_disable_delay);
+		printf("\t\t\tPanel power OFF delay: %d\n", pps->panel_off_delay);
+		printf("\t\t\tPanel power cycle delay: %d\n", pps->panel_power_cycle_delay);
+
+		if (context->bdb->version >= 186)
+			printf("\t\tMIPI PWM delays:\n"
+			       "\t\t\tPWM on to backlight enable: %d\n"
+			       "\t\t\tBacklight disable to PWM off: %d\n",
+			       pwm_delays->pwm_on_to_backlight_enable,
+			       pwm_delays->backlight_disable_to_pwm_off);
+
+		if (context->bdb->version >= 190)
+			printf("\t\tMIPI PMIC I2C Bus Number: %d\n",
+			       start->pmic_i2c_bus_number[i]);
+	}
 }
 
 static const uint8_t *mipi_dump_send_packet(const uint8_t *data, uint8_t seq_version)
@@ -1189,7 +2020,7 @@ static const uint8_t *mipi_dump_send_packet(const uint8_t *data, uint8_t seq_ver
 	len = *((const uint16_t *) data);
 	data += 2;
 
-	printf("\t\tSend DCS: Port %s, VC %d, %s, Type %02x, Length %u, Data",
+	printf("\t\t\tSend DCS: Port %s, VC %d, %s, Type %02x, Length %u, Data",
 	       (flags >> 3) & 1 ? "C" : "A",
 	       (flags >> 1) & 3,
 	       flags & 1 ? "HS" : "LP",
@@ -1204,7 +2035,7 @@ static const uint8_t *mipi_dump_send_packet(const uint8_t *data, uint8_t seq_ver
 
 static const uint8_t *mipi_dump_delay(const uint8_t *data, uint8_t seq_version)
 {
-	printf("\t\tDelay: %u us\n", *((const uint32_t *)data));
+	printf("\t\t\tDelay: %u us\n", *((const uint32_t *)data));
 
 	return data + 4;
 }
@@ -1218,13 +2049,17 @@ static const uint8_t *mipi_dump_gpio(const uint8_t *data, uint8_t seq_version)
 		number = *data++;
 		flags = *data++;
 
-		printf("\t\tGPIO index %u, number %u, set %d (0x%02x)\n",
-		       index, number, flags & 1, flags);
+		if (seq_version >= 4)
+			printf("\t\t\tGPIO index %u, number %u, native %d, set %d (0x%02x)\n",
+			       index, number, !(flags & 2), flags & 1, flags);
+		else
+			printf("\t\t\tGPIO index %u, number %u, set %d (0x%02x)\n",
+			       index, number, flags & 1, flags);
 	} else {
 		index = *data++;
 		flags = *data++;
 
-		printf("\t\tGPIO index %u, source %d, set %d (0x%02x)\n",
+		printf("\t\t\tGPIO index %u, source %d, set %d (0x%02x)\n",
 		       index, (flags >> 1) & 3, flags & 1, flags);
 	}
 
@@ -1244,7 +2079,7 @@ static const uint8_t *mipi_dump_i2c(const uint8_t *data, uint8_t seq_version)
 	offset = *data++;
 	len = *data++;
 
-	printf("\t\tSend I2C: Flags %02x, Index %02x, Bus %02x, Address %04x, Offset %02x, Length %u, Data",
+	printf("\t\t\tSend I2C: Flags %02x, Index %02x, Bus %02x, Address %04x, Offset %02x, Length %u, Data",
 	       flags, index, bus, address, offset, len);
 	for (i = 0; i < len; i++)
 		printf(" %02x", *data++);
@@ -1288,7 +2123,7 @@ static const uint8_t *dump_sequence(const uint8_t *data, uint8_t seq_version)
 {
 	fn_mipi_elem_dump mipi_elem_dump;
 
-	printf("\tSequence %u - %s\n", *data, sequence_name(*data));
+	printf("\t\tSequence %u - %s\n", *data, sequence_name(*data));
 
 	/* Skip Sequence Byte. */
 	data++;
@@ -1493,11 +2328,7 @@ static int goto_next_sequence_v3(const uint8_t *data, int index, int total)
 static void dump_mipi_sequence(struct context *context,
 			       const struct bdb_block *block)
 {
-	const struct bdb_mipi_sequence *sequence = block->data;
-	const uint8_t *data;
-	uint32_t seq_size;
-	int index = 0, i;
-	const uint8_t *sequence_ptrs[MIPI_SEQ_MAX] = {};
+	const struct bdb_mipi_sequence *sequence = block_data(block);
 
 	/* Check if we have sequence block as well */
 	if (!sequence) {
@@ -1514,38 +2345,51 @@ static void dump_mipi_sequence(struct context *context,
 		return;
 	}
 
-	data = find_panel_sequence_block(sequence, context->panel_type,
-					 block->size, &seq_size);
-	if (!data)
-		return;
+	for (int i = 0; i < MAX_MIPI_CONFIGURATIONS; i++) {
+		const uint8_t *sequence_ptrs[MIPI_SEQ_MAX] = {};
+		const uint8_t *data;
+		uint32_t seq_size;
+		int index = 0;
 
-	/* Parse the sequences. Corresponds to VBT parsing in the kernel. */
-	for (;;) {
-		uint8_t seq_id = *(data + index);
-		if (seq_id == MIPI_SEQ_END)
-			break;
+		if (i != context->panel_type && !context->dump_all_panel_types)
+			continue;
 
-		if (seq_id >= MIPI_SEQ_MAX) {
-			fprintf(stderr, "Unknown sequence %u\n", seq_id);
+		data = find_panel_sequence_block(sequence, i,
+						 block->size, &seq_size);
+		if (!data)
 			return;
+
+		printf("\tPanel %d%s\n", i,
+		       context->panel_type == i ? " *" : "");
+
+		/* Parse the sequences. Corresponds to VBT parsing in the kernel. */
+		for (;;) {
+			uint8_t seq_id = *(data + index);
+			if (seq_id == MIPI_SEQ_END)
+				break;
+
+			if (seq_id >= MIPI_SEQ_MAX) {
+				fprintf(stderr, "Unknown sequence %u\n", seq_id);
+				return;
+			}
+
+			sequence_ptrs[seq_id] = data + index;
+
+			if (sequence->version >= 3)
+				index = goto_next_sequence_v3(data, index, seq_size);
+			else
+				index = goto_next_sequence(data, index, seq_size);
+			if (!index) {
+				fprintf(stderr, "Invalid sequence %u\n", seq_id);
+				return;
+			}
 		}
 
-		sequence_ptrs[seq_id] = data + index;
-
-		if (sequence->version >= 3)
-			index = goto_next_sequence_v3(data, index, seq_size);
-		else
-			index = goto_next_sequence(data, index, seq_size);
-		if (!index) {
-			fprintf(stderr, "Invalid sequence %u\n", seq_id);
-			return;
-		}
+		/* Dump the sequences. Corresponds to sequence execution in kernel. */
+		for (int j = 0; j < ARRAY_SIZE(sequence_ptrs); j++)
+			if (sequence_ptrs[j])
+				dump_sequence(sequence_ptrs[j], sequence->version);
 	}
-
-	/* Dump the sequences. Corresponds to sequence execution in kernel. */
-	for (i = 0; i < ARRAY_SIZE(sequence_ptrs); i++)
-		if (sequence_ptrs[i])
-			dump_sequence(sequence_ptrs[i], sequence->version);
 }
 
 #define KB(x) ((x) * 1024)
@@ -1594,7 +2438,7 @@ static const char *dsc_max_bpp(u8 value)
 static void dump_compression_parameters(struct context *context,
 					const struct bdb_block *block)
 {
-	const struct bdb_compression_parameters *dsc = block->data;
+	const struct bdb_compression_parameters *dsc = block_data(block);
 	const struct dsc_compression_parameters_entry *data;
 	int i;
 
@@ -1641,7 +2485,7 @@ static int get_panel_type(struct context *context)
 	if (!block)
 		return -1;
 
-	options = block->data;
+	options = block_data(block);
 	panel_type = options->panel_type;
 
 	free(block);
@@ -1713,6 +2557,11 @@ struct dumper dumpers[] = {
 		.dump = dump_backlight_info,
 	},
 	{
+		.id = BDB_LFP_POWER,
+		.name = "LFP power conservation features block",
+		.dump = dump_lfp_power,
+	},
+	{
 		.id = BDB_SDVO_LVDS_OPTIONS,
 		.name = "SDVO LVDS options block",
 		.dump = dump_sdvo_lvds_options,
@@ -1777,7 +2626,7 @@ static void hex_dump(const void *data, uint32_t size)
 
 static void hex_dump_block(const struct bdb_block *block)
 {
-	hex_dump(block->data, block->size);
+	hex_dump(block->data, 3 + block->size);
 }
 
 static bool dump_section(struct context *context, int section_id)
@@ -1798,10 +2647,10 @@ static bool dump_section(struct context *context, int section_id)
 	}
 
 	if (dumper && dumper->name)
-		printf("BDB block %d - %s:\n", block->id, dumper->name);
+		printf("BDB block %d (%d bytes) - %s:\n", block->id, block->size, dumper->name);
 	else
-		printf("BDB block %d - Unknown, no decoding available:\n",
-		       block->id);
+		printf("BDB block %d (%d bytes) - Unknown, no decoding available:\n",
+		       block->id, block->size);
 
 	if (context->hexdump)
 		hex_dump_block(block);

@@ -57,7 +57,7 @@
 #include <sys/ioctl.h>
 
 #include "drm.h"
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 
 IGT_TEST_DESCRIPTION("Test swizzling by testing pwrite does the inverse of"
 		     " pread.");
@@ -117,7 +117,7 @@ igt_simple_main
 	gem_require_pread_pwrite(fd);
 
 	count = gem_available_fences(fd) + 1;
-	intel_require_memory(2 * count, sizeof(linear), CHECK_RAM);
+	igt_require_memory(2 * count, sizeof(linear), CHECK_RAM);
 
 	for (int i = 0; i < count; i++) {
 		uint32_t handle, handle_target;

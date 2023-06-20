@@ -60,6 +60,24 @@ enum rectangle_type {
 	num_rectangle_types /* must be last */
 };
 
+/*
+ * These are those modes which are tested on multiplane test.
+ * For testing feel interesting case with modifier are 2BPP, 4BPP, NV12 and
+ * one P0xx format.
+ */
+const uint32_t multiplaneformatlist[] = { DRM_FORMAT_RGB565,
+					  DRM_FORMAT_XRGB8888,
+					  DRM_FORMAT_NV12,
+					  DRM_FORMAT_P010 };
+
+typedef struct {
+	igt_rotation_t rotation;
+	float_t width;
+	float_t height;
+	uint64_t modifier;
+	struct igt_fb fbs[ARRAY_SIZE(multiplaneformatlist)][2];
+} planeconfigs_t;
+
 typedef struct {
 	int gfx_fd;
 	igt_display_t display;
@@ -73,10 +91,9 @@ typedef struct {
 	int pos_x;
 	int pos_y;
 	uint32_t override_fmt;
-	uint64_t override_tiling;
+	uint64_t override_modifier;
 	int devid;
 
-	struct p_struct *multiplaneoldview;
 	struct p_point planepos[MAXMULTIPLANESAMOUNT];
 
 	bool use_native_resolution;
@@ -208,11 +225,17 @@ static void prepare_crtc(data_t *data, igt_output_t *output, enum pipe pipe,
 	 */
 	if (!is_amdgpu_device(data->gfx_fd))
 		igt_display_commit2(display, COMMIT_ATOMIC);
-	data->pipe_crc = igt_pipe_crc_new(data->gfx_fd, pipe, INTEL_PIPE_CRC_SOURCE_AUTO);
+	data->pipe_crc = igt_pipe_crc_new(data->gfx_fd, pipe,
+				          IGT_PIPE_CRC_SOURCE_AUTO);
 
 	if (!is_amdgpu_device(data->gfx_fd) && start_crc)
 		igt_pipe_crc_start(data->pipe_crc);
 }
+
+#define TEST_WIDTH(km) \
+	 min_t((km)->hdisplay, (km)->hdisplay, TEST_MAX_WIDTH)
+#define TEST_HEIGHT(km) \
+	 min_t((km)->vdisplay, (km)->vdisplay, TEST_MAX_HEIGHT)
 
 static void prepare_fbs(data_t *data, igt_output_t *output,
 			igt_plane_t *plane, enum rectangle_type rect, uint32_t format)
@@ -220,7 +243,7 @@ static void prepare_fbs(data_t *data, igt_output_t *output,
 	drmModeModeInfo *mode;
 	igt_display_t *display = &data->display;
 	unsigned int w, h, ref_w, ref_h, min_w, min_h;
-	uint64_t tiling = data->override_tiling ?: LOCAL_DRM_FORMAT_MOD_NONE;
+	uint64_t modifier = data->override_modifier ?: DRM_FORMAT_MOD_LINEAR;
 	uint32_t pixel_format = data->override_fmt ?: DRM_FORMAT_XRGB8888;
 	const float flip_opacity = 0.75;
 
@@ -234,8 +257,8 @@ static void prepare_fbs(data_t *data, igt_output_t *output,
 			w = mode->hdisplay;
 			h = mode->vdisplay;
 		} else {
-			w = min(TEST_MAX_WIDTH, mode->hdisplay);
-			h = min(TEST_MAX_HEIGHT, mode->vdisplay);
+			w = TEST_WIDTH(mode);
+			h = TEST_HEIGHT(mode);
 		}
 
 		min_w = 256;
@@ -270,24 +293,24 @@ static void prepare_fbs(data_t *data, igt_output_t *output,
 	 * For 90/270, we will use create smaller fb so that the rotated
 	 * frame can fit in
 	 */
-	if (data->rotation & (IGT_ROTATION_90 | IGT_ROTATION_270)) {
-		tiling = data->override_tiling ?: LOCAL_I915_FORMAT_MOD_Y_TILED;
+	if (igt_rotation_90_or_270(data->rotation)) {
+		modifier = data->override_modifier ?: I915_FORMAT_MOD_Y_TILED;
 
 		igt_swap(w, h);
 	}
 
 	/*
-	 * Just try here if requested tiling format is generally available,
+	 * Just try here if requested modifier format is generally available,
 	 * if one format fail it will skip entire subtest.
 	 */
-	igt_require(igt_display_has_format_mod(display, pixel_format, tiling));
+	igt_require(igt_display_has_format_mod(display, pixel_format, modifier));
 
 	if (!data->crc_rect[data->output_crc_in_use][rect].valid) {
 		/*
 		* Create a reference software rotated flip framebuffer.
 		*/
-		igt_create_fb(data->gfx_fd, ref_w, ref_h, pixel_format, tiling,
-			&data->fb_flip);
+		igt_create_fb(data->gfx_fd, ref_w, ref_h,
+			      pixel_format, modifier, &data->fb_flip);
 		paint_squares(data, data->rotation, &data->fb_flip,
 			flip_opacity);
 		igt_plane_set_fb(plane, &data->fb_flip);
@@ -295,22 +318,22 @@ static void prepare_fbs(data_t *data, igt_output_t *output,
 			igt_plane_set_position(plane, data->pos_x, data->pos_y);
 		igt_display_commit2(display, COMMIT_ATOMIC);
 
-		if (is_i915_device(data->gfx_fd)) {
+		if (is_amdgpu_device(data->gfx_fd)) {
+			igt_pipe_crc_collect_crc(
+				data->pipe_crc,
+				&data->crc_rect[data->output_crc_in_use][rect].flip_crc);
+		} else {
 			igt_pipe_crc_get_current(
 				display->drm_fd, data->pipe_crc,
 				&data->crc_rect[data->output_crc_in_use][rect].flip_crc);
 			igt_remove_fb(data->gfx_fd, &data->fb_flip);
-		} else if (is_amdgpu_device(data->gfx_fd)) {
-			igt_pipe_crc_collect_crc(
-				data->pipe_crc,
-				&data->crc_rect[data->output_crc_in_use][rect].flip_crc);
 		}
 
 		/*
 		* Create a reference CRC for a software-rotated fb.
 		*/
 		igt_create_fb(data->gfx_fd, ref_w, ref_h, pixel_format,
-			data->override_tiling ?: LOCAL_DRM_FORMAT_MOD_NONE, &data->fb_reference);
+			data->override_modifier ?: DRM_FORMAT_MOD_LINEAR, &data->fb_reference);
 		paint_squares(data, data->rotation, &data->fb_reference, 1.0);
 
 		igt_plane_set_fb(plane, &data->fb_reference);
@@ -318,13 +341,15 @@ static void prepare_fbs(data_t *data, igt_output_t *output,
 			igt_plane_set_position(plane, data->pos_x, data->pos_y);
 		igt_display_commit2(display, COMMIT_ATOMIC);
 
-		if (is_i915_device(data->gfx_fd)) {
-			igt_pipe_crc_get_current(display->drm_fd, data->pipe_crc,
-					&data->crc_rect[data->output_crc_in_use][rect].ref_crc);
-		} else if (is_amdgpu_device(data->gfx_fd)) {
-			igt_pipe_crc_collect_crc(data->pipe_crc,
-					&data->crc_rect[data->output_crc_in_use][rect].ref_crc);
+		if (is_amdgpu_device(data->gfx_fd)) {
+			igt_pipe_crc_collect_crc(
+				data->pipe_crc,
+				&data->crc_rect[data->output_crc_in_use][rect].ref_crc);
 			igt_remove_fb(data->gfx_fd, &data->fb_flip);
+		} else {
+			igt_pipe_crc_get_current(
+				display->drm_fd, data->pipe_crc,
+				&data->crc_rect[data->output_crc_in_use][rect].ref_crc);
 		}
 		data->crc_rect[data->output_crc_in_use][rect].valid = true;
 	}
@@ -333,7 +358,7 @@ static void prepare_fbs(data_t *data, igt_output_t *output,
 	/*
 	  * Prepare the non-rotated flip fb.
 	  */
-	igt_create_fb(data->gfx_fd, w, h, pixel_format, tiling,
+	igt_create_fb(data->gfx_fd, w, h, pixel_format, modifier,
 		      &data->fb_flip);
 	paint_squares(data, IGT_ROTATION_0, &data->fb_flip,
 		      flip_opacity);
@@ -341,7 +366,7 @@ static void prepare_fbs(data_t *data, igt_output_t *output,
 	/*
 	 * Prepare the plane with an non-rotated fb let the hw rotate it.
 	 */
-	igt_create_fb(data->gfx_fd, w, h, pixel_format, tiling, &data->fb);
+	igt_create_fb(data->gfx_fd, w, h, pixel_format, modifier, &data->fb);
 	paint_squares(data, IGT_ROTATION_0, &data->fb, 1.0);
 	igt_plane_set_fb(plane, &data->fb);
 
@@ -362,7 +387,7 @@ static void test_single_case(data_t *data, enum pipe pipe,
 	prepare_fbs(data, output, plane, rect, format);
 
 	igt_plane_set_rotation(plane, data->rotation);
-	if (data->rotation & (IGT_ROTATION_90 | IGT_ROTATION_270))
+	if (igt_rotation_90_or_270(data->rotation))
 		igt_plane_set_size(plane, data->fb.height, data->fb.width);
 
 	ret = igt_display_try_commit2(display, COMMIT_ATOMIC);
@@ -383,12 +408,15 @@ static void test_single_case(data_t *data, enum pipe pipe,
 	igt_assert_eq(ret, 0);
 
 	/* Check CRC */
-	if (is_i915_device(data->gfx_fd))
-		igt_pipe_crc_get_current(display->drm_fd, data->pipe_crc, &crc_output);
-	else if (is_amdgpu_device(data->gfx_fd))
+	if (is_amdgpu_device(data->gfx_fd)) {
 		igt_pipe_crc_collect_crc(data->pipe_crc, &crc_output);
-	igt_assert_crc_equal(&data->crc_rect[data->output_crc_in_use][rect].ref_crc,
-			     &crc_output);
+	} else {
+		igt_pipe_crc_get_current(display->drm_fd, data->pipe_crc,
+								 &crc_output);
+	}
+	igt_assert_crc_equal(
+		&data->crc_rect[data->output_crc_in_use][rect].ref_crc,
+		&crc_output);
 
 	/*
 	 * If flips are requested flip to a different fb and
@@ -396,7 +424,7 @@ static void test_single_case(data_t *data, enum pipe pipe,
 	 */
 	if (data->fb_flip.fb_id) {
 		igt_plane_set_fb(plane, &data->fb_flip);
-		if (data->rotation == IGT_ROTATION_90 || data->rotation == IGT_ROTATION_270)
+		if (igt_rotation_90_or_270(data->rotation))
 			igt_plane_set_size(plane, data->fb.height, data->fb.width);
 
 		if (plane->type != DRM_PLANE_TYPE_PRIMARY) {
@@ -410,10 +438,13 @@ static void test_single_case(data_t *data, enum pipe pipe,
 			igt_assert_eq(ret, 0);
 		}
 		kmstest_wait_for_pageflip(data->gfx_fd);
-		if (is_i915_device(data->gfx_fd))
-			igt_pipe_crc_get_current(display->drm_fd, data->pipe_crc, &crc_output);
-		else if (is_amdgpu_device(data->gfx_fd))
+
+		if (is_amdgpu_device(data->gfx_fd)) {
 			igt_pipe_crc_collect_crc(data->pipe_crc, &crc_output);
+		} else {
+			igt_pipe_crc_get_current(display->drm_fd, data->pipe_crc,
+									 &crc_output);
+		}
 		igt_assert_crc_equal(&data->crc_rect[data->output_crc_in_use][rect].flip_crc,
 				     &crc_output);
 	}
@@ -493,9 +524,6 @@ static void test_plane_rotation(data_t *data, int plane_type, bool test_bad_form
 		for (c = 0; c < num_rectangle_types; c++)
 			data->crc_rect[data->output_crc_in_use][c].valid = false;
 
-		if (is_i915_device(data->gfx_fd) && IS_CHERRYVIEW(data->devid) && pipe != PIPE_B)
-			continue;
-
 		/* restricting the execution to 2 pipes to reduce execution time*/
 		if (pipe_count == 2 * connected_outputs && !data->extended)
 			break;
@@ -505,6 +533,11 @@ static void test_plane_rotation(data_t *data, int plane_type, bool test_bad_form
 
 		plane = igt_output_get_plane_type(output, plane_type);
 		igt_require(igt_plane_has_prop(plane, IGT_PLANE_ROTATION));
+		igt_require(igt_plane_has_rotation(plane, data->rotation));
+		/* CHV can't rotate and reflect simultaneously */
+		igt_require(!is_i915_device(data->gfx_fd) ||
+			    !IS_CHERRYVIEW(data->devid) ||
+			    data->rotation != (IGT_ROTATION_180 | IGT_REFLECT_X));
 
 		prepare_crtc(data, output, pipe, plane, true);
 
@@ -517,7 +550,9 @@ static void test_plane_rotation(data_t *data, int plane_type, bool test_bad_form
 			/* Only support partial covering primary plane on gen9+ */
 			if (is_amdgpu_device(data->gfx_fd) ||
 				(plane_type == DRM_PLANE_TYPE_PRIMARY &&
-			    intel_gen(intel_get_drm_devid(data->gfx_fd)) < 9)) {
+				 is_i915_device(data->gfx_fd) &&
+				 intel_display_ver(
+					 intel_get_drm_devid(data->gfx_fd)) < 9)) {
 				if (i != rectangle)
 					continue;
 				else
@@ -554,33 +589,46 @@ static void test_plane_rotation(data_t *data, int plane_type, bool test_bad_form
 }
 
 typedef struct {
-	int32_t x1, y1;
-	uint64_t width, height, tiling, format;
+	int32_t x1, y1, formatindex;
 	igt_plane_t *plane;
 	igt_rotation_t rotation_sw, rotation_hw;
+	planeconfigs_t *fbinfo;
 } planeinfos;
 
-static bool setup_multiplane(data_t *data, planeinfos *planeinfo,
-			     struct igt_fb *fbleft,  struct igt_fb *fbright)
+static bool setup_multiplane(data_t *data, planeinfos planeinfo[2], drmModeModeInfo *mode,
+			     int hwround)
 {
 	uint32_t w, h;
-	struct igt_fb *planes[2] = {fbleft, fbright};
+	struct igt_fb *planes[2] = {&planeinfo[0].fbinfo->fbs[planeinfo[0].formatindex][hwround],
+				    &planeinfo[1].fbinfo->fbs[planeinfo[1].formatindex][hwround]};
 	int c;
+
+	if (hwround == MULTIPLANE_REFERENCE) {
+		planeinfo[0].rotation_sw = planeinfo[0].fbinfo->rotation;
+		planeinfo[1].rotation_sw = planeinfo[1].fbinfo->rotation;
+		planeinfo[0].rotation_hw = IGT_ROTATION_0;
+		planeinfo[1].rotation_hw = IGT_ROTATION_0;
+	} else {
+		planeinfo[0].rotation_sw = IGT_ROTATION_0;
+		planeinfo[1].rotation_sw = IGT_ROTATION_0;
+		planeinfo[0].rotation_hw = planeinfo[0].fbinfo->rotation;
+		planeinfo[1].rotation_hw = planeinfo[1].fbinfo->rotation;
+	}
 
 	for (c = 0; c < ARRAY_SIZE(planes); c++) {
 		/*
 		 * make plane and fb width and height always divisible by 4
 		 * due to NV12 support and Intel hw workarounds.
 		 */
-		w = planeinfo[c].width & ~3;
-		h = planeinfo[c].height & ~3;
+		w = (uint64_t)(planeinfo[c].fbinfo->width * TEST_WIDTH(mode)) & ~3;
+		h = (uint64_t)(planeinfo[c].fbinfo->height * TEST_HEIGHT(mode)) & ~3;
 
-		if (planeinfo[c].rotation_sw & (IGT_ROTATION_90 | IGT_ROTATION_270))
+		if (igt_rotation_90_or_270(planeinfo[c].rotation_sw))
 			igt_swap(w, h);
 
 		if (!igt_plane_has_format_mod(planeinfo[c].plane,
-					      planeinfo[c].format,
-					      planeinfo[c].tiling))
+					      multiplaneformatlist[planeinfo[c].formatindex],
+					      planeinfo[c].fbinfo->modifier))
 			return false;
 
 		/*
@@ -588,15 +636,16 @@ static bool setup_multiplane(data_t *data, planeinfos *planeinfo,
 		 * new fb?
 		 */
 		if (planes[c]->fb_id == 0) {
-			igt_create_fb(data->gfx_fd, w, h, planeinfo[c].format,
-				      planeinfo[c].tiling, planes[c]);
+			igt_create_fb(data->gfx_fd, w, h,
+				      multiplaneformatlist[planeinfo[c].formatindex],
+				      planeinfo[c].fbinfo->modifier, planes[c]);
 
 			paint_squares(data, planeinfo[c].rotation_sw,
 				      planes[c], 1.0f);
 		}
 		igt_plane_set_fb(planeinfo[c].plane, planes[c]);
 
-		if (planeinfo[c].rotation_hw & (IGT_ROTATION_90 | IGT_ROTATION_270))
+		if (igt_rotation_90_or_270(planeinfo[c].rotation_hw))
 			igt_plane_set_size(planeinfo[c].plane, h, w);
 
 		igt_plane_set_position(planeinfo[c].plane, planeinfo[c].x1,
@@ -608,11 +657,11 @@ static bool setup_multiplane(data_t *data, planeinfos *planeinfo,
 	return true;
 }
 
-static void pointlocation(data_t *data, planeinfos *p, drmModeModeInfo *mode,
+static void pointlocation(data_t *data, planeinfos p[2], drmModeModeInfo *mode,
 			  int c)
 {
 	if (data->planepos[c].origo & p_right) {
-		p[c].x1 = (int32_t)(data->planepos[c].x * min(TEST_MAX_WIDTH, mode->hdisplay)
+		p[c].x1 = (int32_t)(data->planepos[c].x * TEST_WIDTH(mode)
 				+ mode->hdisplay);
 		p[c].x1 &= ~3;
 		/*
@@ -623,19 +672,44 @@ static void pointlocation(data_t *data, planeinfos *p, drmModeModeInfo *mode,
 		 */
 		p[c].x1 -= mode->hdisplay & 2;
 	} else {
-		p[c].x1 = (int32_t)(data->planepos[c].x * min(TEST_MAX_WIDTH, mode->hdisplay));
+		p[c].x1 = (int32_t)(data->planepos[c].x * TEST_WIDTH(mode));
 		p[c].x1 &= ~3;
 	}
 
 	if (data->planepos[c].origo & p_bottom) {
-		p[c].y1 = (int32_t)(data->planepos[c].y * min(TEST_MAX_HEIGHT, mode->vdisplay)
+		p[c].y1 = (int32_t)(data->planepos[c].y * TEST_HEIGHT(mode)
 				+ mode->vdisplay);
 		p[c].y1 &= ~3;
 		p[c].y1 -= mode->vdisplay & 2;
 	} else {
-		p[c].y1 = (int32_t)(data->planepos[c].y * min(TEST_MAX_HEIGHT, mode->vdisplay));
+		p[c].y1 = (int32_t)(data->planepos[c].y * TEST_HEIGHT(mode));
 		p[c].y1 &= ~3;
 	}
+}
+
+static bool multiplaneskiproundcheck(data_t *data, planeinfos p[2])
+{
+	/*
+	 * RGB565 90/270 degrees rotation is supported
+	 * from gen11 onwards.
+	 */
+	if (multiplaneformatlist[p[0].formatindex] == DRM_FORMAT_RGB565 &&
+	    igt_rotation_90_or_270(p[0].fbinfo->rotation)
+	    && intel_display_ver(data->devid) < 11)
+		return false;
+
+	if (multiplaneformatlist[p[1].formatindex] == DRM_FORMAT_RGB565 &&
+	    igt_rotation_90_or_270(p[1].fbinfo->rotation)
+	    && intel_display_ver(data->devid) < 11)
+		return false;
+
+	if (!igt_plane_has_rotation(p[0].plane, p[0].fbinfo->rotation))
+		return false;
+
+	if (!igt_plane_has_rotation(p[1].plane, p[1].fbinfo->rotation))
+		return false;
+
+	return true;
 }
 
 /*
@@ -643,6 +717,58 @@ static void pointlocation(data_t *data, planeinfos *p, drmModeModeInfo *mode,
  */
 #define ctz __builtin_ctz
 
+/*
+ * this is to make below inner loops more readable.
+ * 1 = left plane has palar format
+ * 2 = right plane has planar format
+ * 3 = both planes has planar formats
+ */
+#define planarcheck (igt_format_is_yuv_semiplanar(multiplaneformatlist[p[0].formatindex]) | \
+		    (igt_format_is_yuv_semiplanar(multiplaneformatlist[p[1].formatindex]) << 1))
+
+/*
+ * used formats are packed formats and these rotation were already seen on
+ * screen so crc was already logged?
+ */
+static bool havepackedcrc(planeinfos p[2], igt_crc_t crclog[16])
+{
+	int logindex;
+
+	if (planarcheck != 0)
+		return false;
+
+	logindex = ctz(p[0].fbinfo->rotation);
+	logindex |= ctz(p[1].fbinfo->rotation) << 2;
+
+	if (crclog[logindex].frame == 0)
+		return false;
+
+	return true;
+}
+
+/*
+ * check left plane has planar format, right plane doesn't have planar format
+ * and rotations stay the same, if all these are true crc can be re-used from
+ * previous round.
+ */
+static bool reusecrcfromlastround(planeinfos p[2], int lastroundp1format,
+				  int lastroundp0rotation,
+				  int lastroundp1rotation)
+{
+	if (planarcheck != 1)
+		return false;
+
+	if (igt_format_is_yuv_semiplanar(lastroundp1format))
+		return false;
+
+	if (p[0].fbinfo->rotation != lastroundp0rotation)
+		return false;
+
+	if (p[1].fbinfo->rotation != lastroundp1rotation)
+		return false;
+
+	return true;
+}
 /*
  * Here is pipe parameter which is now used only for first pipe.
  * It is left here if this test ever was wanted to be run on
@@ -654,39 +780,29 @@ static void test_multi_plane_rotation(data_t *data, enum pipe pipe)
 	igt_output_t *output;
 	igt_crc_t retcrc_sw, retcrc_hw;
 	planeinfos p[2];
-	int used_w, used_h, lastroundirotation = 0, lastroundjrotation = 0,
+	int lastroundirotation = 0, lastroundjrotation = 0,
 	    lastroundjformat = 0, c, d;
 	drmModeModeInfo *mode;
 	bool have_crc; // flag if can use previously logged crc for comparison
 	igt_crc_t crclog[16] = {}; //4 * 4 rotation crc storage for packed formats
 	char *str1, *str2; // for debug printouts
+	int logindex;
 
-	/*
-	 * These are those modes which are tested. For testing feel interesting
-	 * case with tiling are 2 bpp, 4 bpp and NV12.
-	 */
-	static const uint32_t formatlist[] = {DRM_FORMAT_RGB565,
-		DRM_FORMAT_XRGB8888, DRM_FORMAT_NV12};
-
-	static struct {
-		igt_rotation_t rotation;
-		float_t width;
-		float_t height;
-		uint64_t tiling;
-		struct igt_fb fbs[ARRAY_SIZE(formatlist)][2];
-	} planeconfigs[] = {
-	{IGT_ROTATION_0, .2f, .4f, LOCAL_DRM_FORMAT_MOD_NONE },
-	{IGT_ROTATION_0, .2f, .4f, LOCAL_I915_FORMAT_MOD_X_TILED },
-	{IGT_ROTATION_0, .2f, .4f, LOCAL_I915_FORMAT_MOD_Y_TILED },
-	{IGT_ROTATION_0, .2f, .4f, LOCAL_I915_FORMAT_MOD_Yf_TILED },
-	{IGT_ROTATION_90, .2f, .4f, LOCAL_I915_FORMAT_MOD_Y_TILED },
-	{IGT_ROTATION_90, .2f, .4f, LOCAL_I915_FORMAT_MOD_Yf_TILED },
-	{IGT_ROTATION_180, .2f, .4f, LOCAL_DRM_FORMAT_MOD_NONE },
-	{IGT_ROTATION_180, .2f, .4f, LOCAL_I915_FORMAT_MOD_X_TILED },
-	{IGT_ROTATION_180, .2f, .4f, LOCAL_I915_FORMAT_MOD_Y_TILED },
-	{IGT_ROTATION_180, .2f, .4f, LOCAL_I915_FORMAT_MOD_Yf_TILED },
-	{IGT_ROTATION_270, .2f, .4f, LOCAL_I915_FORMAT_MOD_Y_TILED },
-	{IGT_ROTATION_270, .2f, .4f, LOCAL_I915_FORMAT_MOD_Yf_TILED },
+	static planeconfigs_t planeconfigs[] = {
+		{IGT_ROTATION_0, .2f, .4f, DRM_FORMAT_MOD_LINEAR },
+		{IGT_ROTATION_0, .2f, .4f, I915_FORMAT_MOD_X_TILED },
+		{IGT_ROTATION_0, .2f, .4f, I915_FORMAT_MOD_Y_TILED },
+		{IGT_ROTATION_0, .2f, .4f, I915_FORMAT_MOD_Yf_TILED },
+		{IGT_ROTATION_0, .2f, .4f, I915_FORMAT_MOD_4_TILED },
+		{IGT_ROTATION_90, .2f, .4f, I915_FORMAT_MOD_Y_TILED },
+		{IGT_ROTATION_90, .2f, .4f, I915_FORMAT_MOD_Yf_TILED },
+		{IGT_ROTATION_180, .2f, .4f, DRM_FORMAT_MOD_LINEAR },
+		{IGT_ROTATION_180, .2f, .4f, I915_FORMAT_MOD_X_TILED },
+		{IGT_ROTATION_180, .2f, .4f, I915_FORMAT_MOD_Y_TILED },
+		{IGT_ROTATION_180, .2f, .4f, I915_FORMAT_MOD_Yf_TILED },
+		{IGT_ROTATION_180, .2f, .4f, I915_FORMAT_MOD_4_TILED },
+		{IGT_ROTATION_270, .2f, .4f, I915_FORMAT_MOD_Y_TILED },
+		{IGT_ROTATION_270, .2f, .4f, I915_FORMAT_MOD_Yf_TILED },
 	};
 
 	for_each_valid_output_on_pipe(display, pipe, output) {
@@ -696,91 +812,68 @@ static void test_multi_plane_rotation(data_t *data, enum pipe pipe)
 		igt_display_require_output(display);
 		igt_display_commit2(display, COMMIT_ATOMIC);
 
-		used_w = min(TEST_MAX_WIDTH, mode->hdisplay);
-		used_h = min(TEST_MAX_HEIGHT, mode->vdisplay);
-
 		p[0].plane = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
 		p[1].plane = igt_output_get_plane_type(output, DRM_PLANE_TYPE_OVERLAY);
 
 		data->pipe_crc = igt_pipe_crc_new(data->gfx_fd, pipe,
-						  INTEL_PIPE_CRC_SOURCE_AUTO);
+						  IGT_PIPE_CRC_SOURCE_AUTO);
 		igt_pipe_crc_start(data->pipe_crc);
 
 		for (i = 0; i < ARRAY_SIZE(planeconfigs); i++) {
-			p[0].width = (uint64_t)(planeconfigs[i].width * used_w);
-			p[0].height = (uint64_t)(planeconfigs[i].height * used_h);
-			p[0].tiling = planeconfigs[i].tiling;
-			pointlocation(data, (planeinfos *)&p, mode, 0);
+			p[0].fbinfo = &planeconfigs[i];
+			pointlocation(data, p, mode, 0);
 
-			for (k = 0; k < ARRAY_SIZE(formatlist); k++) {
-				p[0].format = formatlist[k];
+			for (k = 0; k < ARRAY_SIZE(multiplaneformatlist); k++) {
+				p[0].formatindex = k;
 
 				for (j = 0; j < ARRAY_SIZE(planeconfigs); j++) {
-					p[1].width = (uint64_t)(planeconfigs[j].width * used_w);
-					p[1].height = (uint64_t)(planeconfigs[j].height * used_h);
-					p[1].tiling = planeconfigs[j].tiling;
-					pointlocation(data, (planeinfos *)&p,
-						      mode, 1);
+					p[1].fbinfo = &planeconfigs[j];
+					pointlocation(data, p, mode, 1);
 
-					for (l = 0; l < ARRAY_SIZE(formatlist); l++) {
-						p[1].format = formatlist[l];
-						/*
-						 * RGB565 90/270 degrees rotation is supported
-						 * from gen11 onwards.
-						 */
-						if (p[0].format == DRM_FORMAT_RGB565 &&
-						     (planeconfigs[i].rotation & (IGT_ROTATION_90 | IGT_ROTATION_270))
-						     && intel_gen(data->devid) < 11)
+					for (l = 0; l < ARRAY_SIZE(multiplaneformatlist); l++) {
+						p[1].formatindex = l;
+
+						if (!multiplaneskiproundcheck(data, p))
 							continue;
 
-						if (p[1].format == DRM_FORMAT_RGB565 &&
-						     (planeconfigs[j].rotation & (IGT_ROTATION_90 | IGT_ROTATION_270))
-						     && intel_gen(data->devid) < 11)
-							continue;
 						/*
 						 * if using packed formats crc's will be
 						 * same and can store them so there's
-						 * no need to redo comparison image and
+						 * no need to redo reference image and
 						 * just use stored crc.
 						 */
-						if (p[0].format != DRM_FORMAT_NV12 &&
-						    p[1].format != DRM_FORMAT_NV12 &&
-						    crclog[ctz(planeconfigs[i].rotation) | (ctz(planeconfigs[j].rotation) << 2)].frame != 0) {
-							retcrc_sw = crclog[ctz(planeconfigs[i].rotation) | (ctz(planeconfigs[j].rotation) << 2)];
+						if (havepackedcrc(p, crclog)) {
+							logindex = ctz(p[0].fbinfo->rotation);
+							logindex |= ctz(p[1].fbinfo->rotation) << 2;
+
+							retcrc_sw = crclog[logindex];
 							have_crc = true;
-						} else if (p[0].format == DRM_FORMAT_NV12 &&
-							   p[1].format != DRM_FORMAT_NV12 &&
-							   lastroundjformat != DRM_FORMAT_NV12 &&
-							   planeconfigs[i].rotation == lastroundirotation &&
-							   planeconfigs[j].rotation == lastroundjrotation) {
+						} else if(reusecrcfromlastround(p, lastroundjformat,
+										lastroundirotation,
+										lastroundjrotation)) {
 							/*
-							 * With NV12 can benefit from
-							 * previous crc if rotations
+							 * With planar formats can benefit
+							 * from previous crc if rotations
 							 * stay same. If both planes
-							 * have NV12 in use we need to
-							 * skip that case.
+							 * have planar format in use we
+							 * need to skip that case.
 							 * If last round right plane
-							 * had NV12 need to skip this.
+							 * had planar format need to skip
+							 * this.
 							 */
 							have_crc = true;
 						} else {
 							/*
 							 * here will be created
-							 * comparison image and get crc
+							 * reference image and get crc
 							 * if didn't have stored crc
 							 * or planar format is in use.
 							 * have_crc flag will control
 							 * crc comparison part.
 							 */
-							p[0].rotation_sw = planeconfigs[i].rotation;
-							p[0].rotation_hw = IGT_ROTATION_0;
-							p[1].rotation_sw = planeconfigs[j].rotation;
-							p[1].rotation_hw = IGT_ROTATION_0;
-							if (!setup_multiplane(data,
-									(planeinfos *)&p,
-									&planeconfigs[i].fbs[k][MULTIPLANE_REFERENCE],
-									&planeconfigs[j].fbs[l][MULTIPLANE_REFERENCE]))
+							if (!setup_multiplane(data, p, mode, MULTIPLANE_REFERENCE))
 								continue;
+
 							igt_display_commit_atomic(display, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
 							flipsw = kmstest_get_vblank(data->gfx_fd, pipe, 0) + 1;
 							have_crc = false;
@@ -791,15 +884,7 @@ static void test_multi_plane_rotation(data_t *data, enum pipe pipe)
 						 * get vblank where interesting
 						 * crc will be at, grab crc bit later
 						 */
-						p[0].rotation_sw = IGT_ROTATION_0;
-						p[0].rotation_hw = planeconfigs[i].rotation;
-						p[1].rotation_sw = IGT_ROTATION_0;
-						p[1].rotation_hw = planeconfigs[j].rotation;
-
-						if (!setup_multiplane(data,
-								      (planeinfos *)&p,
-								      &planeconfigs[i].fbs[k][MULTIPLANE_ROTATED],
-								      &planeconfigs[j].fbs[l][MULTIPLANE_ROTATED]))
+						if (!setup_multiplane(data, p, mode, MULTIPLANE_ROTATED))
 							continue;
 
 						igt_display_commit_atomic(display, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
@@ -811,9 +896,12 @@ static void test_multi_plane_rotation(data_t *data, enum pipe pipe)
 										   flipsw,
 										   &retcrc_sw);
 
-							if (p[0].format != DRM_FORMAT_NV12 && p[1].format != DRM_FORMAT_NV12)
-								crclog[ctz(planeconfigs[i].rotation) | (ctz(planeconfigs[j].rotation) << 2)]
-								= retcrc_sw;
+							if (planarcheck == 0) {
+								logindex = ctz(p[0].fbinfo->rotation);
+								logindex |= ctz(p[1].fbinfo->rotation) << 2;
+
+								crclog[logindex] = retcrc_sw;
+							}
 						}
 						igt_pipe_crc_get_for_frame(data->gfx_fd, data->pipe_crc, fliphw, &retcrc_hw);
 
@@ -822,18 +910,18 @@ static void test_multi_plane_rotation(data_t *data, enum pipe pipe)
 
 						igt_debug("crc %.8s vs %.8s -- %.4s - %.4s crc buffered:%s rot1 %d rot2 %d\n",
 							str1, str2,
-							(char *) &p[0].format, (char *) &p[1].format,
-							have_crc?"yes":" no",
+							(char *) &multiplaneformatlist[p[0].formatindex],
+							(char *) &multiplaneformatlist[p[1].formatindex],
+							have_crc ? "yes" : " no",
 							(int[]) {0, 90, 180, 270} [ctz(planeconfigs[i].rotation)],
 							(int[]) {0, 90, 180, 270} [ctz(planeconfigs[j].rotation)]);
 
 						free(str1);
 						free(str2);
 
-
 						igt_assert_crc_equal(&retcrc_sw, &retcrc_hw);
 
-						lastroundjformat = p[1].format;
+						lastroundjformat = multiplaneformatlist[p[1].formatindex];
 						lastroundirotation = planeconfigs[i].rotation;
 						lastroundjrotation = planeconfigs[j].rotation;
 					}
@@ -854,13 +942,12 @@ static void test_multi_plane_rotation(data_t *data, enum pipe pipe)
 		lastroundirotation = 0;
 		lastroundjrotation = 0;
 
-
 		igt_output_set_pipe(output, PIPE_NONE);
 	}
 	data->pipe_crc = NULL;
 
 	for (c = 0; c < ARRAY_SIZE(planeconfigs); c++) {
-		for  (d = 0; d < ARRAY_SIZE(formatlist); d++) {
+		for  (d = 0; d < ARRAY_SIZE(multiplaneformatlist); d++) {
 			igt_remove_fb(data->gfx_fd, &planeconfigs[c].fbs[d][MULTIPLANE_REFERENCE]);
 			igt_remove_fb(data->gfx_fd, &planeconfigs[c].fbs[d][MULTIPLANE_ROTATED]);
 		}
@@ -873,7 +960,7 @@ static void test_plane_rotation_exhaust_fences(data_t *data,
 					       igt_plane_t *plane)
 {
 	igt_display_t *display = &data->display;
-	uint64_t tiling = LOCAL_I915_FORMAT_MOD_Y_TILED;
+	uint64_t modifier = I915_FORMAT_MOD_Y_TILED;
 	uint32_t format = DRM_FORMAT_XRGB8888;
 	int fd = data->gfx_fd;
 	drmModeModeInfo *mode;
@@ -884,6 +971,7 @@ static void test_plane_rotation_exhaust_fences(data_t *data,
 	int i;
 
 	igt_require(igt_plane_has_prop(plane, IGT_PLANE_ROTATION));
+	igt_require(igt_plane_has_rotation(plane, IGT_ROTATION_0 | IGT_ROTATION_90));
 	igt_require(gem_available_fences(display->drm_fd) > 0);
 
 	prepare_crtc(data, output, pipe, plane, false);
@@ -892,7 +980,7 @@ static void test_plane_rotation_exhaust_fences(data_t *data,
 	w = mode->hdisplay;
 	h = mode->vdisplay;
 
-	igt_calc_fb_size(fd, w, h, format, tiling, &size, &stride);
+	igt_calc_fb_size(fd, w, h, format, modifier, &size, &stride);
 
 	/*
 	 * Make sure there is atleast 90% of the available GTT space left
@@ -903,7 +991,7 @@ static void test_plane_rotation_exhaust_fences(data_t *data,
 	igt_require(total_fbs_size < total_aperture_size * 0.9);
 
 	for (i = 0; i < MAX_FENCES + 1; i++) {
-		igt_create_fb(fd, w, h, format, tiling, &fb[i]);
+		igt_create_fb(fd, w, h, format, modifier, &fb[i]);
 
 		igt_plane_set_fb(plane, &fb[i]);
 		igt_plane_set_rotation(plane, IGT_ROTATION_0);
@@ -948,15 +1036,17 @@ static const char *rot_test_str(igt_rotation_t rot)
 	}
 }
 
-static const char *tiling_test_str(uint64_t tiling)
+static const char *modifier_test_str(uint64_t modifier)
 {
-	switch (tiling) {
-	case LOCAL_I915_FORMAT_MOD_X_TILED:
+	switch (modifier) {
+	case I915_FORMAT_MOD_X_TILED:
 		return "x-tiled";
-	case LOCAL_I915_FORMAT_MOD_Y_TILED:
+	case I915_FORMAT_MOD_Y_TILED:
 		return "y-tiled";
-	case LOCAL_I915_FORMAT_MOD_Yf_TILED:
+	case I915_FORMAT_MOD_Yf_TILED:
 		return "yf-tiled";
+	case I915_FORMAT_MOD_4_TILED:
+		return "4-tiled";
 	default:
 		igt_assert(0);
 	}
@@ -1002,29 +1092,31 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 	};
 
 	struct reflect_x {
-		uint64_t tiling;
+		uint64_t modifier;
 		igt_rotation_t rot;
 	} *reflect_x, reflect_x_subtests[] = {
-		{ LOCAL_I915_FORMAT_MOD_X_TILED, IGT_ROTATION_0 },
-		{ LOCAL_I915_FORMAT_MOD_X_TILED, IGT_ROTATION_180 },
-		{ LOCAL_I915_FORMAT_MOD_Y_TILED, IGT_ROTATION_0 },
-		{ LOCAL_I915_FORMAT_MOD_Y_TILED, IGT_ROTATION_90 },
-		{ LOCAL_I915_FORMAT_MOD_Y_TILED, IGT_ROTATION_180 },
-		{ LOCAL_I915_FORMAT_MOD_Y_TILED, IGT_ROTATION_270 },
-		{ LOCAL_I915_FORMAT_MOD_Yf_TILED, IGT_ROTATION_0 },
-		{ LOCAL_I915_FORMAT_MOD_Yf_TILED, IGT_ROTATION_90 },
-		{ LOCAL_I915_FORMAT_MOD_Yf_TILED, IGT_ROTATION_180 },
-		{ LOCAL_I915_FORMAT_MOD_Yf_TILED, IGT_ROTATION_270 },
+		{ I915_FORMAT_MOD_X_TILED, IGT_ROTATION_0 },
+		{ I915_FORMAT_MOD_X_TILED, IGT_ROTATION_180 },
+		{ I915_FORMAT_MOD_Y_TILED, IGT_ROTATION_0 },
+		{ I915_FORMAT_MOD_Y_TILED, IGT_ROTATION_90 },
+		{ I915_FORMAT_MOD_Y_TILED, IGT_ROTATION_180 },
+		{ I915_FORMAT_MOD_Y_TILED, IGT_ROTATION_270 },
+		{ I915_FORMAT_MOD_Yf_TILED, IGT_ROTATION_0 },
+		{ I915_FORMAT_MOD_Yf_TILED, IGT_ROTATION_90 },
+		{ I915_FORMAT_MOD_Yf_TILED, IGT_ROTATION_180 },
+		{ I915_FORMAT_MOD_Yf_TILED, IGT_ROTATION_270 },
+		{ I915_FORMAT_MOD_4_TILED, IGT_ROTATION_0 },
+		{ I915_FORMAT_MOD_4_TILED, IGT_ROTATION_180 },
 		{ 0, 0 }
 	};
 
 	int gen = 0;
 
 	igt_fixture {
-		data.gfx_fd = drm_open_driver_master(DRIVER_INTEL | DRIVER_AMDGPU);
+		data.gfx_fd = drm_open_driver_master(DRIVER_ANY);
 		if (is_i915_device(data.gfx_fd)) {
 			data.devid = intel_get_drm_devid(data.gfx_fd);
-			gen = intel_gen(data.devid);
+			gen = intel_display_ver(data.devid);
 		}
 
 		kmstest_set_vt_graphics_mode();
@@ -1040,18 +1132,14 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 		igt_subtest_f("%s-rotation-%s",
 			      plane_test_str(subtest->plane),
 			      rot_test_str(subtest->rot)) {
-			if (is_i915_device(data.gfx_fd)) {
-				igt_require(!(subtest->rot &
-					    (IGT_ROTATION_90 | IGT_ROTATION_270)) ||
-					    gen >= 9);
-			} else if (is_amdgpu_device(data.gfx_fd)) {
+			if (is_amdgpu_device(data.gfx_fd)) {
 				data.override_fmt = DRM_FORMAT_XRGB8888;
-				if (subtest->rot & (IGT_ROTATION_90 | IGT_ROTATION_270))
-					data.override_tiling = AMD_FMT_MOD |
+				if (igt_rotation_90_or_270(subtest->rot))
+					data.override_modifier = AMD_FMT_MOD |
 						AMD_FMT_MOD_SET(TILE, AMD_FMT_MOD_TILE_GFX9_64K_S) |
 						AMD_FMT_MOD_SET(TILE_VERSION, AMD_FMT_MOD_TILE_VER_GFX9);
 				else
-					data.override_tiling = LOCAL_DRM_FORMAT_MOD_NONE;
+					data.override_modifier = DRM_FORMAT_MOD_LINEAR;
 			}
 			data.rotation = subtest->rot;
 			test_plane_rotation(&data, subtest->plane, false);
@@ -1060,7 +1148,6 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 
 	igt_describe("Rotation test with 90 degree for a plane of gen9+ with given position");
 	igt_subtest_f("sprite-rotation-90-pos-100-0") {
-		igt_require(gen >= 9);
 		data.rotation = IGT_ROTATION_90;
 		data.pos_x = 100,
 		data.pos_y = 0;
@@ -1075,7 +1162,6 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 		  * so apart from this, any other gen11+ pixel format
 		  * can be used which doesn't support 90/270 degree
 		  * rotation */
-		igt_require(gen >= 9);
 		data.rotation = IGT_ROTATION_90;
 		data.override_fmt = gen < 11 ? DRM_FORMAT_RGB565 : DRM_FORMAT_Y212;
 		test_plane_rotation(&data, DRM_PLANE_TYPE_PRIMARY, true);
@@ -1084,23 +1170,19 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 
 	igt_describe("Checking unsupported tiling for gen9+ with 90 degree of rotation");
 	igt_subtest_f("bad-tiling") {
-		igt_require(gen >= 9);
 		data.rotation = IGT_ROTATION_90;
-		data.override_tiling = LOCAL_I915_FORMAT_MOD_X_TILED;
+		data.override_modifier = I915_FORMAT_MOD_X_TILED;
 		test_plane_rotation(&data, DRM_PLANE_TYPE_PRIMARY, true);
 	}
-	data.override_tiling = 0;
+	data.override_modifier = 0;
 
 	igt_describe("Tiling and Rotation test for gen 10+ for primary plane");
-	for (reflect_x = reflect_x_subtests; reflect_x->tiling; reflect_x++) {
+	for (reflect_x = reflect_x_subtests; reflect_x->modifier; reflect_x++) {
 		igt_subtest_f("primary-%s-reflect-x-%s",
-			      tiling_test_str(reflect_x->tiling),
+			      modifier_test_str(reflect_x->modifier),
 			      rot_test_str(reflect_x->rot)) {
-			igt_require(gen >= 10 ||
-				    (IS_CHERRYVIEW(data.devid) && reflect_x->rot == IGT_ROTATION_0
-				     && reflect_x->tiling == LOCAL_I915_FORMAT_MOD_X_TILED));
 			data.rotation = (IGT_REFLECT_X | reflect_x->rot);
-			data.override_tiling = reflect_x->tiling;
+			data.override_modifier = reflect_x->modifier;
 			test_plane_rotation(&data, DRM_PLANE_TYPE_PRIMARY, false);
 		}
 	}
@@ -1155,7 +1237,6 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 		enum pipe pipe;
 		igt_output_t *output;
 
-		igt_require(gen >= 9);
 		igt_display_require_output(&data.display);
 
 		for_each_pipe_with_valid_output(&data.display, pipe, output) {
@@ -1168,5 +1249,6 @@ igt_main_args("", long_opts, help_str, opt_handler, &data)
 
 	igt_fixture {
 		igt_display_fini(&data.display);
+		close(data.gfx_fd);
 	}
 }

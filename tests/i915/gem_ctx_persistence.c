@@ -43,6 +43,7 @@
 #include "igt_sysfs.h"
 #include "igt_params.h"
 #include "ioctl_wrappers.h" /* gem_wait()! */
+#include "intel_allocator.h"
 #include "sw_sync.h"
 
 #define RESET_TIMEOUT_MS 2 * MSEC_PER_SEC; /* default: 640ms */
@@ -147,51 +148,34 @@ static void test_idempotent(int i915)
 	igt_assert_eq(p.value, expected);
 }
 
-static void test_clone(int i915)
+static const intel_ctx_t *
+ctx_create_persistence(int i915, const intel_ctx_cfg_t *base_cfg, bool persist)
 {
-	struct drm_i915_gem_context_param p = {
-		.param = I915_CONTEXT_PARAM_PERSISTENCE,
-	};
-	uint32_t ctx, clone;
-
-	/*
-	 * Check that persistence is inherited across a clone.
-	 */
-	igt_require( __gem_context_create(i915, &ctx) == 0);
-
-	p.ctx_id = ctx;
-	p.value = 0;
-	gem_context_set_param(i915, &p);
-
-	clone = gem_context_clone(i915, ctx, I915_CONTEXT_CLONE_FLAGS, 0);
-	gem_context_destroy(i915, ctx);
-
-	p.ctx_id = clone;
-	p.value = -1;
-	gem_context_get_param(i915, &p);
-	igt_assert_eq(p.value, 0);
-
-	gem_context_destroy(i915, clone);
+	intel_ctx_cfg_t cfg = *base_cfg;
+	cfg.nopersist = !persist;
+	return intel_ctx_create(i915, &cfg);
 }
 
-static void test_persistence(int i915, unsigned int engine)
+static void test_persistence(int i915, const intel_ctx_cfg_t *cfg,
+			     unsigned int engine)
 {
 	igt_spin_t *spin;
 	int64_t timeout;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 
 	/*
 	 * Default behaviour are contexts remain alive until their last active
 	 * request is retired -- no early termination.
 	 */
 
-	ctx = gem_context_clone_with_engines(i915, 0);
-	gem_context_set_persistence(i915, ctx, true);
+	ctx = ctx_create_persistence(i915, cfg, true);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
 
-	spin = igt_spin_new(i915, ctx,
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 			    .engine = engine,
 			    .flags = IGT_SPIN_FENCE_OUT);
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 
 	timeout = reset_timeout_ms * NSEC_PER_MSEC;
 	igt_assert_eq(gem_wait(i915, spin->handle, &timeout), -ETIME);
@@ -203,34 +187,39 @@ static void test_persistence(int i915, unsigned int engine)
 	igt_assert_eq(sync_fence_status(spin->out_fence), 1);
 
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
-static void test_nonpersistent_cleanup(int i915, unsigned int engine)
+static void test_nonpersistent_cleanup(int i915, const intel_ctx_cfg_t *cfg,
+				       unsigned int engine)
 {
 	int64_t timeout = reset_timeout_ms * NSEC_PER_MSEC;
 	igt_spin_t *spin;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 
 	/*
 	 * A nonpersistent context is terminated immediately upon closure,
 	 * any inflight request is cancelled.
 	 */
 
-	ctx = gem_context_clone_with_engines(i915, 0);
-	gem_context_set_persistence(i915, ctx, false);
+	ctx = ctx_create_persistence(i915, cfg, false);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
 
-	spin = igt_spin_new(i915, ctx,
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 			    .engine = engine,
 			    .flags = IGT_SPIN_FENCE_OUT);
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 
 	igt_assert_eq(gem_wait(i915, spin->handle, &timeout), 0);
 	igt_assert_eq(sync_fence_status(spin->out_fence), -EIO);
 
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
-static void test_nonpersistent_mixed(int i915, unsigned int engine)
+static void test_nonpersistent_mixed(int i915, const intel_ctx_cfg_t *cfg,
+				     unsigned int engine)
 {
 	int fence[3];
 
@@ -242,17 +231,19 @@ static void test_nonpersistent_mixed(int i915, unsigned int engine)
 
 	for (int i = 0; i < ARRAY_SIZE(fence); i++) {
 		igt_spin_t *spin;
-		uint32_t ctx;
+		const intel_ctx_t *ctx;
+		uint64_t ahnd;
 
-		ctx = gem_context_clone_with_engines(i915, 0);
-		gem_context_set_persistence(i915, ctx, i & 1);
+		ctx = ctx_create_persistence(i915, cfg, i & 1);
+		ahnd = get_reloc_ahnd(i915, ctx->id);
 
-		spin = igt_spin_new(i915, ctx,
+		spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 				    .engine = engine,
 				    .flags = IGT_SPIN_FENCE_OUT);
-		gem_context_destroy(i915, ctx);
+		intel_ctx_destroy(i915, ctx);
 
 		fence[i] = spin->out_fence;
+		put_ahnd(ahnd);
 	}
 
 	/* Outer pair of contexts were non-persistent and killed */
@@ -263,11 +254,13 @@ static void test_nonpersistent_mixed(int i915, unsigned int engine)
 	igt_assert_eq(sync_fence_wait(fence[1], 0), -ETIME);
 }
 
-static void test_nonpersistent_hostile(int i915, unsigned int engine)
+static void test_nonpersistent_hostile(int i915, const intel_ctx_cfg_t *cfg,
+				       unsigned int engine)
 {
 	int64_t timeout = reset_timeout_ms * NSEC_PER_MSEC;
 	igt_spin_t *spin;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 
 	/*
 	 * If we cannot cleanly cancel the non-persistent context on closure,
@@ -275,24 +268,27 @@ static void test_nonpersistent_hostile(int i915, unsigned int engine)
 	 * the requests and cleanup the context.
 	 */
 
-	ctx = gem_context_clone_with_engines(i915, 0);
-	gem_context_set_persistence(i915, ctx, false);
+	ctx = ctx_create_persistence(i915, cfg, false);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
 
-	spin = igt_spin_new(i915, ctx,
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 			    .engine = engine,
 			    .flags = IGT_SPIN_NO_PREEMPTION);
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 
 	igt_assert_eq(gem_wait(i915, spin->handle, &timeout), 0);
 
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
-static void test_nonpersistent_hostile_preempt(int i915, unsigned int engine)
+static void test_nonpersistent_hostile_preempt(int i915, const intel_ctx_cfg_t *cfg,
+					       unsigned int engine)
 {
 	int64_t timeout = reset_timeout_ms * NSEC_PER_MSEC;
 	igt_spin_t *spin[2];
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 
 	/*
 	 * Double plus ungood.
@@ -305,57 +301,60 @@ static void test_nonpersistent_hostile_preempt(int i915, unsigned int engine)
 
 	igt_require(gem_scheduler_has_preemption(i915));
 
-	ctx = gem_context_clone_with_engines(i915, 0);
-	gem_context_set_persistence(i915, ctx, true);
-	gem_context_set_priority(i915, ctx, 0);
-	spin[0] = igt_spin_new(i915, ctx,
+	ctx = ctx_create_persistence(i915, cfg, true);
+	gem_context_set_priority(i915, ctx->id, 0);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
+	spin[0] = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 			       .engine = engine,
 			       .flags = (IGT_SPIN_NO_PREEMPTION |
 					 IGT_SPIN_POLL_RUN));
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 
 	igt_spin_busywait_until_started(spin[0]);
 
-	ctx = gem_context_clone_with_engines(i915, 0);
-	gem_context_set_persistence(i915, ctx, false);
-	gem_context_set_priority(i915, ctx, 1); /* higher priority than 0 */
-	spin[1] = igt_spin_new(i915, ctx,
+	ctx = ctx_create_persistence(i915, cfg, false);
+	gem_context_set_priority(i915, ctx->id, 1); /* higher priority than 0 */
+	spin[1] = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 			       .engine = engine,
 			       .flags = IGT_SPIN_NO_PREEMPTION);
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 
 	igt_assert_eq(gem_wait(i915, spin[1]->handle, &timeout), 0);
 
 	igt_spin_free(i915, spin[1]);
 	igt_spin_free(i915, spin[0]);
+	put_ahnd(ahnd);
 }
 
-static void test_nonpersistent_hang(int i915, unsigned int engine)
+static void test_nonpersistent_hang(int i915, const intel_ctx_cfg_t *cfg,
+				    unsigned int engine)
 {
 	int64_t timeout = reset_timeout_ms * NSEC_PER_MSEC;
 	igt_spin_t *spin;
-	uint32_t ctx;
-
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 	/*
 	 * The user made a simple mistake and submitted an invalid batch,
 	 * but fortunately under a nonpersistent context. Do we detect it?
 	 */
 
-	ctx = gem_context_clone_with_engines(i915, 0);
-	gem_context_set_persistence(i915, ctx, false);
+	ctx = ctx_create_persistence(i915, cfg, false);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
 
-	spin = igt_spin_new(i915, ctx,
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 			    .engine = engine,
 			    .flags = IGT_SPIN_INVALID_CS);
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 
 	igt_assert_eq(gem_wait(i915, spin->handle, &timeout), 0);
 
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
-static void test_nohangcheck_hostile(int i915)
+static void test_nohangcheck_hostile(int i915, const intel_ctx_cfg_t *cfg)
 {
+	const struct intel_execution_engine2 *e;
 	int dir;
 
 	cleanup(i915);
@@ -370,27 +369,31 @@ static void test_nohangcheck_hostile(int i915)
 
 	igt_require(__enable_hangcheck(dir, false));
 
-	for_each_physical_ring(e, i915) {
-		int64_t timeout = reset_timeout_ms * NSEC_PER_MSEC;
-		uint32_t ctx = gem_context_create(i915);
+	for_each_ctx_cfg_engine(i915, cfg, e) {
+		int64_t timeout = 10000 * NSEC_PER_MSEC;
+		const intel_ctx_t *ctx = intel_ctx_create(i915, cfg);
+		uint64_t ahnd = get_reloc_ahnd(i915, ctx->id);
 		igt_spin_t *spin;
 
-		spin = igt_spin_new(i915, ctx,
-				    .engine = eb_ring(e),
+		spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
+				    .engine = e->flags,
 				    .flags = IGT_SPIN_NO_PREEMPTION);
-		gem_context_destroy(i915, ctx);
+		intel_ctx_destroy(i915, ctx);
 
 		igt_assert_eq(gem_wait(i915, spin->handle, &timeout), 0);
 
 		igt_spin_free(i915, spin);
+		put_ahnd(ahnd);
 	}
 
 	igt_require(__enable_hangcheck(dir, true));
 	close(dir);
 }
 
-static void test_nohangcheck_hang(int i915)
+static void test_nohangcheck_hang(int i915, const intel_ctx_cfg_t *cfg)
 {
+	const struct intel_execution_engine2 *e;
+	int testable_engines = 0;
 	int dir;
 
 	cleanup(i915);
@@ -400,26 +403,37 @@ static void test_nohangcheck_hang(int i915)
 	 * we forcibly terminate that context.
 	 */
 
-	igt_require(!gem_has_cmdparser(i915, ALL_ENGINES));
+	for_each_ctx_cfg_engine(i915, cfg, e) {
+		if (!gem_engine_has_cmdparser(i915, cfg, e->flags))
+			testable_engines++;
+	}
+	igt_require(testable_engines);
 
 	dir = igt_params_open(i915);
 	igt_require(dir != -1);
 
 	igt_require(__enable_hangcheck(dir, false));
 
-	for_each_physical_ring(e, i915) {
+	for_each_ctx_cfg_engine(i915, cfg, e) {
 		int64_t timeout = reset_timeout_ms * NSEC_PER_MSEC;
-		uint32_t ctx = gem_context_create(i915);
+		const intel_ctx_t *ctx;
 		igt_spin_t *spin;
+		uint64_t ahnd;
 
-		spin = igt_spin_new(i915, ctx,
-				    .engine = eb_ring(e),
+		if (!gem_engine_has_cmdparser(i915, cfg, e->flags))
+			continue;
+
+		ctx = intel_ctx_create(i915, cfg);
+		ahnd = get_reloc_ahnd(i915, ctx->id);
+		spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
+				    .engine = e->flags,
 				    .flags = IGT_SPIN_INVALID_CS);
-		gem_context_destroy(i915, ctx);
+		intel_ctx_destroy(i915, ctx);
 
 		igt_assert_eq(gem_wait(i915, spin->handle, &timeout), 0);
 
 		igt_spin_free(i915, spin);
+		put_ahnd(ahnd);
 	}
 
 	igt_require(__enable_hangcheck(dir, true));
@@ -477,6 +491,7 @@ static void test_noheartbeat_many(int i915, int count, unsigned int flags)
 
 	for_each_physical_ring(e, i915) {
 		igt_spin_t *spin[count];
+		uint64_t ahnd;
 
 		if (!set_preempt_timeout(i915, e->full_name, 250))
 			continue;
@@ -487,14 +502,16 @@ static void test_noheartbeat_many(int i915, int count, unsigned int flags)
 		igt_assert(set_heartbeat(i915, e->full_name, 500));
 
 		for (int n = 0; n < ARRAY_SIZE(spin); n++) {
-			uint32_t ctx;
+			const intel_ctx_t *ctx;
 
-			ctx = gem_context_create(i915);
-			spin[n] = igt_spin_new(i915, ctx, .engine = eb_ring(e),
+			ctx = intel_ctx_create(i915, NULL);
+			ahnd = get_reloc_ahnd(i915, ctx->id);
+			spin[n] = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
+					       .engine = eb_ring(e),
 					       .flags = (IGT_SPIN_FENCE_OUT |
 							 IGT_SPIN_POLL_RUN |
 							 flags));
-			gem_context_destroy(i915, ctx);
+			intel_ctx_destroy(i915, ctx);
 		}
 		igt_spin_busywait_until_started(spin[0]);
 
@@ -506,8 +523,11 @@ static void test_noheartbeat_many(int i915, int count, unsigned int flags)
 				      -EIO);
 		}
 
-		for (int n = 0; n < ARRAY_SIZE(spin); n++)
+		for (int n = 0; n < ARRAY_SIZE(spin); n++) {
+			ahnd = spin[n]->opts.ahnd;
 			igt_spin_free(i915, spin[n]);
+			put_ahnd(ahnd);
+		}
 
 		set_heartbeat(i915, e->full_name, 2500);
 		cleanup(i915);
@@ -531,7 +551,8 @@ static void test_noheartbeat_close(int i915, unsigned int flags)
 
 	for_each_physical_ring(e, i915) {
 		igt_spin_t *spin;
-		uint32_t ctx;
+		const intel_ctx_t *ctx;
+		uint64_t ahnd;
 		int err;
 
 		if (!set_preempt_timeout(i915, e->full_name, 250))
@@ -540,19 +561,22 @@ static void test_noheartbeat_close(int i915, unsigned int flags)
 		if (!set_heartbeat(i915, e->full_name, 0))
 			continue;
 
-		ctx = gem_context_create(i915);
-		spin = igt_spin_new(i915, ctx, .engine = eb_ring(e),
+		ctx = intel_ctx_create(i915, NULL);
+		ahnd = get_reloc_ahnd(i915, ctx->id);
+		spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
+				    .engine = eb_ring(e),
 				    .flags = (IGT_SPIN_FENCE_OUT |
 					      IGT_SPIN_POLL_RUN |
 					      flags));
 		igt_spin_busywait_until_started(spin);
 
 		igt_debug("Testing %s\n", e->full_name);
-		gem_context_destroy(i915, ctx);
+		intel_ctx_destroy(i915, ctx);
 		err = wait_for_status(spin->out_fence, reset_timeout_ms);
 
 		set_heartbeat(i915, e->full_name, 2500);
 		igt_spin_free(i915, spin);
+		put_ahnd(ahnd);
 
 		igt_assert_eq(err, -EIO);
 		cleanup(i915);
@@ -565,6 +589,7 @@ static void test_nonpersistent_file(int i915)
 {
 	int debugfs = i915;
 	igt_spin_t *spin;
+	uint64_t ahnd;
 
 	cleanup(i915);
 
@@ -575,8 +600,9 @@ static void test_nonpersistent_file(int i915)
 
 	i915 = gem_reopen_driver(i915);
 
+	ahnd = get_reloc_ahnd(i915, 0);
 	gem_context_set_persistence(i915, 0, false);
-	spin = igt_spin_new(i915, .flags = IGT_SPIN_FENCE_OUT);
+	spin = igt_spin_new(i915, .ahnd = ahnd, .flags = IGT_SPIN_FENCE_OUT);
 
 	close(i915);
 	flush_delayed_fput(debugfs);
@@ -585,6 +611,7 @@ static void test_nonpersistent_file(int i915)
 
 	spin->handle = 0;
 	igt_spin_free(-1, spin);
+	put_ahnd(ahnd);
 }
 
 static int __execbuf_wr(int i915, struct drm_i915_gem_execbuffer2 *execbuf)
@@ -605,22 +632,24 @@ static void alarm_handler(int sig)
 {
 }
 
-static void test_nonpersistent_queued(int i915, unsigned int engine)
+static void test_nonpersistent_queued(int i915, const intel_ctx_cfg_t *cfg,
+				      unsigned int engine)
 {
 	struct sigaction old_sa, sa = { .sa_handler = alarm_handler };
 	struct itimerval itv;
 	igt_spin_t *spin;
 	int fence = -1;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 
 	/*
 	 * Not only must the immediate batch be cancelled, but
 	 * all pending batches in the context.
 	 */
 
-	ctx = gem_context_clone_with_engines(i915, 0);
-	gem_context_set_persistence(i915, ctx, false);
-	spin = igt_spin_new(i915, ctx,
+	ctx = ctx_create_persistence(i915, cfg, false);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 			    .engine = engine,
 			    .flags = IGT_SPIN_FENCE_OUT);
 
@@ -648,12 +677,13 @@ static void test_nonpersistent_queued(int i915, unsigned int engine)
 	setitimer(ITIMER_REAL, &itv, NULL);
 	sigaction(SIGALRM, &old_sa, NULL);
 
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 
 	igt_assert_eq(wait_for_status(spin->out_fence, reset_timeout_ms), -EIO);
 	igt_assert_eq(wait_for_status(fence, reset_timeout_ms), -EIO);
 
 	igt_spin_free(i915, spin);
+	put_ahnd(ahnd);
 }
 
 static void sendfd(int socket, int fd)
@@ -709,12 +739,16 @@ static void test_process(int i915)
 
 	igt_fork(child, 1) {
 		igt_spin_t *spin;
+		uint64_t ahnd;
 
+		intel_allocator_init();
 		i915 = gem_reopen_driver(i915);
 		gem_quiescent_gpu(i915);
 
 		gem_context_set_persistence(i915, 0, false);
-		spin = igt_spin_new(i915, .flags = IGT_SPIN_FENCE_OUT);
+		ahnd = get_reloc_ahnd(i915, 0);
+		spin = igt_spin_new(i915, .ahnd = ahnd,
+				    .flags = IGT_SPIN_FENCE_OUT);
 		sendfd(sv[0], spin->out_fence);
 
 		igt_list_del(&spin->link); /* prevent autocleanup */
@@ -753,12 +787,16 @@ static void test_userptr(int i915)
 
 	igt_fork(child, 1) {
 		igt_spin_t *spin;
+		uint64_t ahnd;
 
+		intel_allocator_init();
 		i915 = gem_reopen_driver(i915);
 		gem_quiescent_gpu(i915);
 
 		gem_context_set_persistence(i915, 0, false);
-		spin = igt_spin_new(i915, .flags = IGT_SPIN_FENCE_OUT | IGT_SPIN_USERPTR);
+		ahnd = get_reloc_ahnd(i915, 0);
+		spin = igt_spin_new(i915, .ahnd = ahnd,
+				    .flags = IGT_SPIN_FENCE_OUT | IGT_SPIN_USERPTR);
 		sendfd(sv[0], spin->out_fence);
 
 		igt_list_del(&spin->link); /* prevent autocleanup */
@@ -779,7 +817,8 @@ static void test_userptr(int i915)
 	gem_quiescent_gpu(i915);
 }
 
-static void test_process_mixed(int pfd, unsigned int engine)
+static void test_process_mixed(int pfd, const intel_ctx_cfg_t *cfg,
+			       unsigned int engine)
 {
 	int fence[2], sv[2];
 
@@ -799,13 +838,13 @@ static void test_process_mixed(int pfd, unsigned int engine)
 
 		for (int persists = 0; persists <= 1; persists++) {
 			igt_spin_t *spin;
-			uint32_t ctx;
+			const intel_ctx_t *ctx;
+			uint64_t ahnd;
 
-			ctx = gem_context_create(i915);
-			gem_context_copy_engines(pfd, 0, i915, ctx);
-			gem_context_set_persistence(i915, ctx, persists);
-
-			spin = igt_spin_new(i915, ctx,
+			intel_allocator_init();
+			ctx = ctx_create_persistence(i915, cfg, persists);
+			ahnd = get_reloc_ahnd(i915, ctx->id);
+			spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
 					    .engine = engine,
 					    .flags = IGT_SPIN_FENCE_OUT);
 
@@ -836,15 +875,34 @@ static void test_process_mixed(int pfd, unsigned int engine)
 	gem_quiescent_gpu(pfd);
 }
 
+#define SATURATED_NOPREMPT	(1 << 0)
+
 static void
-test_saturated_hostile(int i915, const struct intel_execution_engine2 *engine)
+test_saturated_hostile_all(int i915, const intel_ctx_t *base_ctx,
+			   unsigned int engine_flags, unsigned int test_flags)
 {
 	const struct intel_execution_engine2 *other;
+	unsigned int other_flags = 0;
 	igt_spin_t *spin;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd = get_reloc_ahnd(i915, base_ctx->id);
 	int fence = -1;
 
 	cleanup(i915);
+
+	if (test_flags & SATURATED_NOPREMPT) {
+		/*
+		 * Render and compute engines have a reset dependency. If one is
+		 * reset then all must be reset. Thus, if a hanging batch causes
+		 * a reset, any non-preemptible batches on the other engines
+		 * will be killed. So don't bother testing for the survival of
+		 * non-preemptible batches when compute engines are present.
+		 */
+		for_each_ctx_engine(i915, base_ctx, other)
+			igt_require(other->class != I915_ENGINE_CLASS_COMPUTE);
+
+		other_flags |= IGT_SPIN_NO_PREEMPTION;
+	}
 
 	/*
 	 * Check that if we have to remove a hostile request from a
@@ -858,14 +916,13 @@ test_saturated_hostile(int i915, const struct intel_execution_engine2 *engine)
 	 * reset other users whenever they chose.]
 	 */
 
-	__for_each_physical_engine(i915, other) {
-		if (other->flags == engine->flags)
+	for_each_ctx_engine(i915, base_ctx, other) {
+		if (other->flags == engine_flags)
 			continue;
 
-		spin = igt_spin_new(i915,
+		spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = base_ctx,
 				   .engine = other->flags,
-				   .flags = (IGT_SPIN_NO_PREEMPTION |
-					     IGT_SPIN_FENCE_OUT));
+				   .flags = other_flags | IGT_SPIN_FENCE_OUT);
 
 		if (fence < 0) {
 			fence = spin->out_fence;
@@ -880,17 +937,18 @@ test_saturated_hostile(int i915, const struct intel_execution_engine2 *engine)
 		}
 		spin->out_fence = -1;
 	}
+	put_ahnd(ahnd);
 	igt_require(fence != -1);
 
-	ctx = gem_context_clone_with_engines(i915, 0);
-	gem_context_set_persistence(i915, ctx, false);
-	spin = igt_spin_new(i915, ctx,
-			    .engine = engine->flags,
+	ctx = ctx_create_persistence(i915, &base_ctx->cfg, false);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
+	spin = igt_spin_new(i915, .ahnd = ahnd, .ctx = ctx,
+			    .engine = engine_flags,
 			    .flags = (IGT_SPIN_NO_PREEMPTION |
 				      IGT_SPIN_POLL_RUN |
 				      IGT_SPIN_FENCE_OUT));
 	igt_spin_busywait_until_started(spin);
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 
 	/* Hostile request requires a GPU reset to terminate */
 	igt_assert_eq(wait_for_status(spin->out_fence, reset_timeout_ms), -EIO);
@@ -899,6 +957,25 @@ test_saturated_hostile(int i915, const struct intel_execution_engine2 *engine)
 	gem_quiescent_gpu(i915);
 	igt_assert_eq(wait_for_status(fence, reset_timeout_ms), 1);
 	close(fence);
+	put_ahnd(ahnd);
+}
+
+static void
+test_saturated_hostile_nopreempt(int i915, const intel_ctx_cfg_t *cfg,
+				 unsigned int engine_flags)
+{
+	const intel_ctx_t *ctx = intel_ctx_create(i915, cfg);
+	test_saturated_hostile_all(i915, ctx, engine_flags, SATURATED_NOPREMPT);
+	intel_ctx_destroy(i915, ctx);
+}
+
+static void
+test_saturated_hostile(int i915, const intel_ctx_cfg_t *cfg,
+		       unsigned int engine_flags)
+{
+	const intel_ctx_t *ctx = intel_ctx_create(i915, cfg);
+	test_saturated_hostile_all(i915, ctx, engine_flags, 0);
+	intel_ctx_destroy(i915, ctx);
 }
 
 static void test_processes(int i915)
@@ -920,11 +997,15 @@ static void test_processes(int i915)
 		igt_fork(child, 1) {
 			igt_spin_t *spin;
 			int pid;
+			uint64_t ahnd;
 
+			intel_allocator_init();
 			i915 = gem_reopen_driver(i915);
 			gem_context_set_persistence(i915, 0, i);
 
-			spin = igt_spin_new(i915, .flags = IGT_SPIN_FENCE_OUT);
+			ahnd = get_reloc_ahnd(i915, 0);
+			spin = igt_spin_new(i915, .ahnd = ahnd,
+					    .flags = IGT_SPIN_FENCE_OUT);
 			/* prevent autocleanup */
 			igt_list_del(&spin->link);
 
@@ -977,7 +1058,7 @@ static void test_processes(int i915)
 	gem_quiescent_gpu(i915);
 }
 
-static void __smoker(int i915,
+static void __smoker(int i915, const intel_ctx_cfg_t *cfg,
 		     unsigned int engine,
 		     unsigned int timeout,
 		     int expected)
@@ -985,11 +1066,14 @@ static void __smoker(int i915,
 	igt_spin_t *spin;
 	int fence = -1;
 	int fd, extra;
+	const intel_ctx_t *ctx;
+	uint64_t ahnd;
 
 	fd = gem_reopen_driver(i915);
-	gem_context_copy_engines(i915, 0, fd, 0);
-	gem_context_set_persistence(fd, 0, expected > 0);
-	spin = igt_spin_new(fd, .engine = engine, .flags = IGT_SPIN_FENCE_OUT);
+	ctx = ctx_create_persistence(fd, cfg, expected > 0);
+	ahnd = get_reloc_ahnd(fd, ctx->id);
+	spin = igt_spin_new(fd, .ahnd = ahnd, .ctx = ctx, .engine = engine,
+			    .flags = IGT_SPIN_FENCE_OUT);
 
 	extra = rand() % 8;
 	while (extra--) {
@@ -1000,6 +1084,8 @@ static void __smoker(int i915,
 		igt_assert(spin->execbuf.rsvd2);
 		fence = spin->execbuf.rsvd2 >> 32;
 	}
+
+	intel_ctx_destroy(fd, ctx);
 
 	close(fd);
 	flush_delayed_fput(i915);
@@ -1015,20 +1101,21 @@ static void __smoker(int i915,
 
 	spin->handle = 0;
 	igt_spin_free(fd, spin);
+	put_ahnd(ahnd);
 }
 
-static void smoker(int i915,
+static void smoker(int i915, const intel_ctx_cfg_t *cfg,
 		   unsigned int engine,
 		   unsigned int timeout,
 		   unsigned int *ctl)
 {
 	while (!READ_ONCE(*ctl)) {
-		__smoker(i915, engine, timeout, -EIO);
-		__smoker(i915, engine, timeout, 1);
+		__smoker(i915, cfg, engine, timeout, -EIO);
+		__smoker(i915, cfg, engine, timeout, 1);
 	}
 }
 
-static void smoketest(int i915)
+static void smoketest(int i915, const intel_ctx_cfg_t *cfg)
 {
 	const int SMOKE_LOAD_FACTOR = 4;
 	const struct intel_execution_engine2 *e;
@@ -1048,9 +1135,9 @@ static void smoketest(int i915)
 		*ctl = 0;
 
 		igt_debug("Applying load factor: %d\n", i);
-		__for_each_physical_engine(i915, e) {
+		for_each_ctx_cfg_engine(i915, cfg, e) {
 			igt_fork(child, i)
-				smoker(i915,
+				smoker(i915, cfg,
 				       e->flags,
 				       i * reset_timeout_ms,
 				       ctl);
@@ -1065,11 +1152,12 @@ static void smoketest(int i915)
 	gem_quiescent_gpu(i915);
 }
 
-static void many_contexts(int i915)
+static void many_contexts(int i915, const intel_ctx_cfg_t *cfg)
 {
 	const struct intel_execution_engine2 *e;
 	int64_t timeout = NSEC_PER_SEC;
 	igt_spin_t *spin;
+	uint64_t ahnd = get_reloc_ahnd(i915, 0);
 
 	cleanup(i915);
 
@@ -1079,24 +1167,31 @@ static void many_contexts(int i915)
 	 * creating new contexts, and submitting new execbuf.
 	 */
 
-	spin = igt_spin_new(i915, .flags = IGT_SPIN_NO_PREEMPTION);
+	spin = igt_spin_new(i915, .ahnd = ahnd, .flags = IGT_SPIN_NO_PREEMPTION);
 	igt_spin_end(spin);
 
 	gem_sync(i915, spin->handle);
 	igt_spin_reset(spin);
 
+	for_each_ctx_cfg_engine(i915, cfg, e) {
+		int t = 0;
+
+		gem_engine_property_scanf(i915, e->name,
+					  "preempt_timeout_ms", "%d", &t);
+		timeout = max_t(int64_t, timeout, 2000000ll * t);
+	}
+
 	igt_until_timeout(30) {
-		__for_each_physical_engine(i915, e) {
-			uint32_t ctx;
+		for_each_ctx_cfg_engine(i915, cfg, e) {
+			const intel_ctx_t *ctx;
 
-			ctx = gem_context_clone_with_engines(i915, 0);
-			gem_context_set_persistence(i915, ctx, false);
+			ctx = ctx_create_persistence(i915, cfg, false);
 
-			spin->execbuf.rsvd1 = ctx;
+			spin->execbuf.rsvd1 = ctx->id;
 			spin->execbuf.flags &= ~63;
 			spin->execbuf.flags |= e->flags;
 			gem_execbuf(i915, &spin->execbuf);
-			gem_context_destroy(i915, ctx);
+			intel_ctx_destroy(i915, ctx);
 		}
 	}
 	igt_debugfs_dump(i915, "i915_engine_info");
@@ -1110,196 +1205,13 @@ static void many_contexts(int i915)
 
 	igt_spin_free(i915, spin);
 	gem_quiescent_gpu(i915);
+	put_ahnd(ahnd);
 }
 
-static void replace_engines(int i915, const struct intel_execution_engine2 *e)
-{
-	I915_DEFINE_CONTEXT_PARAM_ENGINES(engines, 1) = {
-		.engines = {{ e->class, e->instance }}
-	};
-	struct drm_i915_gem_context_param param = {
-		.ctx_id = gem_context_create(i915),
-		.param = I915_CONTEXT_PARAM_ENGINES,
-		.value = to_user_pointer(&engines),
-		.size = sizeof(engines),
-	};
-	igt_spin_t *spin[2];
-	int64_t timeout;
-
-	/*
-	 * Suppose the user tries to hide a hanging batch by replacing
-	 * the set of engines on the context so that it's not visible
-	 * at the time of closure? Then we must act when they replace
-	 * the engines!
-	 */
-
-	gem_context_set_persistence(i915, param.ctx_id, false);
-
-	gem_context_set_param(i915, &param);
-	spin[0] = igt_spin_new(i915, param.ctx_id);
-
-	gem_context_set_param(i915, &param);
-	spin[1] = igt_spin_new(i915, param.ctx_id);
-
-	gem_context_destroy(i915, param.ctx_id);
-
-	timeout = reset_timeout_ms * NSEC_PER_MSEC;
-	igt_assert_eq(gem_wait(i915, spin[1]->handle, &timeout), 0);
-
-	timeout = reset_timeout_ms * NSEC_PER_MSEC;
-	igt_assert_eq(gem_wait(i915, spin[0]->handle, &timeout), 0);
-
-	igt_spin_free(i915, spin[1]);
-	igt_spin_free(i915, spin[0]);
-	gem_quiescent_gpu(i915);
-}
-
-static void race_set_engines(int i915, int in, int out)
-{
-	I915_DEFINE_CONTEXT_PARAM_ENGINES(engines, 1) = {
-		.engines = {}
-	};
-	struct drm_i915_gem_context_param param = {
-		.param = I915_CONTEXT_PARAM_ENGINES,
-		.value = to_user_pointer(&engines),
-		.size = sizeof(engines),
-	};
-	igt_spin_t *spin;
-
-	spin = igt_spin_new(i915);
-	igt_spin_end(spin);
-
-	while (read(in, &param.ctx_id, sizeof(param.ctx_id)) > 0) {
-		if (!param.ctx_id)
-			break;
-
-		__gem_context_set_param(i915, &param);
-
-		spin->execbuf.rsvd1 = param.ctx_id;
-		__gem_execbuf(i915, &spin->execbuf);
-
-		write(out, &param.ctx_id, sizeof(param.ctx_id));
-	}
-
-	igt_spin_free(i915, spin);
-}
-
-static void close_replace_race(int i915)
-{
-	const int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-	int fence = -1;
-	int out[2], in[2];
-
-	cleanup(i915);
-
-	/*
-	 * If we time the submission of a hanging batch to one set of engines
-	 * and then simultaneously replace the engines in one thread, and
-	 * close the context in another, it might be possible for the kernel
-	 * to lose track of the old engines believing that the non-persisten
-	 * context is already closed and the hanging requests cancelled.
-	 *
-	 * Our challenge is try and expose any such race condition.
-	 */
-
-	igt_assert(pipe(out) == 0);
-	igt_assert(pipe(in) == 0);
-	igt_fork(child, ncpus) {
-		close(out[1]);
-		close(in[0]);
-		race_set_engines(i915, out[0], in[1]);
-	}
-	for (int i = 0; i < ncpus; i++)
-		close(out[0]);
-
-	igt_until_timeout(5) {
-		igt_spin_t *spin;
-		uint32_t ctx;
-
-		ctx = gem_context_clone_with_engines(i915, 0);
-		gem_context_set_persistence(i915, ctx, false);
-
-		spin = igt_spin_new(i915, ctx, .flags = IGT_SPIN_FENCE_OUT);
-		for (int i = 0; i < ncpus; i++)
-			write(out[1], &ctx, sizeof(ctx));
-
-		gem_context_destroy(i915, ctx);
-		for (int i = 0; i < ncpus; i++)
-			read(in[0], &ctx, sizeof(ctx));
-
-		if (fence < 0) {
-			fence = spin->out_fence;
-		} else {
-			int tmp;
-
-			tmp = sync_fence_merge(fence, spin->out_fence);
-			close(fence);
-			close(spin->out_fence);
-
-			fence = tmp;
-		}
-		spin->out_fence = -1;
-	}
-	close(in[0]);
-
-	for (int i = 0; i < ncpus; i++) {
-		uint32_t end = 0;
-
-		write(out[1], &end, sizeof(end));
-	}
-	close(out[1]);
-
-	if (sync_fence_wait(fence, MSEC_PER_SEC / 2)) {
-		igt_debugfs_dump(i915, "i915_engine_info");
-		igt_assert(sync_fence_wait(fence, MSEC_PER_SEC / 2) == 0);
-	}
-	close(fence);
-
-	igt_waitchildren();
-	gem_quiescent_gpu(i915);
-}
-
-static void replace_engines_hostile(int i915,
-				    const struct intel_execution_engine2 *e)
-{
-	I915_DEFINE_CONTEXT_PARAM_ENGINES(engines, 1) = {
-		.engines = {{ e->class, e->instance }}
-	};
-	struct drm_i915_gem_context_param param = {
-		.ctx_id = gem_context_create(i915),
-		.param = I915_CONTEXT_PARAM_ENGINES,
-		.value = to_user_pointer(&engines),
-		.size = sizeof(engines),
-	};
-	int64_t timeout = reset_timeout_ms * NSEC_PER_MSEC;
-	igt_spin_t *spin;
-
-	/*
-	 * Suppose the user tries to hide a hanging batch by replacing
-	 * the set of engines on the context so that it's not visible
-	 * at the time of closure? Then we must act when they replace
-	 * the engines!
-	 */
-
-	gem_context_set_persistence(i915, param.ctx_id, false);
-
-	gem_context_set_param(i915, &param);
-	spin = igt_spin_new(i915, param.ctx_id,
-			    .flags = IGT_SPIN_NO_PREEMPTION);
-
-	param.size = 8;
-	gem_context_set_param(i915, &param);
-	gem_context_destroy(i915, param.ctx_id);
-
-	igt_assert_eq(gem_wait(i915, spin->handle, &timeout), 0);
-
-	igt_spin_free(i915, spin);
-	gem_quiescent_gpu(i915);
-}
-
-static void do_test(void (*test)(int i915, unsigned int engine),
-		    int i915, unsigned int engine,
-		    const char *name)
+static void do_test(void (*test)(int i915, const intel_ctx_cfg_t *cfg,
+				 unsigned int engine),
+		    int i915, const intel_ctx_cfg_t *cfg,
+		    unsigned int engine, const char *name)
 {
 #define ATTR "preempt_timeout_ms"
 	int timeout = -1;
@@ -1310,10 +1222,10 @@ static void do_test(void (*test)(int i915, unsigned int engine),
 	if (timeout != -1) {
 		igt_require(gem_engine_property_printf(i915, name,
 						       ATTR, "%d", 50) > 0);
-		reset_timeout_ms = 200;
+		reset_timeout_ms = 700;
 	}
 
-	test(i915, engine);
+	test(i915, cfg, engine);
 
 	if (timeout != -1) {
 		gem_engine_property_printf(i915, name, ATTR, "%d", timeout);
@@ -1332,9 +1244,11 @@ static void exit_handler(int sig)
 
 igt_main
 {
+	const intel_ctx_cfg_t empty_cfg = {};
 	struct {
 		const char *name;
-		void (*func)(int fd, unsigned int engine);
+		void (*func)(int fd, const intel_ctx_cfg_t *cfg,
+			     unsigned int engine);
 	} *test, tests[] = {
 		{ "persistence", test_persistence },
 		{ "cleanup", test_nonpersistent_cleanup },
@@ -1346,6 +1260,7 @@ igt_main
 		{ "hang", test_nonpersistent_hang },
 		{ NULL, NULL },
 	};
+	const intel_ctx_t *ctx;
 
 	igt_fixture {
 		i915 = drm_open_driver(DRIVER_INTEL);
@@ -1357,17 +1272,16 @@ igt_main
 		enable_hangcheck(i915);
 		igt_install_exit_handler(exit_handler);
 
+		ctx = intel_ctx_create_all_physical(i915);
+
 		igt_require(has_persistence(i915));
-		igt_allow_hang(i915, 0, 0);
+		igt_allow_hang(i915, ctx->id, 0);
 	}
 
 	/* Legacy execbuf engine selection flags. */
 
 	igt_subtest("idempotent")
 		test_idempotent(i915);
-
-	igt_subtest("clone")
-		test_clone(i915);
 
 	igt_subtest("file")
 		test_nonpersistent_file(i915);
@@ -1382,9 +1296,9 @@ igt_main
 		test_userptr(i915);
 
 	igt_subtest("hostile")
-		test_nohangcheck_hostile(i915);
+		test_nohangcheck_hostile(i915, &empty_cfg);
 	igt_subtest("hang")
-		test_nohangcheck_hang(i915);
+		test_nohangcheck_hang(i915, &empty_cfg);
 
 	igt_subtest("heartbeat-stop")
 		test_noheartbeat_many(i915, 1, 0);
@@ -1406,16 +1320,13 @@ igt_main
 						   test->name) {
 				for_each_physical_ring(e, i915) {
 					igt_dynamic_f("%s", e->name) {
-						do_test(test->func,
-							i915, eb_ring(e),
+						do_test(test->func, i915,
+							&empty_cfg, eb_ring(e),
 							e->full_name);
 					}
 				}
 			}
 		}
-
-		/* Assert things are under control. */
-		igt_assert(!gem_context_has_engine_map(i915, 0));
 	}
 
 	/* New way of selecting engines. */
@@ -1428,10 +1339,10 @@ igt_main
 
 		for (test = tests; test->name; test++) {
 			igt_subtest_with_dynamic_f("engines-%s", test->name) {
-				__for_each_physical_engine(i915, e) {
+				for_each_ctx_engine(i915, ctx, e) {
 					igt_dynamic_f("%s", e->name) {
-						do_test(test->func,
-							i915, e->flags,
+						do_test(test->func, i915,
+							&ctx->cfg, e->flags,
 							e->name);
 					}
 				}
@@ -1439,42 +1350,36 @@ igt_main
 		}
 
 		igt_subtest_with_dynamic_f("saturated-hostile") {
-			__for_each_physical_engine(i915, e) {
+			for_each_ctx_engine(i915, ctx, e) {
 				igt_dynamic_f("%s", e->name)
-					test_saturated_hostile(i915, e);
+					do_test(test_saturated_hostile, i915, &ctx->cfg, e->flags, e->name);
+			}
+		}
+
+		igt_subtest_with_dynamic_f("saturated-hostile-nopreempt") {
+			for_each_ctx_engine(i915, ctx, e) {
+				igt_dynamic_f("%s", e->name)
+					do_test(test_saturated_hostile_nopreempt, i915, &ctx->cfg, e->flags, e->name);
 			}
 		}
 
 		igt_subtest("many-contexts")
-			many_contexts(i915);
-
-		igt_subtest("smoketest")
-			smoketest(i915);
+			many_contexts(i915, &ctx->cfg);
 	}
 
-	/* Check interactions with set-engines */
 	igt_subtest_group {
-		const struct intel_execution_engine2 *e;
-
-		igt_fixture
+		igt_fixture {
 			gem_require_contexts(i915);
-
-		igt_subtest_with_dynamic("replace") {
-			__for_each_physical_engine(i915, e) {
-				igt_dynamic_f("%s", e->name)
-					replace_engines(i915, e);
-			}
+			intel_allocator_multiprocess_start();
 		}
 
-		igt_subtest_with_dynamic("replace-hostile") {
-			__for_each_physical_engine(i915, e) {
-				igt_dynamic_f("%s", e->name)
-					replace_engines_hostile(i915, e);
-			}
+		igt_subtest("smoketest")
+			smoketest(i915, &ctx->cfg);
+
+		igt_fixture {
+			intel_allocator_multiprocess_stop();
 		}
 
-		igt_subtest("close-replace-race")
-			close_replace_race(i915);
 	}
 
 	igt_fixture {

@@ -21,25 +21,11 @@
  * IN THE SOFTWARE.
  */
 
-#include <assert.h>
-#include <string.h>
-#include <signal.h>
-#include <errno.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
-#include <fcntl.h>
-
 #include "drmtest.h"
 #include "igt_aux.h"
-#include "igt_core.h"
 #include "igt_fb.h"
 #include "igt_vc4.h"
 #include "ioctl_wrappers.h"
-#include "intel_reg.h"
-#include "intel_chipset.h"
-#include "vc4_drm.h"
 #include "vc4_packet.h"
 
 #if NEW_CONTEXT_PARAM_NO_ERROR_CAPTURE_API
@@ -71,6 +57,18 @@ bool igt_vc4_is_tiled(uint64_t modifier)
 	default:
 		return false;
 	}
+}
+
+bool igt_vc4_is_v3d(int fd)
+{
+	uint64_t value;
+
+	/*
+	 * vc5 doesn't have syncobj capabilities, only vc4.
+	 */
+	if (drmGetCap(fd, DRM_CAP_SYNCOBJ, &value))
+		return false;
+	return value;
 }
 
 /**
@@ -140,6 +138,8 @@ igt_vc4_mmap_bo(int fd, uint32_t handle, uint32_t size, unsigned prot)
 
 	do_ioctl(fd, DRM_IOCTL_VC4_MMAP_BO, &mmap_bo);
 
+	igt_assert_eq(mmap_bo.offset % sysconf(_SC_PAGE_SIZE), 0);
+
 	ptr = mmap(0, size, prot, MAP_SHARED, fd, mmap_bo.offset);
 	if (ptr == MAP_FAILED)
 		return NULL;
@@ -195,6 +195,40 @@ bool igt_vc4_purgeable_bo(int fd, int handle, bool purgeable)
 	return arg.retained;
 }
 
+uint32_t igt_vc4_perfmon_create(int fd, uint32_t ncounters, uint8_t *events)
+{
+	struct drm_vc4_perfmon_create create = {
+		.ncounters = ncounters,
+	};
+
+	memcpy(create.events, events, ncounters * sizeof(*events));
+
+	do_ioctl(fd, DRM_IOCTL_VC4_PERFMON_CREATE, &create);
+	igt_assert_neq(create.id, 0);
+
+	return create.id;
+}
+
+void igt_vc4_perfmon_get_values(int fd, uint32_t id)
+{
+	uint64_t *values = calloc(DRM_VC4_MAX_PERF_COUNTERS, sizeof(*values));
+	struct drm_vc4_perfmon_get_values get = {
+		.id = id,
+		.values_ptr = to_user_pointer(values),
+	};
+
+	do_ioctl(fd, DRM_IOCTL_VC4_PERFMON_GET_VALUES, &get);
+	free(values);
+}
+
+void igt_vc4_perfmon_destroy(int fd, uint32_t id)
+{
+	struct drm_vc4_perfmon_destroy destroy = {
+		.id = id,
+	};
+
+	do_ioctl(fd, DRM_IOCTL_VC4_PERFMON_DESTROY, &destroy);
+}
 
 /* Calculate the t-tile width so that size = width * height * bpp / 8. */
 #define VC4_T_TILE_W(size, height, bpp) ((size) / (height) / ((bpp) / 8))

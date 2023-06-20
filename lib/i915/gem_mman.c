@@ -27,11 +27,12 @@
 #include <errno.h>
 
 #include "igt_core.h"
+#include "igt_gt.h"
 #include "igt_device.h"
 #include "ioctl_wrappers.h"
 #include "intel_chipset.h"
 
-#include "gem.h"
+#include "gem_create.h"
 #include "gem_mman.h"
 
 #ifdef HAVE_VALGRIND
@@ -63,9 +64,36 @@ bool gem_has_mmap_offset(int fd)
 	return gtt_version >= 4;
 }
 
+bool gem_has_legacy_mmap(int fd)
+{
+	struct drm_i915_gem_mmap arg = { .handle = ~0U };
+
+	igt_assert_eq(igt_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &arg), -1);
+
+	return errno != EOPNOTSUPP;
+}
+
+/**
+ * gem_has_mmap_offset_type:
+ * @fd: open i915 drm file descriptor
+ * @*t: pointer to mmap_offset
+ *
+ * This functions checks the mmap offset type is supported or not.
+ * For discrete memory only FIXED mmap_offset type is supported
+ * and for non-discrete memory all other offset type except FIXED
+ * are supported.
+ *
+ * Returns: True if supported or False if not.
+ */
 bool gem_has_mmap_offset_type(int fd, const struct mmap_offset *t)
 {
-	return gem_has_mmap_offset(fd) || t->type == I915_MMAP_OFFSET_GTT;
+	if (gem_has_mmap_offset(fd))
+		if (gem_has_lmem(fd))
+			return t->type == I915_MMAP_OFFSET_FIXED;
+		else
+			return t->type != I915_MMAP_OFFSET_FIXED;
+	else
+		return t->type == I915_MMAP_OFFSET_GTT;
 }
 
 /**
@@ -90,7 +118,7 @@ void *__gem_mmap__gtt(int fd, uint32_t handle, uint64_t size, unsigned prot)
 	if (igt_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_GTT, &mmap_arg))
 		return NULL;
 
-	ptr = mmap64(0, size, prot, MAP_SHARED, fd, mmap_arg.offset);
+	ptr = mmap(0, size, prot, MAP_SHARED, fd, mmap_arg.offset);
 	if (ptr == MAP_FAILED)
 		ptr = NULL;
 	else
@@ -135,6 +163,9 @@ bool gem_mmap__has_wc(int fd)
 
 	struct drm_i915_getparam gp;
 	int mmap_version = -1;
+
+	if (gem_mmap_offset__has_wc(fd))
+		return true;
 
 	memset(&gp, 0, sizeof(gp));
 	gp.param = I915_PARAM_MMAP_VERSION;
@@ -184,6 +215,45 @@ bool gem_mmap_offset__has_wc(int fd)
 	return has_wc > 0;
 }
 
+bool gem_mmap__has_device_coherent(int fd)
+{
+	struct drm_i915_gem_mmap_offset arg;
+	bool supported;
+
+	if (gem_mmap__has_wc(fd))
+		return true;
+
+	/* Maybe we still have GTT mmaps? */
+	memset(&arg, 0, sizeof(arg));
+	arg.handle = gem_create(fd, 4096);
+	arg.offset = 0;
+	arg.flags = I915_MMAP_OFFSET_GTT;
+	supported = igt_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET,
+			      &arg) == 0;
+	gem_close(fd, arg.handle);
+
+	errno = 0;
+
+	if (supported)
+		return true;
+
+	/*
+	 * Maybe this is a discrete device, which only supports fixed mmaps?
+	 * Such mappings should also be considered device coherent.
+	 */
+	memset(&arg, 0, sizeof(arg));
+	arg.handle = gem_create(fd, 4096);
+	arg.offset = 0;
+	arg.flags = I915_MMAP_OFFSET_FIXED;
+	supported = igt_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET,
+			      &arg) == 0;
+	gem_close(fd, arg.handle);
+
+	errno = 0;
+
+	return supported;
+}
+
 /**
  * __gem_mmap:
  * @fd: open i915 drm file descriptor
@@ -204,6 +274,7 @@ static void *__gem_mmap(int fd, uint32_t handle, uint64_t offset, uint64_t size,
 			unsigned int prot, uint64_t flags)
 {
 	struct drm_i915_gem_mmap arg;
+	int ret;
 
 	memset(&arg, 0, sizeof(arg));
 	arg.handle = handle;
@@ -211,7 +282,13 @@ static void *__gem_mmap(int fd, uint32_t handle, uint64_t offset, uint64_t size,
 	arg.size = size;
 	arg.flags = flags;
 
-	if (igt_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &arg))
+	ret = igt_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP, &arg);
+	if (ret == -1 && errno == EOPNOTSUPP)
+		return __gem_mmap_offset(fd, handle, offset, size, prot,
+					 flags == I915_MMAP_WC ?
+						I915_MMAP_OFFSET_WC :
+						I915_MMAP_OFFSET_WB);
+	else if (ret)
 		return NULL;
 
 	VG(VALGRIND_MAKE_MEM_DEFINED(from_user_pointer(arg.addr_ptr), arg.size));
@@ -254,7 +331,7 @@ void *__gem_mmap_offset(int fd, uint32_t handle, uint64_t offset, uint64_t size,
 	if (igt_ioctl(fd, DRM_IOCTL_I915_GEM_MMAP_OFFSET, &arg))
 		return NULL;
 
-	ptr = mmap64(0, size, prot, MAP_SHARED, fd, arg.offset + offset);
+	ptr = mmap(0, size, prot, MAP_SHARED, fd, arg.offset + offset);
 
 	if (ptr == MAP_FAILED)
 		ptr = NULL;
@@ -362,9 +439,11 @@ void *__gem_mmap__device_coherent(int fd, uint32_t handle, uint64_t offset,
 {
 	void *ptr = __gem_mmap_offset(fd, handle, offset, size, prot,
 				      I915_MMAP_OFFSET_WC);
+
+	if (!ptr)
+		ptr = __gem_mmap_offset__fixed(fd, handle, offset, size, prot);
 	if (!ptr)
 		ptr = __gem_mmap__wc(fd, handle, offset, size, prot);
-
 	if (!ptr)
 		ptr = __gem_mmap__gtt(fd, handle, size, prot);
 
@@ -414,7 +493,13 @@ void *gem_mmap__device_coherent(int fd, uint32_t handle, uint64_t offset,
  */
 void *__gem_mmap__cpu(int fd, uint32_t handle, uint64_t offset, uint64_t size, unsigned prot)
 {
-	return __gem_mmap(fd, handle, offset, size, prot, 0);
+	void *ptr;
+
+	ptr = __gem_mmap(fd, handle, offset, size, prot, 0);
+	if (!ptr)
+		ptr = __gem_mmap_offset__fixed(fd, handle, offset, size, prot);
+
+	return ptr;
 }
 
 /**
@@ -452,8 +537,14 @@ void *gem_mmap__cpu(int fd, uint32_t handle, uint64_t offset, uint64_t size, uns
 void *__gem_mmap_offset__cpu(int fd, uint32_t handle, uint64_t offset,
 			     uint64_t size, unsigned prot)
 {
-	return __gem_mmap_offset(fd, handle, offset, size, prot,
+	void *ptr;
+
+	ptr = __gem_mmap_offset(fd, handle, offset, size, prot,
 				 I915_MMAP_OFFSET_WB);
+	if (!ptr)
+		ptr = __gem_mmap_offset__fixed(fd, handle, offset, size, prot);
+
+	return ptr;
 }
 
 /**
@@ -473,6 +564,41 @@ void *gem_mmap_offset__cpu(int fd, uint32_t handle, uint64_t offset,
 {
 	void *ptr = __gem_mmap_offset(fd, handle, offset, size, prot,
 				      I915_MMAP_OFFSET_WB);
+
+	igt_assert(ptr);
+	return ptr;
+}
+
+void *__gem_mmap_offset__fixed(int fd, uint32_t handle, uint64_t offset,
+			       uint64_t size, unsigned prot)
+{
+	return __gem_mmap_offset(fd, handle, offset, size, prot,
+				 I915_MMAP_OFFSET_FIXED);
+}
+
+/**
+ * gem_mmap_offset__fixed: Used to mmap objects on discrete platforms
+ * @fd: open i915 drm file descriptor
+ * @handle: gem buffer object handle
+ * @offset: offset in the gem buffer of the mmap arena
+ * @size: size of the mmap arena
+ * @prot: memory protection bits as used by mmap()
+ *
+ * Like __gem_mmap_offset__fixed() except we assert on failure.
+ *
+ * For discrete the caching attributes for the pages are fixed at allocation
+ * time, and can't be changed. The FIXED mode will simply use the same caching *
+ * mode of the allocated pages. This mode will always be coherent with GPU
+ * access.
+ *
+ * On non-discrete platforms this mode is not supported.
+ *
+ * Returns: A pointer to the created memory mapping
+ */
+void *gem_mmap_offset__fixed(int fd, uint32_t handle, uint64_t offset,
+			   uint64_t size, unsigned prot)
+{
+	void *ptr = __gem_mmap_offset__fixed(fd, handle, offset, size, prot);
 
 	igt_assert(ptr);
 	return ptr;
@@ -552,6 +678,7 @@ const struct mmap_offset mmap_offset_types[] = {
 	{ "wb", I915_MMAP_OFFSET_WB, I915_GEM_DOMAIN_CPU },
 	{ "wc", I915_MMAP_OFFSET_WC, I915_GEM_DOMAIN_WC },
 	{ "uc", I915_MMAP_OFFSET_UC, I915_GEM_DOMAIN_WC },
+	{ "fixed", I915_MMAP_OFFSET_FIXED, 0},
 	{},
 };
 

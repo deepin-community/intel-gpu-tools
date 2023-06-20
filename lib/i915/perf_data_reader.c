@@ -45,13 +45,14 @@ oa_report_ctx_is_valid(const struct intel_perf_devinfo *devinfo,
 {
 	const uint32_t *report = (const uint32_t *) _report;
 
-	if (devinfo->gen < 8) {
+	if (devinfo->graphics_ver < 8)
 		return false; /* TODO */
-	} else if (devinfo->gen == 8) {
+	if (devinfo->graphics_ver >= 12)
+		return true; /* Always valid */
+	if (devinfo->graphics_ver == 8)
 		return report[0] & (1ul << 25);
-	} else if (devinfo->gen > 8) {
+	if (devinfo->graphics_ver > 8)
 		return report[0] & (1ul << 16);
-	}
 
 	return false;
 }
@@ -62,12 +63,6 @@ oa_report_ctx_id(const struct intel_perf_devinfo *devinfo, const uint8_t *report
 	if (!oa_report_ctx_is_valid(devinfo, report))
 		return 0xffffffff;
 	return ((const uint32_t *) report)[2];
-}
-
-static inline uint64_t
-oa_report_timestamp(const uint8_t *report)
-{
-	return ((const uint32_t *)report)[1];
 }
 
 static void
@@ -214,7 +209,7 @@ correlate_gpu_timestamp(struct intel_perf_data_reader *reader,
 	 * Try to figure what portion of the correlation data the
 	 * 32bit timestamp belongs to.
 	 */
-	uint64_t mask = 0xffffffff;
+	uint64_t mask = reader->perf->devinfo.oa_timestamp_mask;
 	int corr_idx = -1;
 
 	for (uint32_t i = 0; i < reader->n_correlation_chunks; i++) {
@@ -297,8 +292,12 @@ generate_cpu_events(struct intel_perf_data_reader *reader)
 		last_ctx_id = oa_report_ctx_id(&reader->devinfo, start_report);
 		current_ctx_id = oa_report_ctx_id(&reader->devinfo, end_report);
 
-		gpu_ts_start = oa_report_timestamp(start_report);
-		gpu_ts_end = oa_report_timestamp(end_report);
+		gpu_ts_start = intel_perf_read_record_timestamp(reader->perf,
+								reader->metric_set,
+								last_header);
+		gpu_ts_end = intel_perf_read_record_timestamp(reader->perf,
+							      reader->metric_set,
+							      current_header);
 
 		if (last_ctx_id == current_ctx_id)
 			continue;
@@ -338,8 +337,8 @@ bool
 intel_perf_data_reader_init(struct intel_perf_data_reader *reader,
 			    int perf_file_fd)
 {
-        struct stat st;
-        if (fstat(perf_file_fd, &st) != 0) {
+	struct stat st;
+	if (fstat(perf_file_fd, &st) != 0) {
 		snprintf(reader->error_msg, sizeof(reader->error_msg),
 			 "Unable to access file (%s)", strerror(errno));
 		return false;

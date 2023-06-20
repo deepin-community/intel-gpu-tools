@@ -42,7 +42,7 @@
 #include <time.h>
 #include <pthread.h>
 
-#include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt_stats.h"
 
 #define TEST_DPMS		(1 << 0)
@@ -81,9 +81,13 @@
 #define RUN_TEST		1
 #define RUN_PAIR		2
 
+#define MAX_HDISPLAY_PER_CRTC 5120
+
 #ifndef DRM_CAP_TIMESTAMP_MONOTONIC
 #define DRM_CAP_TIMESTAMP_MONOTONIC 6
 #endif
+
+static bool all_pipes = false;
 
 drmModeRes *resources;
 int drm_fd;
@@ -126,6 +130,15 @@ struct event_state {
 	/* Step between the current and next 'target' sequence number. */
 	int seq_step;
 };
+
+static bool should_skip_ts_checks(void) {
+	/* Mediatek devices have a HW issue with sending their vblank IRQ at the same time interval
+	 * everytime. The drift can be below or above the expected frame time, causing the
+	 * timestamp to drift with a relatively larger standard deviation over a large sample.
+	 * As it's a known issue, skip any Timestamp or Sequence checks for MTK drivers.
+	 */
+	return is_mtk_device(drm_fd);
+}
 
 static bool vblank_dependence(int flags)
 {
@@ -614,9 +627,9 @@ static void recreate_fb(struct test_output *o)
 	o->fb_info[o->current_fb_id].fb_id = new_fb_id;
 }
 
-static igt_hang_t hang_gpu(int fd)
+static igt_hang_t hang_gpu(int fd, uint64_t ahnd)
 {
-	return igt_hang_ring(fd, I915_EXEC_DEFAULT);
+	return igt_hang_ring_with_ahnd(fd, I915_EXEC_DEFAULT, ahnd);
 }
 
 static void unhang_gpu(int fd, igt_hang_t hang)
@@ -673,6 +686,7 @@ static bool run_test_step(struct test_output *o, unsigned int *events)
 	struct vblank_reply vbl_reply;
 	unsigned int target_seq;
 	igt_hang_t hang;
+	uint64_t ahnd = 0;
 
 	target_seq = o->vblank_state.seq_step;
 	/* Absolute waits only works once we have a frame counter. */
@@ -758,24 +772,30 @@ static bool run_test_step(struct test_output *o, unsigned int *events)
 		start = gettime_us();
 		igt_assert(__wait_for_vblank(TEST_VBLANK_BLOCK, o->pipe, 2, 0, &reply) == 0);
 		end = gettime_us();
-		/*
-		 * we waited for two vblanks, so verify that
-		 * we were blocked for ~1-2 frames. And due
-		 * to scheduling latencies we give it an extra
-		 * half a frame or so.
-		 */
-		igt_assert_f(end - start > 0.9 * actual_frame_time(o) &&
-			     end - start < 2.6 * actual_frame_time(o),
-			     "wait for two vblanks took %lu usec (frame time %f usec)\n",
-			     end - start, mode_frame_time(o));
+
+		if (!should_skip_ts_checks()) {
+			/*
+			 * we waited for two vblanks, so verify that
+			 * we were blocked for ~1-2 frames. And due
+			 * to scheduling latencies we give it an extra
+			 * half a frame or so.
+			 */
+			igt_assert_f(end - start > 0.9 * actual_frame_time(o) &&
+							 end - start < 2.6 * actual_frame_time(o),
+						 "wait for two vblanks took %lu usec (frame time %f usec)\n",
+						 end - start, mode_frame_time(o));
+		}
 		join_vblank_wait_thread();
 	}
 
 	igt_print_activity();
 
 	memset(&hang, 0, sizeof(hang));
-	if (do_flip && (o->flags & TEST_HANG))
-		hang = hang_gpu(drm_fd);
+	if (do_flip && (o->flags & TEST_HANG)) {
+		igt_require_intel(drm_fd);
+		ahnd = get_reloc_ahnd(drm_fd, 0);
+		hang = hang_gpu(drm_fd, ahnd);
+	}
 
 	/* try to make sure we can issue two flips during the same frame */
 	if (do_flip && (o->flags & TEST_EBUSY)) {
@@ -845,6 +865,7 @@ static bool run_test_step(struct test_output *o, unsigned int *events)
 		igt_assert(do_page_flip(o, new_fb_id, false) == expected_einval);
 
 	unhang_gpu(drm_fd, hang);
+	put_ahnd(ahnd);
 
 	*events = completed_events;
 
@@ -911,12 +932,35 @@ static bool mode_compatible(const drmModeModeInfo *a, const drmModeModeInfo *b)
 	return true;
 }
 
+static bool get_compatible_modes(drmModeModeInfo *a, drmModeModeInfo *b,
+				 drmModeConnector *c1, drmModeConnector *c2)
+{
+	int n, m;
+
+	*a = c1->modes[0];
+	*b = c2->modes[0];
+
+	if (!mode_compatible(a, b)) {
+		for (n = 0; n < c1->count_modes; n++) {
+			*a = c1->modes[n];
+			for (m = 0; m < c2->count_modes; m++) {
+				*b = c2->modes[m];
+				if (mode_compatible(a, b))
+					return true;
+			}
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
 static void connector_find_compatible_mode(int crtc_idx0, int crtc_idx1,
 					   struct test_output *o)
 {
 	struct kmstest_connector_config config[2];
-	drmModeModeInfo *mode[2];
-	int n, m;
+	drmModeModeInfo mode[2];
 
 	if (!kmstest_get_connector_config(drm_fd, o->_connector[0],
 					  1 << crtc_idx0, &config[0]))
@@ -928,39 +972,24 @@ static void connector_find_compatible_mode(int crtc_idx0, int crtc_idx1,
 		return;
 	}
 
-	mode[0] = &config[0].default_mode;
-	mode[1] = &config[1].default_mode;
-	if (!mode_compatible(mode[0], mode[1])) {
-		for (n = 0; n < config[0].connector->count_modes; n++) {
-			mode[0] = &config[0].connector->modes[n];
-			for (m = 0; m < config[1].connector->count_modes; m++) {
-				mode[1] = &config[1].connector->modes[m];
-				if (mode_compatible(mode[0], mode[1]))
-					goto found;
-			}
-		}
+	o->mode_valid = get_compatible_modes(&mode[0], &mode[1],
+					     config[0].connector, config[1].connector);
 
-		/* hope for the best! */
-		mode[1] = mode[0] = &config[0].default_mode;
-	}
-
-found:
 	o->pipe = config[0].pipe;
-	o->fb_width = mode[0]->hdisplay;
-	o->fb_height = mode[0]->vdisplay;
-	o->mode_valid = 1;
+	o->fb_width = mode[0].hdisplay;
+	o->fb_height = mode[0].vdisplay;
 
 	o->kconnector[0] = config[0].connector;
 	o->kencoder[0] = config[0].encoder;
 	o->_crtc[0] = config[0].crtc->crtc_id;
 	o->_pipe[0] = config[0].pipe;
-	o->kmode[0] = *mode[0];
+	o->kmode[0] = mode[0];
 
 	o->kconnector[1] = config[1].connector;
 	o->kencoder[1] = config[1].encoder;
 	o->_crtc[1] = config[1].crtc->crtc_id;
 	o->_pipe[1] = config[1].pipe;
-	o->kmode[1] = *mode[1];
+	o->kmode[1] = mode[1];
 
 	drmModeFreeCrtc(config[0].crtc);
 	drmModeFreeCrtc(config[1].crtc);
@@ -1221,8 +1250,10 @@ static bool calibrate_ts(struct test_output *o, int crtc_idx)
 
 	igt_info("Expected frametime: %.0fus; measured %.1fus +- %.3fus accuracy %.2f%%\n",
 		 expected, mean, stddev, 100 * 3 * stddev / mean);
-	/* 99.7% samples within 0.5% of the mean */
-	igt_assert(3 * stddev / mean < 0.005);
+	if (!should_skip_ts_checks())
+		/* 99.7% samples within 0.5% of the mean */
+		igt_assert(3 * stddev / mean < 0.005);
+
 	/* 84% samples within 0.5% of the expected value.
 	 * See comments in check_timings() in kms_setmode.c
 	 */
@@ -1259,40 +1290,80 @@ static bool needs_retry_after_link_reset(struct udev_monitor *mon)
 	return hotplug_detected;
 }
 
+static void discard_any_stale_events(void) {
+	fd_set fds;
+	int ret;
+	struct timeval timeout = { .tv_sec = 0, .tv_usec = 20000 };
+	FD_ZERO(&fds);
+	FD_SET(drm_fd, &fds);
+	ret = select(drm_fd + 1, &fds, NULL, NULL, &timeout);
+
+	if (ret > 0) {
+		drmEventContext evctx;
+		memset(&evctx, 0, sizeof evctx);
+		evctx.version = 2;
+		igt_info("Stale Event found - Discarding now\n");
+		drmHandleEvent(drm_fd, &evctx);
+	}
+	else {
+		igt_debug("No stale events found\n");
+	}
+}
+
+static void get_suitable_modes(struct test_output *o)
+{
+	drmModeModeInfo mode[2];
+	int i;
+
+	for (i = 0; i < RUN_PAIR; i++)
+		igt_sort_connector_modes(o->kconnector[i],
+					 sort_drm_modes_by_clk_asc);
+
+	o->mode_valid = get_compatible_modes(&mode[0], &mode[1],
+					     o->kconnector[0], o->kconnector[1]);
+
+	o->fb_width = mode[0].hdisplay;
+	o->fb_height = mode[0].vdisplay;
+	o->kmode[0] = mode[0];
+	o->kmode[1] = mode[1];
+}
+
 static void __run_test_on_crtc_set(struct test_output *o, int *crtc_idxs,
 				   int crtc_count, int duration_ms)
 {
 	struct udev_monitor *mon = igt_watch_uevents();
 	unsigned bo_size = 0;
 	bool vblank = true;
-	bool retried = false;
+	bool retried = false, restart = false;
 	bool state_ok;
 	unsigned elapsed;
-	uint64_t tiling;
-	int i;
+	uint64_t modifier;
+	int i, ret;
 
+restart:
 	last_connector = o->kconnector[0];
 
 	if (o->flags & TEST_PAN)
 		o->fb_width *= 2;
 
-	tiling = LOCAL_DRM_FORMAT_MOD_NONE;
+	modifier = DRM_FORMAT_MOD_LINEAR;
 	if (o->flags & TEST_FENCE_STRESS)
-		tiling = LOCAL_I915_FORMAT_MOD_X_TILED;
+		modifier = I915_FORMAT_MOD_X_TILED;
 
 	/* 256 MB is usually the maximum mappable aperture,
 	 * (make it 4x times that to ensure failure) */
 	if (o->flags & TEST_BO_TOOBIG) {
+		igt_skip_on(!is_i915_device(drm_fd));
 		bo_size = 4*gem_mappable_aperture_size(drm_fd);
 		igt_require(bo_size < gem_global_aperture_size(drm_fd));
 	}
 
 	o->fb_ids[0] = igt_create_fb(drm_fd, o->fb_width, o->fb_height,
 					 igt_bpp_depth_to_drm_format(o->bpp, o->depth),
-					 tiling, &o->fb_info[0]);
+					 modifier, &o->fb_info[0]);
 	o->fb_ids[1] = igt_create_fb_with_bo_size(drm_fd, o->fb_width, o->fb_height,
 						  igt_bpp_depth_to_drm_format(o->bpp, o->depth),
-						  tiling, IGT_COLOR_YCBCR_BT709,
+						  modifier, IGT_COLOR_YCBCR_BT709,
 						  IGT_COLOR_YCBCR_LIMITED_RANGE,
 						  &o->fb_info[1], bo_size, 0);
 
@@ -1309,6 +1380,9 @@ static void __run_test_on_crtc_set(struct test_output *o, int *crtc_idxs,
 		kmstest_dump_mode(&o->kmode[i]);
 
 retry:
+	/* Discard any pending event that hasn't been consumed from a previous retry or subtest. */
+	discard_any_stale_events();
+
 	memset(&o->vblank_state, 0, sizeof(o->vblank_state));
 	memset(&o->flip_state, 0, sizeof(o->flip_state));
 	o->flip_state.name = "flip";
@@ -1318,14 +1392,32 @@ retry:
 
 	igt_flush_uevents(mon);
 
-	if (set_mode(o, o->fb_ids[0], 0, 0)) {
-		/* We may fail to apply the mode if there are hidden
-		 * constraints, such as bandwidth on the third pipe.
-		 */
-		igt_assert_f(crtc_count > 1 || crtc_idxs[0] < 2,
-			     "set_mode may only fail on the 3rd pipe or in multiple crtc tests\n");
+	ret = set_mode(o, o->fb_ids[0], 0, 0);
+
+	/* In case of DP-MST find suitable mode(s) to fit into the link BW. */
+	if (ret < 0 && errno == ENOSPC &&
+	    crtc_count == RUN_PAIR) {
+
+		if (restart) {
+			igt_info("No suitable modes found to fit into the link BW.\n");
+			goto out;
+		}
+
+		get_suitable_modes(o);
+
+		if (o->mode_valid) {
+			igt_remove_fb(drm_fd, &o->fb_info[2]);
+			igt_remove_fb(drm_fd, &o->fb_info[1]);
+			igt_remove_fb(drm_fd, &o->fb_info[0]);
+
+			restart = true;
+			goto restart;
+		}
+
 		goto out;
 	}
+
+	igt_assert(!ret);
 	igt_assert(fb_is_bound(o, o->fb_ids[0]));
 
 	vblank = kms_has_vblank(drm_fd);
@@ -1397,9 +1489,11 @@ out:
 }
 
 static void run_test_on_crtc_set(struct test_output *o, int *crtc_idxs,
-				 int crtc_count, int duration_ms)
+				 int crtc_count, int total_crtcs,
+				 int duration_ms)
 {
 	char test_name[128];
+	int i;
 
 	switch (crtc_count) {
 	case RUN_TEST:
@@ -1431,6 +1525,29 @@ static void run_test_on_crtc_set(struct test_output *o, int *crtc_idxs,
 
 	igt_assert_eq(o->count, crtc_count);
 
+	/*
+	 * Handle BW limitations:
+	 *
+	 * if mode.hdisplay > 5120, then ignore
+	 *  - last crtc in single/multi-connector config
+	 *  - consecutive crtcs in multi-connector config
+	 *
+	 * in multi-connector config ignore if
+	 *  - previous crtc mode.hdisplay > 5120 and
+	 *  - current & previous crtcs are consecutive
+	 */
+	for (i = 0; i < crtc_count; i++) {
+		if (((o->kmode[i].hdisplay > MAX_HDISPLAY_PER_CRTC) &&
+		     ((crtc_idxs[i] >= (total_crtcs - 1)) ||
+		      ((i < (crtc_count - 1)) && (abs(crtc_idxs[i + 1] - crtc_idxs[i]) <= 1)))) ||
+		    ((i > 0) && (o->kmode[i - 1].hdisplay > MAX_HDISPLAY_PER_CRTC) &&
+		     (abs(crtc_idxs[i] - crtc_idxs[i - 1]) <= 1))) {
+
+			igt_debug("Combo: %s is not possible with selected mode(s).\n", test_name);
+			return;
+		}
+	}
+
 	igt_dynamic_f("%s", test_name)
 		__run_test_on_crtc_set(o, crtc_idxs, crtc_count, duration_ms);
 }
@@ -1450,6 +1567,11 @@ static int run_test(int duration, int flags)
 	/* Count output configurations to scale test runtime. */
 	for (i = 0; i < resources->count_connectors; i++) {
 		for (n = 0; n < resources->count_crtcs; n++) {
+			/* Limit the execution to 2 CRTCs (first & last) for hang tests */
+			if ((flags & TEST_HANG) && !all_pipes &&
+			    n != 0 && n != (resources->count_crtcs - 1))
+				continue;
+
 			memset(&o, 0, sizeof(o));
 			o.count = 1;
 			o._connector[0] = resources->connectors[i];
@@ -1466,13 +1588,21 @@ static int run_test(int duration, int flags)
 	}
 
 	igt_require(modes);
-	duration = duration * 1000 / modes;
-	duration = max(500, duration);
+
+	if (duration) {
+		duration = duration * 1000 / modes;
+		duration = max(500, duration);
+	}
 
 	/* Find any connected displays */
 	for (i = 0; i < resources->count_connectors; i++) {
 		for (n = 0; n < resources->count_crtcs; n++) {
 			int crtc_idx;
+
+			/* Limit the execution to 2 CRTCs (first & last) for hang tests */
+			if ((flags & TEST_HANG) && !all_pipes &&
+			    n != 0 && n != (resources->count_crtcs - 1))
+				continue;
 
 			memset(&o, 0, sizeof(o));
 			o.count = 1;
@@ -1482,7 +1612,8 @@ static int run_test(int duration, int flags)
 			o.depth = 24;
 
 			crtc_idx = n;
-			run_test_on_crtc_set(&o, &crtc_idx, RUN_TEST, duration);
+			run_test_on_crtc_set(&o, &crtc_idx, RUN_TEST,
+					     resources->count_crtcs, duration);
 		}
 	}
 
@@ -1528,8 +1659,11 @@ static int run_pair(int duration, int flags)
 	/* If we have fewer than 2 connected outputs then we won't have any
 	 * configuration at all. So skip in that case. */
 	igt_require_f(modes, "At least two displays required\n");
-	duration = duration * 1000 / modes;
-	duration = max(duration, 500);
+
+	if (duration) {
+		duration = duration * 1000 / modes;
+		duration = max(duration, 500);
+	}
 
 	/* Find a pair of connected displays */
 	for (i = 0; i < resources->count_connectors; i++) {
@@ -1551,6 +1685,7 @@ static int run_pair(int duration, int flags)
 
 					run_test_on_crtc_set(&o, crtc_idxs,
 							     RUN_PAIR,
+							     resources->count_crtcs,
 							     duration);
 				}
 			}
@@ -1604,7 +1739,23 @@ static void test_nonblocking_read(int in)
 	close(fd);
 }
 
-igt_main
+static int opt_handler(int opt, int opt_index, void *data)
+{
+	switch (opt) {
+		case 'e':
+			all_pipes = true;
+			break;
+		default:
+			return IGT_OPT_HANDLER_ERROR;
+	}
+
+	return IGT_OPT_HANDLER_SUCCESS;
+}
+
+const char *help_str =
+	"  -e \tRun on all pipes. (By default subtests will run on two pipes)\n";
+
+igt_main_args("e", NULL, help_str, opt_handler, NULL)
 {
 	struct {
 		int duration;
@@ -1665,12 +1816,20 @@ igt_main
 		if (is_i915_device(drm_fd)) {
 			bops = buf_ops_create(drm_fd);
 		}
+
+		if (should_skip_ts_checks()) {
+			igt_info("Skipping timestamp checks\n");
+			for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+				tests[i].flags &= ~(TEST_CHECK_TS | TEST_VBLANK_EXPIRED_SEQ);
+		}
 	}
 
+	igt_describe("Tests that nonblocking reading fails correctly");
 	igt_subtest("nonblocking-read")
 		test_nonblocking_read(drm_fd);
 
 	for (i = 0; i < sizeof(tests) / sizeof (tests[0]); i++) {
+		igt_describe("Basic test for validating modeset, dpms and pageflips");
 		igt_subtest_with_dynamic_f("%s%s",
 			      tests[i].flags & TEST_BASIC ? "basic-" : "",
 			      tests[i].name)
@@ -1679,6 +1838,7 @@ igt_main
 		if (tests[i].flags & TEST_NO_2X_OUTPUT)
 			continue;
 
+		igt_describe("Test for validating modeset, dpms and pageflips with a pair of connected displays");
 		igt_subtest_with_dynamic_f("2x-%s", tests[i].name)
 			run_pair(tests[i].duration, tests[i].flags);
 	}
@@ -1705,14 +1865,19 @@ igt_main
 		if (tests[i].flags & (TEST_EINVAL | TEST_EBUSY | TEST_HANG))
 			continue;
 
+		igt_describe("Interrupt test for validating modeset, dpms and pageflips");
 		igt_subtest_with_dynamic_f("%s-interruptible", tests[i].name)
 			run_test(tests[i].duration, tests[i].flags);
 
 		if (tests[i].flags & TEST_NO_2X_OUTPUT)
 			continue;
 
+		 igt_describe("Interrupt test for validating modeset, dpms and pageflips with pair of connected displays");
 		igt_subtest_with_dynamic_f("2x-%s-interruptible", tests[i].name)
 			run_pair(tests[i].duration, tests[i].flags);
 	}
 	igt_stop_signal_helper();
+
+	igt_fixture
+		close(drm_fd);
 }

@@ -29,6 +29,7 @@
 #include "config.h"
 
 #include <stdint.h>
+#include <stddef.h>
 
 #include <xf86drmMode.h>
 
@@ -304,12 +305,30 @@ struct edid_cea {
 
 enum edid_ext_tag {
 	EDID_EXT_CEA = 0x02,
+	EDID_EXT_DISPLAYID = 0x70,
+};
+
+struct edid_tile {
+	uint8_t header[7];
+	uint8_t tile_cap;
+	uint8_t topo[3];
+	uint8_t tile_size[4];
+	uint8_t tile_pixel_bezel[5];
+	uint8_t topology_id[9];
+	uint8_t data[96];
+	uint8_t extension_checksum;
+	uint8_t checksum;
+} __attribute__((packed));
+
+enum edid_tile_cap {
+	SCALE_TO_FIT = 0x82,
 };
 
 struct edid_ext {
 	uint8_t tag; /* enum edid_ext_tag */
 	union {
 		struct edid_cea cea;
+		struct edid_tile tile;
 	} data;
 } __attribute__((packed));
 
@@ -332,7 +351,7 @@ struct edid {
 	uint8_t features;
 	/* Color characteristics */
 	uint8_t red_green_lo;
-	uint8_t black_white_lo;
+	uint8_t blue_white_lo;
 	uint8_t red_x;
 	uint8_t red_y;
 	uint8_t green_x;
@@ -356,8 +375,13 @@ struct edid {
 void edid_init(struct edid *edid);
 void edid_init_with_mode(struct edid *edid, drmModeModeInfo *mode);
 void edid_update_checksum(struct edid *edid);
+void base_edid_update_checksum(struct edid *edid);
 size_t edid_get_size(const struct edid *edid);
 void edid_get_mfg(const struct edid *edid, char out[static 3]);
+uint8_t edid_get_deep_color_from_vsdb(const struct edid *edid);
+uint8_t edid_get_bit_depth_from_vid(const struct edid *edid);
+void std_timing_set(struct std_timing *st, int hsize, int vfreq,
+		    enum std_timing_aspect aspect);
 void detailed_timing_set_mode(struct detailed_timing *dt, drmModeModeInfo *mode,
 			      int width_mm, int height_mm);
 void detailed_timing_set_monitor_range_mode(struct detailed_timing *dt,
@@ -383,4 +407,5 @@ size_t edid_cea_data_block_set_speaker_alloc(struct edid_cea_data_block *block,
 void edid_ext_set_cea(struct edid_ext *ext, size_t data_blocks_size,
 		      uint8_t num_native_dtds, uint8_t flags);
 
+void edid_ext_set_displayid(struct edid_ext *ext);
 #endif

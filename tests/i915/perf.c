@@ -41,6 +41,7 @@
 #include "i915/gem.h"
 #include "i915/perf.h"
 #include "igt.h"
+#include "igt_perf.h"
 #include "igt_sysfs.h"
 #include "drm.h"
 
@@ -86,13 +87,18 @@ IGT_TEST_DESCRIPTION("Test the i915 perf metrics streaming interface");
 
 #define MAX_OA_BUF_SIZE (16 * 1024 * 1024)
 
-#define NUM_PROPERTIES(p) (sizeof(p) / (2 * sizeof(uint64_t)))
-
 struct accumulator {
 #define MAX_RAW_OA_COUNTERS 62
 	enum drm_i915_oa_format format;
 
 	uint64_t deltas[MAX_RAW_OA_COUNTERS];
+};
+
+enum {
+	OAG,
+	OAR,
+
+	MAX_OA_TYPE,
 };
 
 struct oa_format {
@@ -104,10 +110,12 @@ struct oa_format {
 	int a_off;
 	int n_a;
 	int first_a;
+	int first_a40;
 	int b_off;
 	int n_b;
 	int c_off;
 	int n_c;
+	int oa_type;
 };
 
 static struct oa_format hsw_oa_formats[I915_OA_FORMAT_MAX] = {
@@ -172,6 +180,26 @@ static struct oa_format gen12_oa_formats[I915_OA_FORMAT_MAX] = {
 		.c_off = 224, .n_c = 8, },
 };
 
+static struct oa_format dg2_oa_formats[I915_OA_FORMAT_MAX] = {
+	[I915_OAR_FORMAT_A32u40_A4u32_B8_C8] = {
+		"A32u40_A4u32_B8_C8", .size = 256,
+		.a40_high_off = 160, .a40_low_off = 16, .n_a40 = 32,
+		.a_off = 144, .n_a = 4, .first_a = 32,
+		.b_off = 192, .n_b = 8,
+		.c_off = 224, .n_c = 8, .oa_type = OAR, },
+	/* This format has A36 and A37 interleaved with high bytes of some A
+	 * counters, so we will accumulate only subset of counters.
+	 */
+	[I915_OA_FORMAT_A24u40_A14u32_B8_C8] = {
+		"A24u40_A14u32_B8_C8", .size = 256,
+		/* u40: A4 - A23 */
+		.a40_high_off = 160, .a40_low_off = 16, .n_a40 = 20, .first_a40 = 4,
+		/* u32: A0 - A3 */
+		.a_off = 16, .n_a = 4,
+		.b_off = 192, .n_b = 8,
+		.c_off = 224, .n_c = 8, .oa_type = OAG, },
+};
+
 static bool hsw_undefined_a_counters[45] = {
 	[4] = true,
 	[6] = true,
@@ -230,6 +258,8 @@ get_oa_format(enum drm_i915_oa_format format)
 {
 	if (IS_HASWELL(devid))
 		return hsw_oa_formats[format];
+	else if (IS_DG2(devid) || IS_METEORLAKE(devid))
+		return dg2_oa_formats[format];
 	else if (IS_GEN12(devid))
 		return gen12_oa_formats[format];
 	else
@@ -339,11 +369,11 @@ try_sysfs_read_u64(const char *path, uint64_t *val)
 }
 
 static unsigned long
-sysfs_read(const char *path)
+sysfs_read(enum i915_attr_id id)
 {
 	unsigned long value;
 
-	igt_assert(igt_sysfs_scanf(sysfs, path, "%lu", &value) == 1);
+	igt_assert(igt_sysfs_rps_scanf(sysfs, id, "%lu", &value) == 1);
 
 	return value;
 }
@@ -410,6 +440,29 @@ gen8_read_report_reason(const uint32_t *report)
 		return "[un]slice clock ratio change";
 	else
 		return "unknown";
+}
+
+static uint32_t
+cs_timestamp_frequency(int fd)
+{
+	struct drm_i915_getparam gp = {};
+	static uint32_t value = 0;
+
+	if (value)
+		return value;
+
+	gp.param = I915_PARAM_CS_TIMESTAMP_FREQUENCY;
+	gp.value = (int *)(&value);
+
+	igt_assert_eq(igt_ioctl(fd, DRM_IOCTL_I915_GETPARAM, &gp), 0);
+
+	return value;
+}
+
+static uint64_t
+cs_timebase_scale(uint32_t u32_delta)
+{
+	return ((uint64_t)u32_delta * NSEC_PER_SEC) / cs_timestamp_frequency(drm_fd);
 }
 
 static uint64_t
@@ -500,6 +553,15 @@ oa_report_get_ctx_id(uint32_t *report)
 	if (!oa_report_ctx_is_valid(report))
 		return 0xffffffff;
 	return report[2];
+}
+
+static int
+oar_unit_default_format(void)
+{
+	if (IS_DG2(devid) || IS_METEORLAKE(devid))
+		return I915_OAR_FORMAT_A32u40_A4u32_B8_C8;
+
+	return test_set->perf_oa_format;
 }
 
 /*
@@ -795,7 +857,7 @@ gen8_sanity_check_test_oa_reports(const uint32_t *oa_report0,
 	max_delta = clock_delta * intel_perf->devinfo.n_eus;
 
 	/* Gen8+ has some 40bit A counters... */
-	for (int j = 0; j < format.n_a40; j++) {
+	for (int j = format.first_a40; j < format.n_a40 + format.first_a40; j++) {
 		uint64_t value0 = gen8_read_40bit_a_counter(oa_report0, fmt, j);
 		uint64_t value1 = gen8_read_40bit_a_counter(oa_report1, fmt, j);
 		uint64_t delta = gen8_40bit_a_delta(value0, value1);
@@ -1017,7 +1079,7 @@ test_system_wide_paranoid(void)
 		struct drm_i915_perf_open_param param = {
 			.flags = I915_PERF_FLAG_FD_CLOEXEC |
 				I915_PERF_FLAG_FD_NONBLOCK,
-			.num_properties = sizeof(properties) / 16,
+			.num_properties = ARRAY_SIZE(properties) / 2,
 			.properties_ptr = to_user_pointer(properties),
 		};
 
@@ -1043,7 +1105,7 @@ test_system_wide_paranoid(void)
 		struct drm_i915_perf_open_param param = {
 			.flags = I915_PERF_FLAG_FD_CLOEXEC |
 				I915_PERF_FLAG_FD_NONBLOCK,
-			.num_properties = sizeof(properties) / 16,
+			.num_properties = ARRAY_SIZE(properties) / 2,
 			.properties_ptr = to_user_pointer(properties),
 		};
 		write_u64_file("/proc/sys/dev/i915/perf_stream_paranoid", 0);
@@ -1074,7 +1136,7 @@ test_invalid_open_flags(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = ~0, /* Undefined flag bits set! */
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 
@@ -1096,7 +1158,7 @@ test_invalid_oa_metric_set_id(void)
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 			I915_PERF_FLAG_FD_NONBLOCK,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 
@@ -1130,7 +1192,7 @@ test_invalid_oa_format_id(void)
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 			I915_PERF_FLAG_FD_NONBLOCK,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 
@@ -1162,7 +1224,7 @@ test_missing_sample_flags(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 
@@ -1253,7 +1315,7 @@ read_2_oa_reports(int format_id,
 			igt_assert_eq(header->size, sample_size);
 
 			report = (const void *)(header + 1);
-			dump_report(report, 64, "oa-formats");
+			dump_report(report, format_size / 4, "oa-formats");
 
 			igt_debug("read report: reason = %x, timestamp = %x, exponent mask=%x\n",
 				  report[0], report[1], exponent_mask);
@@ -1302,7 +1364,7 @@ open_and_read_2_oa_reports(int format_id,
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 
@@ -1477,10 +1539,13 @@ test_oa_formats(void)
 {
 	for (int i = 0; i < I915_OA_FORMAT_MAX; i++) {
 		struct oa_format format = get_oa_format(i);
-		uint32_t oa_report0[64];
-		uint32_t oa_report1[64];
+		uint32_t oa_report0[format.size / 4];
+		uint32_t oa_report1[format.size / 4];
 
 		if (!format.name) /* sparse, indexed by ID */
+			continue;
+
+		if (format.oa_type != OAG) /* sparse, indexed by ID */
 			continue;
 
 		igt_debug("Checking OA format %s\n", format.name);
@@ -1536,6 +1601,9 @@ static void load_helper_set_load(enum load load)
 
 static void load_helper_run(enum load load)
 {
+	if (!render_copy)
+		return;
+
 	/*
 	 * FIXME fork helpers won't get cleaned up when started from within a
 	 * subtest, so handle the case where it sticks around a bit too long.
@@ -1568,12 +1636,20 @@ static void load_helper_run(enum load load)
 
 static void load_helper_stop(void)
 {
+	if (!render_copy)
+		return;
+
 	kill(lh.igt_proc.pid, SIGUSR1);
 	igt_assert(igt_wait_helper(&lh.igt_proc) == 0);
 }
 
 static void load_helper_init(void)
 {
+	if (!render_copy) {
+		igt_info("Running test without render_copy\n");
+		return;
+	}
+
 	lh.devid = intel_get_drm_devid(drm_fd);
 
 	/* MI_STORE_DATA can only use GTT address on gen4+/g33 and needs
@@ -1586,7 +1662,7 @@ static void load_helper_init(void)
 	lh.context_id = gem_context_create(drm_fd);
 	igt_assert_neq(lh.context_id, 0xffffffff);
 
-	lh.ibb = intel_bb_create_with_context(drm_fd, lh.context_id, BATCH_SZ);
+	lh.ibb = intel_bb_create_with_context(drm_fd, lh.context_id, NULL, BATCH_SZ);
 
 	scratch_buf_init(lh.bops, &lh.dst, 1920, 1080, 0);
 	scratch_buf_init(lh.bops, &lh.src, 1920, 1080, 0);
@@ -1594,7 +1670,12 @@ static void load_helper_init(void)
 
 static void load_helper_fini(void)
 {
-	int i915 = buf_ops_get_fd(lh.bops);
+	int i915;
+
+	if (!render_copy)
+		return;
+
+	i915 = buf_ops_get_fd(lh.bops);
 
 	if (lh.igt_proc.running)
 		load_helper_stop();
@@ -1766,7 +1847,7 @@ test_invalid_oa_exponent(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 
@@ -1801,7 +1882,7 @@ test_low_oa_exponent_permissions(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	uint64_t oa_period, oa_freq;
@@ -1864,7 +1945,7 @@ test_per_context_mode_unprivileged(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 
@@ -1940,8 +2021,8 @@ test_blocking(uint64_t requested_oa_period, bool set_kernel_hrtimer, uint64_t ke
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 			I915_PERF_FLAG_DISABLED,
 		.num_properties = set_kernel_hrtimer ?
-				  NUM_PROPERTIES(properties) :
-				  NUM_PROPERTIES(properties) - 1,
+				  ARRAY_SIZE(properties) / 2 :
+				  (ARRAY_SIZE(properties) / 2) - 1,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	uint8_t buf[1024 * 1024];
@@ -2100,8 +2181,8 @@ test_polling(uint64_t requested_oa_period, bool set_kernel_hrtimer, uint64_t ker
 			I915_PERF_FLAG_DISABLED |
 			I915_PERF_FLAG_FD_NONBLOCK,
 		.num_properties = set_kernel_hrtimer ?
-				  NUM_PROPERTIES(properties) :
-				  NUM_PROPERTIES(properties) - 1,
+				  ARRAY_SIZE(properties) / 2 :
+				  (ARRAY_SIZE(properties) / 2) - 1,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	uint8_t buf[1024 * 1024];
@@ -2220,14 +2301,22 @@ test_polling(uint64_t requested_oa_period, bool set_kernel_hrtimer, uint64_t ker
 			n_extra_iterations++;
 
 		/* At this point, after consuming pending reports (and hoping
-		 * the scheduler hasn't stopped us for too long we now
-		 * expect EAGAIN on read.
+		 * the scheduler hasn't stopped us for too long) we now expect
+		 * EAGAIN on read. While this works most of the times, there are
+		 * some rare failures when the OA period passed to this test is
+		 * very small (say 500 us) and that results in some valid
+		 * reports here. To weed out those rare occurences we assert
+		 * only if the OA period is >= 40 ms because 40 ms has withstood
+		 * the test of time on most platforms (ref: subtest: polling).
 		 */
 		while ((ret = read(stream_fd, buf, sizeof(buf))) < 0 &&
 		       errno == EINTR)
 			;
-		igt_assert_eq(ret, -1);
-		igt_assert_eq(errno, EAGAIN);
+
+		if (requested_oa_period >= 40000000) {
+			igt_assert_eq(ret, -1);
+			igt_assert_eq(errno, EAGAIN);
+		}
 
 		n++;
 	}
@@ -2283,7 +2372,7 @@ static void test_polling_small_buf(void)
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 			I915_PERF_FLAG_DISABLED |
 			I915_PERF_FLAG_FD_NONBLOCK,
-		.num_properties = NUM_PROPERTIES(properties),
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	uint32_t test_duration = 80 * 1000 * 1000;
@@ -2383,7 +2472,7 @@ gen12_test_oa_tlb_invalidate(void)
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 			I915_PERF_FLAG_DISABLED,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	int num_reports1, num_reports2, num_expected_reports;
@@ -2522,6 +2611,9 @@ test_buffer_fill(void)
 						first_timestamp = report[1];
 					last_timestamp = report[1];
 
+					if (((last_timestamp - first_timestamp) * oa_period) < (fill_duration / 2))
+						break;
+
 					if (oa_report_is_periodic(oa_exponent, report)) {
 						memcpy(last_periodic_report, report,
 						       sizeof(last_periodic_report));
@@ -2536,6 +2628,8 @@ test_buffer_fill(void)
 		}
 
 		do_ioctl(stream_fd, I915_PERF_IOCTL_DISABLE, 0);
+
+		igt_debug("first ts = %u, last ts = %u\n", first_timestamp, last_timestamp);
 
 		igt_debug("%f < %zu < %f\n",
 			  report_size * n_full_oa_reports * 0.45,
@@ -2569,7 +2663,7 @@ test_non_zero_reason(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	struct drm_i915_perf_record_header *header;
@@ -2654,7 +2748,7 @@ test_enable_disable(void)
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 			 I915_PERF_FLAG_DISABLED, /* Verify we start disabled */
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	int buf_size = 65536 * (256 + sizeof(struct drm_i915_perf_record_header));
@@ -2732,6 +2826,9 @@ test_enable_disable(void)
 						  oa_report_is_periodic(oa_exponent, report),
 						  oa_report_get_ctx_id(report));
 
+					if (((last_timestamp - first_timestamp) * oa_period) < (fill_duration / 2))
+						break;
+
 					if (oa_report_is_periodic(oa_exponent, report)) {
 						memcpy(last_periodic_report, report,
 						       sizeof(last_periodic_report));
@@ -2754,6 +2851,8 @@ test_enable_disable(void)
 		}
 
 		do_ioctl(stream_fd, I915_PERF_IOCTL_DISABLE, 0);
+
+		igt_debug("first ts = %u, last ts = %u\n", first_timestamp, last_timestamp);
 
 		igt_debug("%f < %zu < %f\n",
 			  report_size * n_full_oa_reports * 0.45,
@@ -2798,7 +2897,7 @@ test_short_reads(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	size_t record_size = 256 + sizeof(struct drm_i915_perf_record_header);
@@ -2843,8 +2942,13 @@ test_short_reads(void)
 
 	/* A read that can't return a single record because it would result
 	 * in a fault on buffer overrun should result in an EFAULT error...
+	 *
+	 * Make sure to weed out all report lost errors before verifying EFAULT.
 	 */
-	ret = read(stream_fd, pages + page_size - 16, page_size);
+	header = (void *)(pages + page_size - 16);
+	do {
+		ret = read(stream_fd, header, page_size);
+	} while (ret > 0 && header->type == DRM_I915_PERF_RECORD_OA_REPORT_LOST);
 	igt_assert_eq(ret, -1);
 	igt_assert_eq(errno, EFAULT);
 
@@ -2885,7 +2989,7 @@ test_non_sampling_read_error(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	int ret;
@@ -2921,7 +3025,7 @@ test_disabled_read_error(void)
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 			 I915_PERF_FLAG_DISABLED, /* XXX: open disabled */
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	uint32_t oa_report0[64];
@@ -2967,6 +3071,7 @@ test_disabled_read_error(void)
 static void
 gen12_test_mi_rpc(void)
 {
+	uint64_t fmt = oar_unit_default_format();
 	uint64_t properties[] = {
 		/* On Gen12, MI RPC uses OAR. OAR is configured only for the
 		 * render context that wants to measure the performance. Hence a
@@ -2987,7 +3092,7 @@ gen12_test_mi_rpc(void)
 		 * values.
 		 */
 		DRM_I915_PERF_PROP_OA_METRICS_SET, test_set->perf_oa_metrics_set,
-		DRM_I915_PERF_PROP_OA_FORMAT, test_set->perf_oa_format,
+		DRM_I915_PERF_PROP_OA_FORMAT, fmt,
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
@@ -3001,7 +3106,7 @@ gen12_test_mi_rpc(void)
 	uint32_t ctx_id = INVALID_CTX_ID;
 	uint32_t *report32;
 	size_t format_size_32;
-	struct oa_format format = get_oa_format(test_set->perf_oa_format);
+	struct oa_format format = get_oa_format(fmt);
 
 	/* Ensure perf_stream_paranoid is set to 1 by default */
 	write_u64_file("/proc/sys/dev/i915/perf_stream_paranoid", 1);
@@ -3011,7 +3116,7 @@ gen12_test_mi_rpc(void)
 	igt_assert_neq(ctx_id, INVALID_CTX_ID);
 	properties[1] = ctx_id;
 
-	ibb = intel_bb_create_with_context(drm_fd, ctx_id, BATCH_SZ);
+	ibb = intel_bb_create_with_context(drm_fd, ctx_id, NULL, BATCH_SZ);
 	buf = intel_buf_create(bops, 4096, 1, 8, 64,
 			       I915_TILING_NONE, I915_COMPRESSION_NONE);
 
@@ -3078,7 +3183,7 @@ test_mi_rpc(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	struct buf_ops *bops = buf_ops_create(drm_fd);
@@ -3090,7 +3195,7 @@ test_mi_rpc(void)
 
 	ctx_id = gem_context_create(drm_fd);
 
-	ibb = intel_bb_create_with_context(drm_fd, ctx_id, BATCH_SZ);
+	ibb = intel_bb_create_with_context(drm_fd, ctx_id, NULL, BATCH_SZ);
 	buf = intel_buf_create(bops, 4096, 1, 8, 64,
 			       I915_TILING_NONE, I915_COMPRESSION_NONE);
 
@@ -3181,7 +3286,7 @@ hsw_test_single_ctx_counters(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 
@@ -3217,8 +3322,8 @@ hsw_test_single_ctx_counters(void)
 		 */
 		context0_id = gem_context_create(drm_fd);
 		context1_id = gem_context_create(drm_fd);
-		ibb0 = intel_bb_create_with_context(drm_fd, context0_id, BATCH_SZ);
-		ibb1 = intel_bb_create_with_context(drm_fd, context1_id,  BATCH_SZ);
+		ibb0 = intel_bb_create_with_context(drm_fd, context0_id, NULL, BATCH_SZ);
+		ibb1 = intel_bb_create_with_context(drm_fd, context1_id, NULL, BATCH_SZ);
 
 		igt_debug("submitting warm up render_copy\n");
 
@@ -3461,8 +3566,8 @@ gen8_test_single_ctx_render_target_writes_a_counter(void)
 
 			context0_id = gem_context_create(drm_fd);
 			context1_id = gem_context_create(drm_fd);
-			ibb0 = intel_bb_create_with_context(drm_fd, context0_id, BATCH_SZ);
-			ibb1 = intel_bb_create_with_context(drm_fd, context1_id, BATCH_SZ);
+			ibb0 = intel_bb_create_with_context(drm_fd, context0_id, NULL, BATCH_SZ);
+			ibb1 = intel_bb_create_with_context(drm_fd, context1_id, NULL, BATCH_SZ);
 
 			igt_debug("submitting warm up render_copy\n");
 
@@ -3816,6 +3921,7 @@ again:
 
 static void gen12_single_ctx_helper(void)
 {
+	uint64_t fmt = oar_unit_default_format();
 	uint64_t properties[] = {
 		/* Have a random value here for the context id, but initialize
 		 * it once you figure out the context ID for the work to be
@@ -3831,7 +3937,7 @@ static void gen12_single_ctx_helper(void)
 		 * values.
 		 */
 		DRM_I915_PERF_PROP_OA_METRICS_SET, test_set->perf_oa_metrics_set,
-		DRM_I915_PERF_PROP_OA_FORMAT, test_set->perf_oa_format,
+		DRM_I915_PERF_PROP_OA_FORMAT, fmt,
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
@@ -3854,7 +3960,7 @@ static void gen12_single_ctx_helper(void)
 	uint32_t ctx1_id = INVALID_CTX_ID;
 	int ret;
 	struct accumulator accumulator = {
-		.format = test_set->perf_oa_format
+		.format = fmt
 	};
 
 	bops = buf_ops_create(drm_fd);
@@ -3866,8 +3972,8 @@ static void gen12_single_ctx_helper(void)
 
 	context0_id = gem_context_create(drm_fd);
 	context1_id = gem_context_create(drm_fd);
-	ibb0 = intel_bb_create_with_context(drm_fd, context0_id, BATCH_SZ);
-	ibb1 = intel_bb_create_with_context(drm_fd, context1_id, BATCH_SZ);
+	ibb0 = intel_bb_create_with_context(drm_fd, context0_id, NULL, BATCH_SZ);
+	ibb1 = intel_bb_create_with_context(drm_fd, context1_id, NULL, BATCH_SZ);
 
 	igt_debug("submitting warm up render_copy\n");
 
@@ -4059,7 +4165,7 @@ static void gen12_single_ctx_helper(void)
 	/* Sanity check that we can pass the delta to timebase_scale */
 	igt_assert(delta_ts64 < UINT32_MAX);
 	delta_oa32_ns = timebase_scale(delta_oa32);
-	delta_ts64_ns = timebase_scale(delta_ts64);
+	delta_ts64_ns = cs_timebase_scale(delta_ts64);
 
 	igt_debug("oa32 delta = %u, = %uns\n",
 			delta_oa32, (unsigned)delta_oa32_ns);
@@ -4145,7 +4251,7 @@ gen12_test_single_ctx_render_target_writes_a_counter(void)
 
 static unsigned long rc6_residency_ms(void)
 {
-	return sysfs_read("power/rc6_residency_ms");
+	return sysfs_read(RC6_RESIDENCY_MS);
 }
 
 static void
@@ -4162,13 +4268,13 @@ test_rc6_disable(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	unsigned long rc6_start, rc6_end, rc6_enabled;
 
 	rc6_enabled = 0;
-	igt_sysfs_scanf(sysfs, "power/rc6_enable", "%lu", &rc6_enabled);
+	igt_sysfs_rps_scanf(sysfs, RC6_ENABLE, "%lu", &rc6_enabled);
 	igt_require(rc6_enabled);
 
 	/* Verify rc6 is functional by measuring residency while idle */
@@ -4218,7 +4324,7 @@ test_stress_open_close(void)
 		struct drm_i915_perf_open_param param = {
 			.flags = I915_PERF_FLAG_FD_CLOEXEC |
 			         I915_PERF_FLAG_DISABLED, /* XXX: open disabled */
-			.num_properties = NUM_PROPERTIES(properties),
+			.num_properties = ARRAY_SIZE(properties) / 2,
 			.properties_ptr = to_user_pointer(properties),
 		};
 
@@ -4314,8 +4420,8 @@ test_global_sseu_config_invalid(void)
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 		I915_PERF_FLAG_DISABLED, /* XXX: open disabled */
-		.num_properties = NUM_PROPERTIES(properties),
-			.properties_ptr = to_user_pointer(properties),
+		.num_properties = ARRAY_SIZE(properties) / 2,
+		.properties_ptr = to_user_pointer(properties),
 	};
 
 	memset(&default_sseu, 0, sizeof(default_sseu));
@@ -4389,8 +4495,8 @@ test_global_sseu_config(void)
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC |
 		I915_PERF_FLAG_DISABLED, /* XXX: open disabled */
-		.num_properties = NUM_PROPERTIES(properties),
-			.properties_ptr = to_user_pointer(properties),
+		.num_properties = ARRAY_SIZE(properties) / 2,
+		.properties_ptr = to_user_pointer(properties),
 	};
 
 	memset(&default_sseu, 0, sizeof(default_sseu));
@@ -4741,9 +4847,11 @@ test_whitelisted_registers_userspace_config(void)
 		mux_regs[i++] = 0;
 		mux_regs[i++] = 0xD2C;
 		mux_regs[i++] = 0;
-		/* WAIT_FOR_RC6_EXIT */
-		mux_regs[i++] = 0x20CC;
-		mux_regs[i++] = 0;
+		if (!IS_METEORLAKE(devid)) {
+			/* WAIT_FOR_RC6_EXIT */
+			mux_regs[i++] = 0x20CC;
+			mux_regs[i++] = 0;
+		}
 	}
 
 	if (IS_CHERRYVIEW(devid)) {
@@ -4805,6 +4913,19 @@ done:
 	return ref_count;
 }
 
+static int perf_sysfs_open(int i915)
+{
+	int dirfd, gt;
+
+	/* use the first available sysfs interface */
+	for_each_sysfs_gt_dirfd(i915, dirfd, gt)
+		break;
+
+	igt_assert(dirfd != -1);
+
+	return dirfd;
+}
+
 /* check that an open i915 perf stream holds a reference on the drm i915 module
  * including in the corner case where the original drm fd has been closed.
  */
@@ -4822,7 +4943,7 @@ test_i915_ref_count(void)
 	};
 	struct drm_i915_perf_open_param param = {
 		.flags = I915_PERF_FLAG_FD_CLOEXEC,
-		.num_properties = sizeof(properties) / 16,
+		.num_properties = ARRAY_SIZE(properties) / 2,
 		.properties_ptr = to_user_pointer(properties),
 	};
 	unsigned baseline, ref_count0, ref_count1;
@@ -4838,8 +4959,9 @@ test_i915_ref_count(void)
 	igt_debug("baseline ref count (drm fd closed) = %u\n", baseline);
 
 	drm_fd = __drm_open_driver(DRIVER_INTEL);
+	igt_require_intel(drm_fd);
 	devid = intel_get_drm_devid(drm_fd);
-	sysfs = igt_sysfs_open(drm_fd);
+	sysfs = perf_sysfs_open(drm_fd);
 
 	/* Note: these global variables are only initialized after calling
 	 * init_sys_info()...
@@ -4906,6 +5028,19 @@ static int i915_perf_revision(int fd)
 	return value;
 }
 
+static bool has_class_instance(int i915, uint16_t class, uint16_t instance)
+{
+	int fd;
+
+	fd = perf_i915_open(i915, I915_PMU_ENGINE_BUSY(class, instance));
+	if (fd >= 0) {
+		close(fd);
+		return true;
+	}
+
+	return false;
+}
+
 igt_main
 {
 	igt_fixture {
@@ -4941,17 +5076,17 @@ igt_main
 		igt_require_gem(drm_fd);
 
 		devid = intel_get_drm_devid(drm_fd);
-		sysfs = igt_sysfs_open(drm_fd);
+		sysfs = perf_sysfs_open(drm_fd);
 
 		igt_require(init_sys_info());
 
 		write_u64_file("/proc/sys/dev/i915/perf_stream_paranoid", 1);
 		write_u64_file("/proc/sys/dev/i915/oa_max_sample_rate", 100000);
 
-		gt_max_freq_mhz = sysfs_read("gt_boost_freq_mhz");
+		gt_max_freq_mhz = sysfs_read(RPS_RP0_FREQ_MHZ);
 
-		render_copy = igt_get_render_copyfunc(devid);
-		igt_require_f(render_copy, "no render-copy function\n");
+		if (has_class_instance(drm_fd, I915_ENGINE_CLASS_RENDER, 0))
+			render_copy = igt_get_render_copyfunc(devid);
 	}
 
 	igt_subtest("non-system-wide-paranoid")
@@ -5054,6 +5189,7 @@ igt_main
 
 	igt_subtest("unprivileged-single-ctx-counters") {
 		igt_require(IS_HASWELL(devid));
+		igt_require_f(render_copy, "no render-copy function\n");
 		hsw_test_single_ctx_counters();
 	}
 
@@ -5067,6 +5203,7 @@ igt_main
 		 * For gen12 implement a separate test that uses only OAR
 		 */
 		igt_require(intel_gen(devid) >= 8 && intel_gen(devid) < 12);
+		igt_require_f(render_copy, "no render-copy function\n");
 		gen8_test_single_ctx_render_target_writes_a_counter();
 	}
 
@@ -5082,8 +5219,10 @@ igt_main
 			gen12_test_oa_tlb_invalidate();
 
 		igt_describe("Measure performance for a specific context using OAR in Gen 12");
-		igt_subtest("gen12-unprivileged-single-ctx-counters")
+		igt_subtest("gen12-unprivileged-single-ctx-counters") {
+			igt_require_f(render_copy, "no render-copy function\n");
 			gen12_test_single_ctx_render_target_writes_a_counter();
+		}
 	}
 
 	igt_subtest("rc6-disable")
@@ -5096,6 +5235,7 @@ igt_main
 	igt_subtest_group {
 		igt_fixture {
 			igt_require(i915_perf_revision(drm_fd) >= 4);
+			igt_require(intel_graphics_ver(devid) < IP_VER(12, 50));
 		}
 
 		igt_describe("Verify invalid SSEU opening parameters");

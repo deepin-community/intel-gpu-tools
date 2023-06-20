@@ -34,7 +34,7 @@ igt_simple_main
 	const struct edid *edid;
 	int mode_count, connector_id;
 
-	drm_fd = drm_open_driver_master(DRIVER_INTEL);
+	drm_fd = drm_open_driver_master(DRIVER_ANY);
 
 	res = drmModeGetResources(drm_fd);
 	igt_require(res);
@@ -98,7 +98,7 @@ igt_simple_main
 		/* create stereo framebuffer */
 		fb_id = igt_create_stereo_fb(drm_fd, &connector->modes[i],
 					     igt_bpp_depth_to_drm_format(32, 24),
-					     LOCAL_DRM_FORMAT_MOD_NONE);
+					     DRM_FORMAT_MOD_LINEAR);
 
 		ret = drmModeSetCrtc(drm_fd, config.crtc->crtc_id, fb_id, 0, 0,
 				     &connector->connector_id, 1,
@@ -111,4 +111,5 @@ igt_simple_main
 	kmstest_force_edid(drm_fd, connector, NULL);
 
 	drmModeFreeConnector(connector);
+	close(drm_fd);
 }

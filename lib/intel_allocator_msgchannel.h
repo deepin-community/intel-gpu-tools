@@ -55,6 +55,7 @@ struct alloc_req {
 			uint64_t end;
 			uint8_t allocator_type;
 			uint8_t allocator_strategy;
+			uint64_t default_alignment;
 		} open;
 
 		struct {
@@ -139,6 +140,7 @@ struct alloc_resp {
 };
 
 struct msg_channel {
+	bool ready;
 	void *priv;
 	void (*init)(struct msg_channel *channel);
 	void (*deinit)(struct msg_channel *channel);

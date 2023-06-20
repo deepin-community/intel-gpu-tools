@@ -24,6 +24,22 @@
 
 #include "kms_color_helper.h"
 
+bool
+panel_supports_deep_color(int drm_fd, char *output_name)
+{
+	unsigned int maximum = igt_get_output_max_bpc(drm_fd, output_name);
+
+	igt_info("Max supported bit depth: %d\n", maximum);
+
+	return maximum >= 10;
+}
+
+uint64_t get_max_bpc(igt_output_t *output)
+{
+	return igt_output_has_prop(output, IGT_CONNECTOR_MAX_BPC) ?
+		igt_output_get_prop(output, IGT_CONNECTOR_MAX_BPC) : 0;
+}
+
 void paint_gradient_rectangles(data_t *data,
 			       drmModeModeInfo *mode,
 			       color_t *colors,
@@ -103,14 +119,19 @@ void free_lut(gamma_lut_t *gamma)
 	free(gamma);
 }
 
+static void set_rgb(color_t *coeff, double value)
+{
+	coeff->r = coeff->g = coeff->b = value;
+}
+
 gamma_lut_t *generate_table(int lut_size, double exp)
 {
 	gamma_lut_t *gamma = alloc_lut(lut_size);
 	int i;
 
-	gamma->coeffs[0] = 0.0;
+	set_rgb(&gamma->coeffs[0], 0.0);
 	for (i = 1; i < lut_size; i++)
-		gamma->coeffs[i] = pow(i * 1.0 / (lut_size - 1), exp);
+		set_rgb(&gamma->coeffs[i], pow(i * 1.0 / (lut_size - 1), exp));
 
 	return gamma;
 }
@@ -120,9 +141,9 @@ gamma_lut_t *generate_table_max(int lut_size)
 	gamma_lut_t *gamma = alloc_lut(lut_size);
 	int i;
 
-	gamma->coeffs[0] = 0.0;
+	set_rgb(&gamma->coeffs[0], 0.0);
 	for (i = 1; i < lut_size; i++)
-		gamma->coeffs[i] = 1.0;
+		set_rgb(&gamma->coeffs[i], 1.0);
 
 	return gamma;
 }
@@ -133,7 +154,7 @@ gamma_lut_t *generate_table_zero(int lut_size)
 	int i;
 
 	for (i = 0; i < lut_size; i++)
-		gamma->coeffs[i] = 0.0;
+		set_rgb(&gamma->coeffs[i], 0.0);
 
 	return gamma;
 }
@@ -149,7 +170,7 @@ struct drm_color_lut *coeffs_to_lut(data_t *data,
 	uint32_t mask;
 
 	if (is_i915_device(data->drm_fd))
-		mask = ((1 << color_depth) - 1) << 8;
+		mask = ((1 << color_depth) - 1) << (16 - color_depth);
 	else
 		mask = max_value;
 
@@ -158,7 +179,9 @@ struct drm_color_lut *coeffs_to_lut(data_t *data,
 	if (IS_CHERRYVIEW(data->devid))
 		lut_size -= 1;
 	for (i = 0; i < lut_size; i++) {
-		uint32_t v = (gamma->coeffs[i] * max_value);
+		uint32_t r = gamma->coeffs[i].r * max_value;
+		uint32_t g = gamma->coeffs[i].g * max_value;
+		uint32_t b = gamma->coeffs[i].b * max_value;
 
 		/*
 		 * Hardware might encode colors on a different number of bits
@@ -166,11 +189,13 @@ struct drm_color_lut *coeffs_to_lut(data_t *data,
 		 * Mask the lower bits not provided by the framebuffer so we
 		 * can do CRC comparisons.
 		 */
-		v &= mask;
+		r &= mask;
+		g &= mask;
+		b &= mask;
 
-		lut[i].red = v;
-		lut[i].green = v;
-		lut[i].blue = v;
+		lut[i].red = r;
+		lut[i].green = g;
+		lut[i].blue = b;
 	}
 
 	if (IS_CHERRYVIEW(data->devid))
@@ -277,83 +302,55 @@ pipe_set_property_blob(igt_pipe_t *pipe,
 				       COMMIT_ATOMIC : COMMIT_LEGACY);
 }
 
-void
-invalid_gamma_lut_sizes(data_t *data)
+static void
+invalid_lut_sizes(data_t *data, enum pipe p,
+		  enum igt_atomic_crtc_properties prop, int size)
 {
 	igt_display_t *display = &data->display;
-	igt_pipe_t *pipe = &display->pipes[0];
-	size_t gamma_lut_size = data->gamma_lut_size *
-				sizeof(struct drm_color_lut);
-	struct drm_color_lut *gamma_lut;
+	igt_pipe_t *pipe = &display->pipes[p];
+	struct drm_color_lut *lut;
+	size_t lut_size = size * sizeof(lut[0]);
 
-	igt_require(igt_pipe_obj_has_prop(pipe, IGT_CRTC_GAMMA_LUT));
+	igt_require(igt_pipe_obj_has_prop(pipe, prop));
 
-	gamma_lut = malloc(gamma_lut_size * 2);
+	lut = malloc(lut_size * 2);
 
 	igt_display_commit2(display,
 			    display->is_atomic ?
 			    COMMIT_ATOMIC : COMMIT_LEGACY);
 
-	igt_assert_eq(pipe_set_property_blob(pipe, IGT_CRTC_GAMMA_LUT,
-					     gamma_lut, 1), -EINVAL);
-	igt_assert_eq(pipe_set_property_blob(pipe, IGT_CRTC_GAMMA_LUT,
-					     gamma_lut, gamma_lut_size + 1),
-					     -EINVAL);
-	igt_assert_eq(pipe_set_property_blob(pipe, IGT_CRTC_GAMMA_LUT,
-					     gamma_lut, gamma_lut_size - 1),
-					     -EINVAL);
-	igt_assert_eq(pipe_set_property_blob(pipe, IGT_CRTC_GAMMA_LUT,
-					     gamma_lut, gamma_lut_size +
-					     sizeof(struct drm_color_lut)),
-					     -EINVAL);
-	igt_assert_eq(pipe_set_property_blob_id(pipe, IGT_CRTC_GAMMA_LUT,
-		      pipe->crtc_id), -EINVAL);
-	igt_assert_eq(pipe_set_property_blob_id(pipe, IGT_CRTC_GAMMA_LUT,
-		      4096 * 4096), -EINVAL);
+	igt_assert_eq(pipe_set_property_blob(pipe, prop, lut,
+					     1), -EINVAL);
+	igt_assert_eq(pipe_set_property_blob(pipe, prop, lut,
+					     lut_size + 1), -EINVAL);
+	igt_assert_eq(pipe_set_property_blob(pipe, prop, lut,
+					     lut_size - 1), -EINVAL);
+	igt_assert_eq(pipe_set_property_blob(pipe, prop, lut,
+					     lut_size + sizeof(struct drm_color_lut)), -EINVAL);
+	igt_assert_eq(pipe_set_property_blob_id(pipe, prop,
+						pipe->crtc_id), -EINVAL);
+	igt_assert_eq(pipe_set_property_blob_id(pipe, prop,
+						4096 * 4096), -EINVAL);
 
-	free(gamma_lut);
+	free(lut);
 }
 
 void
-invalid_degamma_lut_sizes(data_t *data)
+invalid_gamma_lut_sizes(data_t *data, enum pipe p)
 {
-	igt_display_t *display = &data->display;
-	igt_pipe_t *pipe = &display->pipes[0];
-	size_t degamma_lut_size = data->degamma_lut_size *
-				  sizeof(struct drm_color_lut);
-	struct drm_color_lut *degamma_lut;
-
-	igt_require(igt_pipe_obj_has_prop(pipe, IGT_CRTC_DEGAMMA_LUT));
-
-	degamma_lut = malloc(degamma_lut_size * 2);
-
-	igt_display_commit2(display, display->is_atomic ?
-			    COMMIT_ATOMIC : COMMIT_LEGACY);
-
-	igt_assert_eq(pipe_set_property_blob(pipe, IGT_CRTC_DEGAMMA_LUT,
-					     degamma_lut, 1), -EINVAL);
-	igt_assert_eq(pipe_set_property_blob(pipe, IGT_CRTC_DEGAMMA_LUT,
-					     degamma_lut, degamma_lut_size + 1),
-					     -EINVAL);
-	igt_assert_eq(pipe_set_property_blob(pipe, IGT_CRTC_DEGAMMA_LUT,
-					     degamma_lut, degamma_lut_size - 1),
-					     -EINVAL);
-	igt_assert_eq(pipe_set_property_blob(pipe, IGT_CRTC_DEGAMMA_LUT,
-					     degamma_lut, degamma_lut_size +
-					     sizeof(struct drm_color_lut)),
-					     -EINVAL);
-	igt_assert_eq(pipe_set_property_blob_id(pipe, IGT_CRTC_DEGAMMA_LUT,
-						pipe->crtc_id), -EINVAL);
-	igt_assert_eq(pipe_set_property_blob_id(pipe, IGT_CRTC_DEGAMMA_LUT,
-						4096 * 4096), -EINVAL);
-
-	free(degamma_lut);
+	invalid_lut_sizes(data, p, IGT_CRTC_GAMMA_LUT, data->gamma_lut_size);
 }
 
-void invalid_ctm_matrix_sizes(data_t *data)
+void
+invalid_degamma_lut_sizes(data_t *data, enum pipe p)
+{
+	invalid_lut_sizes(data, p, IGT_CRTC_DEGAMMA_LUT, data->degamma_lut_size);
+}
+
+void invalid_ctm_matrix_sizes(data_t *data, enum pipe p)
 {
 	igt_display_t *display = &data->display;
-	igt_pipe_t *pipe = &display->pipes[0];
+	igt_pipe_t *pipe = &display->pipes[p];
 	void *ptr;
 
 	igt_require(igt_pipe_obj_has_prop(pipe, IGT_CRTC_CTM));

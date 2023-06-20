@@ -37,8 +37,12 @@ struct pci_device *intel_get_pci_device(void);
 uint32_t intel_get_drm_devid(int fd);
 
 struct intel_device_info {
-	unsigned gen;
+	unsigned graphics_ver;
+	unsigned graphics_rel;
+	unsigned display_ver;
 	unsigned gt; /* 0 if unknown */
+	bool has_4tile : 1;
+	bool has_flatccs : 1;
 	bool is_mobile : 1;
 	bool is_whitney : 1;
 	bool is_almador : 1;
@@ -76,13 +80,20 @@ struct intel_device_info {
 	bool is_tigerlake : 1;
 	bool is_rocketlake : 1;
 	bool is_dg1 : 1;
+	bool is_dg2 : 1;
 	bool is_alderlake_s : 1;
+	bool is_raptorlake_s : 1;
+	bool is_alderlake_p : 1;
+	bool is_alderlake_n : 1;
+	bool is_meteorlake : 1;
 	const char *codename;
 };
 
 const struct intel_device_info *intel_get_device_info(uint16_t devid) __attribute__((pure));
 
 unsigned intel_gen(uint16_t devid) __attribute__((pure));
+unsigned intel_graphics_ver(uint16_t devid) __attribute__((pure));
+unsigned intel_display_ver(uint16_t devid) __attribute__((pure));
 
 extern enum pch_type intel_pch;
 
@@ -98,6 +109,8 @@ void intel_check_pch(void);
 #define HAS_IBX (intel_pch == PCH_IBX)
 #define HAS_CPT (intel_pch == PCH_CPT)
 #define HAS_LPT (intel_pch == PCH_LPT)
+
+#define IP_VER(ver, rel)		((ver) << 8 | (rel))
 
 /* Exclude chipset #defines, they just add noise */
 #ifndef __GTK_DOC_IGNORE__
@@ -177,10 +190,15 @@ void intel_check_pch(void);
 #define IS_TIGERLAKE(devid)	(intel_get_device_info(devid)->is_tigerlake)
 #define IS_ROCKETLAKE(devid)	(intel_get_device_info(devid)->is_rocketlake)
 #define IS_DG1(devid)		(intel_get_device_info(devid)->is_dg1)
+#define IS_DG2(devid)		(intel_get_device_info(devid)->is_dg2)
 #define IS_ALDERLAKE_S(devid)	(intel_get_device_info(devid)->is_alderlake_s)
+#define IS_RAPTORLAKE_S(devid)	(intel_get_device_info(devid)->is_raptorlake_s)
+#define IS_ALDERLAKE_P(devid)	(intel_get_device_info(devid)->is_alderlake_p)
+#define IS_ALDERLAKE_N(devid)	(intel_get_device_info(devid)->is_alderlake_n)
+#define IS_METEORLAKE(devid)	(intel_get_device_info(devid)->is_meteorlake)
 
-#define IS_GEN(devid, x)	(intel_get_device_info(devid)->gen & (1u << ((x)-1)))
-#define AT_LEAST_GEN(devid, x)	(intel_get_device_info(devid)->gen & -(1u << ((x)-1)))
+#define IS_GEN(devid, x)	(intel_get_device_info(devid)->graphics_ver == x)
+#define AT_LEAST_GEN(devid, x)	(intel_get_device_info(devid)->graphics_ver >= x)
 
 #define IS_GEN2(devid)		IS_GEN(devid, 2)
 #define IS_GEN3(devid)		IS_GEN(devid, 3)
@@ -204,5 +222,9 @@ void intel_check_pch(void);
 				 !(IS_VALLEYVIEW(devid) || \
 				   IS_CHERRYVIEW(devid) || \
 				   IS_BROXTON(devid)))
+
+#define HAS_4TILE(devid)	(intel_get_device_info(devid)->has_4tile)
+
+#define HAS_FLATCCS(devid)	(intel_get_device_info(devid)->has_flatccs)
 
 #endif /* _INTEL_CHIPSET_H */

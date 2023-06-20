@@ -186,15 +186,17 @@ igt_main
 			count = MAX_32b;
 		count = 3 + count / (1024 * 1024);
 		igt_require(count > 1);
-		intel_require_memory(count, 1024 * 1024 , CHECK_RAM);
+		igt_require_memory(count, 1024 * 1024 , CHECK_RAM);
 
 		igt_debug("Using %'"PRIu64" 1MiB buffers\n", count);
 		count = (count + ncpus - 1) / ncpus;
 	}
 
+	igt_describe("Check basic functionality.");
 	igt_subtest("basic")
 		run_test(fd, 2);
 
+	igt_describe("Check with parallel execution.");
 	igt_subtest("normal") {
 		intel_allocator_multiprocess_start();
 		igt_fork(child, ncpus)
@@ -203,6 +205,7 @@ igt_main
 		intel_allocator_multiprocess_stop();
 	}
 
+	igt_describe("Check with interrupts in parallel execution.");
 	igt_subtest("interruptible") {
 		intel_allocator_multiprocess_start();
 		igt_fork_signal_helper();

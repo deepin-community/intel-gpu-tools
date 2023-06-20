@@ -41,6 +41,7 @@
 #include <drm.h>
 
 #include "i915/gem.h"
+#include "i915/gem_create.h"
 #include "igt.h"
 #include "igt_dummyload.h"
 #include "igt_rand.h"
@@ -76,7 +77,7 @@ static void big_exec(int fd, uint32_t handle, int ring)
 	int i;
 
 	/* Make sure we only fill half of RAM with gem objects. */
-	igt_require(intel_get_total_ram_mb() * 1024 / 2 > num_buffers * 4);
+	igt_require(igt_get_total_ram_mb() * 1024 / 2 > num_buffers * 4);
 
 	gem_exec = calloc(num_buffers + 1, sizeof(*gem_exec));
 	igt_assert(gem_exec);
@@ -169,13 +170,15 @@ static void norecovery(int i915)
 	hang = igt_allow_hang(i915, 0, 0);
 
 	for (int pass = 1; pass >= 0; pass--) {
+		const intel_ctx_t *ctx = intel_ctx_create(i915, NULL);
 		struct drm_i915_gem_context_param param = {
-			.ctx_id = gem_context_create(i915),
+			.ctx_id = ctx->id,
 			.param = I915_CONTEXT_PARAM_RECOVERABLE,
 			.value = pass,
 		};
 		int expect = pass == 0 ? -EIO : 0;
 		igt_spin_t *spin;
+		uint64_t ahnd = get_reloc_ahnd(i915, param.ctx_id);
 
 		gem_context_set_param(i915, &param);
 
@@ -184,7 +187,8 @@ static void norecovery(int i915)
 		igt_assert_eq(param.value, pass);
 
 		spin = __igt_spin_new(i915,
-				      .ctx = param.ctx_id,
+				      .ahnd = ahnd,
+				      .ctx = ctx,
 				      .flags = IGT_SPIN_POLL_RUN);
 		igt_spin_busywait_until_started(spin);
 
@@ -194,7 +198,8 @@ static void norecovery(int i915)
 		igt_assert_eq(__gem_execbuf(i915, &spin->execbuf), expect);
 		igt_spin_free(i915, spin);
 
-		gem_context_destroy(i915, param.ctx_id);
+		intel_ctx_destroy(i915, ctx);
+		put_ahnd(ahnd);
 	}
 
 	 igt_disallow_hang(i915, hang);
@@ -267,9 +272,10 @@ static void nohangcheck_hostile(int i915)
 	const struct intel_execution_engine2 *e;
 	igt_hang_t hang;
 	int fence = -1;
-	uint32_t ctx;
+	const intel_ctx_t *ctx;
 	int err = 0;
 	int dir;
+	uint64_t ahnd;
 
 	/*
 	 * Even if the user disables hangcheck during their context,
@@ -281,12 +287,13 @@ static void nohangcheck_hostile(int i915)
 	dir = igt_params_open(i915);
 	igt_require(dir != -1);
 
-	ctx = gem_context_create(i915);
-	hang = igt_allow_hang(i915, ctx, 0);
+	ctx = intel_ctx_create_all_physical(i915);
+	hang = igt_allow_hang(i915, ctx->id, 0);
+	ahnd = get_reloc_ahnd(i915, ctx->id);
 
 	igt_require(__enable_hangcheck(dir, false));
 
-	____for_each_physical_engine(i915, ctx, e) {
+	for_each_ctx_engine(i915, ctx, e) {
 		igt_spin_t *spin;
 		int new;
 
@@ -294,7 +301,9 @@ static void nohangcheck_hostile(int i915)
 		gem_engine_property_printf(i915, e->name,
 					   "preempt_timeout_ms", "%d", 50);
 
-		spin = __igt_spin_new(i915, ctx,
+		spin = __igt_spin_new(i915,
+				      .ahnd = ahnd,
+				      .ctx = ctx,
 				      .engine = e->flags,
 				      .flags = (IGT_SPIN_NO_PREEMPTION |
 						IGT_SPIN_FENCE_OUT));
@@ -315,7 +324,7 @@ static void nohangcheck_hostile(int i915)
 			fence = tmp;
 		}
 	}
-	gem_context_destroy(i915, ctx);
+	intel_ctx_destroy(i915, ctx);
 	igt_assert(fence != -1);
 
 	if (sync_fence_wait(fence, MSEC_PER_SEC)) { /* 640ms preempt-timeout */
@@ -332,6 +341,7 @@ static void nohangcheck_hostile(int i915)
 
 	igt_assert_eq(sync_fence_status(fence), -EIO);
 	close(fence);
+	put_ahnd(ahnd);
 
 	close(dir);
 	close(i915);
@@ -340,30 +350,45 @@ static void nohangcheck_hostile(int i915)
 static void close_race(int i915)
 {
 	const int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-	uint32_t *contexts;
+	const intel_ctx_t *base_ctx;
+	const intel_ctx_t **ctx;
+	uint32_t *ctx_id;
 	igt_spin_t *spin;
+	uint64_t ahnd;
 
 	/* Check we can execute a polling spinner */
-	igt_spin_free(i915, igt_spin_new(i915, .flags = IGT_SPIN_POLL_RUN));
+	base_ctx = intel_ctx_create(i915, NULL);
+	ahnd = get_reloc_ahnd(i915, base_ctx->id);
+	igt_spin_free(i915, igt_spin_new(i915,
+					 .ahnd = ahnd,
+					 .ctx = base_ctx,
+					 .flags = IGT_SPIN_POLL_RUN));
 
-	contexts = mmap(NULL, 4096, PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-	igt_assert(contexts != MAP_FAILED);
+	ctx = calloc(ncpus, sizeof(*ctx));
+	ctx_id = mmap(NULL, 4096, PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+	igt_assert(ctx_id != MAP_FAILED);
 
-	for (int child = 0; child < ncpus; child++)
-		contexts[child] = gem_context_clone_with_engines(i915, 0);
+	for (int child = 0; child < ncpus; child++) {
+		ctx[child] = intel_ctx_create(i915, NULL);
+		ctx_id[child] = ctx[child]->id;
+	}
 
 	igt_fork(child, ncpus) {
-		spin = __igt_spin_new(i915, .flags = IGT_SPIN_POLL_RUN);
+		ahnd = get_reloc_ahnd(i915, base_ctx->id);
+		spin = __igt_spin_new(i915,
+				      .ahnd = ahnd,
+				      .ctx = base_ctx,
+				      .flags = IGT_SPIN_POLL_RUN);
 		igt_spin_end(spin);
 		gem_sync(i915, spin->handle);
 
-		while (!READ_ONCE(contexts[ncpus])) {
+		while (!READ_ONCE(ctx_id[ncpus])) {
 			int64_t timeout = 1;
 
 			igt_spin_reset(spin);
 			igt_assert(!igt_spin_has_started(spin));
 
-			spin->execbuf.rsvd1 = READ_ONCE(contexts[child]);
+			spin->execbuf.rsvd1 = READ_ONCE(ctx_id[child]);
 			if (__gem_execbuf(i915, &spin->execbuf))
 				continue;
 
@@ -394,6 +419,7 @@ static void close_race(int i915)
 		}
 
 		igt_spin_free(i915, spin);
+		put_ahnd(ahnd);
 	}
 
 	igt_until_timeout(5) {
@@ -403,20 +429,23 @@ static void close_race(int i915)
 		 * and the kernel's context/request handling.
 		 */
 		for (int child = 0; child < ncpus; child++) {
-			gem_context_destroy(i915, contexts[child]);
-			contexts[child] =
-				gem_context_clone_with_engines(i915, 0);
+			intel_ctx_destroy(i915, ctx[child]);
+			ctx[child] = intel_ctx_create(i915, NULL);
+			ctx_id[child] = ctx[child]->id;
 		}
 		usleep(1000 + hars_petruska_f54_1_random_unsafe() % 2000);
 	}
 
-	contexts[ncpus] = 1;
+	ctx_id[ncpus] = 1;
 	igt_waitchildren();
 
+	intel_ctx_destroy(i915, base_ctx);
 	for (int child = 0; child < ncpus; child++)
-		gem_context_destroy(i915, contexts[child]);
+		intel_ctx_destroy(i915, ctx[child]);
+	put_ahnd(ahnd);
 
-	munmap(contexts, 4096);
+	free(ctx);
+	munmap(ctx_id, 4096);
 }
 
 igt_main
@@ -436,6 +465,7 @@ igt_main
 		gem_write(fd, handle, 0, batch, sizeof(batch));
 	}
 
+	igt_describe("Check the basic context batch buffer execution.");
 	igt_subtest("basic") {
 		ctx_id = gem_context_create(fd);
 		igt_assert(exec(fd, handle, 0, ctx_id) == 0);
@@ -451,23 +481,45 @@ igt_main
 		gem_sync(fd, handle);
 	}
 
+	igt_describe("Verify that execbuf with invalid context fails.");
 	igt_subtest("basic-invalid-context")
 		invalid_context(fd, handle);
 
+	igt_describe("Check maximum number of buffers it can"
+		     " evict for a context.");
 	igt_subtest("eviction")
 		big_exec(fd, handle, 0);
 
+	igt_describe("Check the status of context after a hang"
+		     " by setting and unsetting the RECOVERABLE.");
 	igt_subtest("basic-norecovery")
 		norecovery(fd);
 
+	igt_describe("Verify that contexts are automatically shotdown"
+		     " on close, if hangchecking is disabled.");
 	igt_subtest("basic-nohangcheck")
 		nohangcheck_hostile(fd);
 
-	igt_subtest("basic-close-race")
-		close_race(fd);
+	igt_describe("Race the execution and interrupt handlers along a context,"
+	             " while closing it at a random time.");
+	igt_subtest_group {
+		igt_fixture {
+			intel_allocator_multiprocess_start();
+		}
 
+		igt_subtest("basic-close-race")
+			close_race(fd);
+
+		igt_fixture {
+			intel_allocator_multiprocess_stop();
+		}
+	}
+
+	igt_describe("Check if the kernel doesn't leak the vma"
+		     " pin_count for the last context on reset.");
 	igt_subtest("reset-pin-leak") {
 		int i;
+		uint64_t ahnd;
 
 		/*
 		 * Use an explicit context to isolate the test from
@@ -475,6 +527,7 @@ igt_main
 		 * default context (eg. if they would be eliminated).
 		 */
 		ctx_id = gem_context_create(fd);
+		ahnd = get_reloc_ahnd(fd, ctx_id);
 
 		/*
 		 * Iterate enough times that the kernel will
@@ -482,7 +535,8 @@ igt_main
 		 * the last context is leaked at every reset.
 		 */
 		for (i = 0; i < 20; i++) {
-			igt_hang_t hang = igt_hang_ring(fd, 0);
+
+			igt_hang_t hang = igt_hang_ring_with_ahnd(fd, 0, ahnd);
 
 			igt_assert_eq(exec(fd, handle, 0, 0), 0);
 			igt_assert_eq(exec(fd, handle, 0, ctx_id), 0);
@@ -490,5 +544,6 @@ igt_main
 		}
 
 		gem_context_destroy(fd, ctx_id);
+		put_ahnd(ahnd);
 	}
 }
